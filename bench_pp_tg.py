@@ -1,5 +1,9 @@
 """Benchmark pp512 tg128 — standard llama.cpp benchmark format.
-Also tests end-to-end correctness (prefill → decode handoff)."""
+Also tests end-to-end correctness (prefill → decode handoff).
+
+Scope: batch-size-1 single-stream decode, targeting local inference.
+All measurements use torch.cuda.synchronize() barriers + perf_counter.
+One warm-up run precedes each timed section."""
 import time, torch
 from model import Decoder, HIDDEN_SIZE, INTERMEDIATE_SIZE, FA_QPROJ_SIZE, FA_Q_SIZE, FA_KV_SIZE
 from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, MAX_SEQ_LEN
@@ -82,6 +86,13 @@ for _ in range(30):
     ref_out.append(nid)
 ref_text = tok.decode(ref_out, skip_special_tokens=True)
 print(f"Ref:    {ref_text[:80]}", flush=True)
+
+if out == ref_out:
+    print("PASS: megakernel output matches reference decode path", flush=True)
+else:
+    print("FAIL: output mismatch between megakernel and reference", flush=True)
+    print(f"  Megakernel tokens: {out[:10]}...", flush=True)
+    print(f"  Reference tokens:  {ref_out[:10]}...", flush=True)
 
 # ============================================================
 # 2. pp512 benchmark (prompt processing)

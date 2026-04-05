@@ -1,5 +1,7 @@
 # Benchmark Results
 
+All benchmarks are **batch size 1, single-stream decode**, targeting local inference on consumer hardware. This is the llama.cpp/Ollama use case, not multi-tenant serving.
+
 ## Hardware
 
 | Machine | GPU/Chip | Memory |
@@ -37,3 +39,19 @@
 | 150W | 405 MHz | 150W | 194 | 1.29 | too aggressive |
 
 Sweet spot: 220W, 1.87 tok/J.
+
+## Methodology
+
+- **Precision:** BF16 weights and activations, FP32 accumulation. No quantization. All baselines (llama.cpp, PyTorch HF) also run BF16 for apples-to-apples comparison.
+- **Power measurement:** Accelerator power only via NVML energy counters (NVIDIA) and `powermetrics` (Apple Silicon), consistent with [Hazy Research's Intelligence Per Watt methodology](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles). Total system draw is higher for both platforms.
+- **Correctness:** `bench_pp_tg.py` includes an end-to-end correctness check, comparing megakernel output (prefill + decode) against a token-by-token reference decode path. Both must produce identical token sequences.
+- **Warm-up:** One warm-up run before timed measurements. Timing uses `torch.cuda.synchronize()` barriers with `time.perf_counter()`.
+- **llama.cpp version:** Latest release at time of testing, BF16 mode, default settings.
+
+## What this doesn't measure
+
+- Batched throughput (batch size > 1)
+- Quantized model performance (INT4/INT8)
+- Models larger than 0.8B parameters
+- Multi-GPU or tensor-parallel setups
+- Total system power (CPU, RAM, PSU losses)
