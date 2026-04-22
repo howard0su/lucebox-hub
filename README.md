@@ -3,9 +3,9 @@
 </p>
 
 <p align="center">
-  <a href="https://lucebox.com"><img src="https://img.shields.io/badge/lucebox.com-f5c842?style=for-the-badge&logo=safari&logoColor=f5c842&labelColor=090909" alt="lucebox.com"></a>
+  <a href="https://www.lucebox.com"><img src="https://img.shields.io/badge/lucebox.com-f5c842?style=for-the-badge&logo=safari&logoColor=f5c842&labelColor=090909" alt="lucebox.com"></a>
   <a href="https://discord.gg/yHfswqZmJQ"><img src="https://img.shields.io/badge/Discord-f5c842?style=for-the-badge&logo=discord&logoColor=f5c842&labelColor=090909" alt="Discord"></a>
-  <a href="https://lucebox.com/blog"><img src="https://img.shields.io/badge/Blog-f5c842?style=for-the-badge&logo=rss&logoColor=f5c842&labelColor=090909" alt="Blog"></a>
+  <a href="https://www.lucebox.com/blog"><img src="https://img.shields.io/badge/Blog-f5c842?style=for-the-badge&logo=rss&logoColor=f5c842&labelColor=090909" alt="Blog"></a>
 </p>
 
 <p align="center">
@@ -57,7 +57,7 @@ python final_bench.py
 
 **What makes it work:** 82 blocks, 512 threads, one persistent kernel. No CPU round-trips between layers. Weights streamed straight from HuggingFace. Cooperative grid sync instead of ~100 kernel launches per token. Power ceiling hit before compute ceiling, so DVFS converts tight execution straight into saved watts.
 
-[Full writeup →](megakernel/README.md) · [Benchmarks →](megakernel/RESULTS.md) · [Blog post →](https://lucebox.com/blog/megakernel)
+[Full writeup →](megakernel/README.md) · [Benchmarks →](megakernel/RESULTS.md) · [Blog post →](https://www.lucebox.com/blog/megakernel)
 
 ---
 
@@ -124,7 +124,7 @@ AI-assisted development flips that calculus. Rewrites that took a quarter now fi
 
 ## Requirements
 
-NVIDIA GPU (Ampere+, sm_86+), CUDA 12+, PyTorch 2.0+. Tested on RTX 3090 (2020).
+NVIDIA RTX 3090 (sm_86) only, CUDA 12+, PyTorch 2.0+.
 dflash needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops).
 
 **Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W).
@@ -148,6 +148,8 @@ lucebox-hub/
   Q1 2026    ▮▮▮▮▮▮▮▮▮▮    RTX 3090 kernels & optimizations
   Q2 2026    ▮▮▮▮▮▯▯▯▯▯    Ryzen AI MAX+ 395 optimizations
   Q2 2026    ▮▮▯▯▯▯▯▯▯▯    Heterogeneous CPU + GPU latency optimizations
+  Q2 2026    ▮▯▯▯▯▯▯▯▯▯    CLI for local AI
+  Q3 2026    ▯▯▯▯▯▯▯▯▯▯    Lucebox official launch
 ```
 
 ---
@@ -179,12 +181,12 @@ Per-project citations live in each subproject's README.
 ## Community
 
 - **Discord**: [discord.gg/yHfswqZmJQ](https://discord.gg/yHfswqZmJQ)
-- **Website**: [lucebox.com](https://lucebox.com)
+- **Website**: [lucebox.com](https://www.lucebox.com)
 - **Issues**: [github.com/Luce-Org/lucebox-hub/issues](https://github.com/Luce-Org/lucebox-hub/issues)
-- **Blog**: [lucebox.com/blog](https://lucebox.com/blog)
+- **Blog**: [lucebox.com/blog](https://www.lucebox.com/blog)
 
 ---
 
 <p align="center">
-  <sub><a href="LICENSE">MIT</a> · <a href="https://lucebox.com">Lucebox.com</a></sub>
+  <sub><a href="LICENSE">MIT</a> · <a href="https://www.lucebox.com">Lucebox.com</a></sub>
 </p>

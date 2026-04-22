@@ -8,7 +8,7 @@
   <strong>The first megakernel for hybrid DeltaNet/Attention LLMs.</strong><br/>
   All 24 layers of Qwen 3.5-0.8B in a single CUDA dispatch.<br/>
   1.87 tok/J on a 2020 GPU, matching Apple's latest silicon at 2x the throughput.<br/><br/>
-  <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
+  <a href="https://www.lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://www.lucebox.com">lucebox.com</a>
 </p>
 
 ---
@@ -65,9 +65,9 @@ Sweet spot at 220W: 95% of the speed, 30% less power. The curve is nonlinear, ti
 | tok/s | 267 | 229 | **411** |
 | Power | 350W | ~130W | 220W |
 | tok/J | 0.76 | 1.76 | **1.87** |
-| GPU price | ~$700 | $2,499+ (system) | ~$700 |
+| GPU price | ~$900 | $2,499+ (system) | ~$900 |
 
-A $700 GPU from 2020, power-limited to 220W, matches Apple's latest chip on efficiency while delivering 1.8x the throughput.
+A $900 GPU from 2020, power-limited to 220W, matches Apple's latest chip on efficiency while delivering 1.8x the throughput.
 
 ## How it works
 
@@ -114,7 +114,7 @@ python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
 ```
 
 **Requirements:**
-- NVIDIA GPU (Ampere+), tested on RTX 3090
+- NVIDIA RTX 3090 (sm_86) only
 - CUDA 12+
 - PyTorch 2.0+
 - ~1.5 GB VRAM for BF16 weights
@@ -173,14 +173,14 @@ llama.cpp is the most widely used local inference engine. It's what most people 
 
 ## Why an RTX 3090?
 
-Deliberately chosen as the "worst case" for NVIDIA: a 2020 GPU, widely dismissed as power-hungry, available for ~$900-1,000 used. If the software gap is real on old hardware, it's even larger on newer cards.
+Deliberately chosen as the "worst case" for NVIDIA: a 2020 GPU, widely dismissed as power-hungry, available for ~$900 used. If the software gap is real on old hardware, it's even larger on newer cards.
 ## Community
 
 Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/yHfswqZmJQ).
 
 ---
 
-MIT · [Lucebox](https://lucebox.com)
+MIT · [Lucebox](https://www.lucebox.com)
 
 Built with [Claude](https://claude.ai)
 
