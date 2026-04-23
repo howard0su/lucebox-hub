@@ -19,20 +19,28 @@ from pathlib import Path
 def default_paths():
     return {
         "target": "models/Qwen3.5-27B-Q4_K_M.gguf",
-        "draft":  str(Path.home() / ".cache/huggingface/hub/models--z-lab--Qwen3.5-27B-DFlash/snapshots"),
+        "draft":  "models/draft",
         "bin":    "build/test_dflash" + (".exe" if sys.platform == "win32" else ""),
     }
 
 
 def resolve_draft(draft_dir: str) -> str:
     if draft_dir.endswith(".safetensors"):
-        return draft_dir
+        p = Path(draft_dir)
+        if p.is_file():
+            return str(p)
+        raise FileNotFoundError(f"draft safetensors not found: {draft_dir}")
+
     p = Path(draft_dir)
     if p.is_file():
         return str(p)
-    for st in p.rglob("model.safetensors"):
-        return str(st)
-    raise FileNotFoundError(f"no model.safetensors under {draft_dir}")
+    if p.is_dir():
+        for st in p.rglob("model.safetensors"):
+            return str(st)
+
+    raise FileNotFoundError(
+        f"no model.safetensors under {draft_dir}. Download it as documented in the README, or pass --draft explicitly."
+    )
 
 
 def tokenize(tokenizer, text: str, out_path: str) -> int:
