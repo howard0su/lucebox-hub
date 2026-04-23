@@ -635,8 +635,14 @@ def main():
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
-    default_ctx = 131072 if os.environ.get("DFLASH27B_KV_Q4") == "1" else 6144
-    ap.add_argument("--max-ctx", type=int, default=default_ctx)
+    # Attention compute currently scales with --max-ctx, not the actual
+    # prompt+gen length (see issue #10). Default 16384 fits most API
+    # workloads without the 20×+ slowdown users hit with --max-ctx=131072
+    # on short requests. Bump via --max-ctx for long-context serving.
+    ap.add_argument("--max-ctx", type=int, default=16384,
+                    help="Maximum context length (default: 16384; oversizing "
+                         "this, e.g. 131072 on short prompts, can slow "
+                         "attention 20×+ until issue #10 is fixed)")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-27B",
                     help="HF tokenizer id; Qwen3.6 shares this tokenizer.")
     args = ap.parse_args()
