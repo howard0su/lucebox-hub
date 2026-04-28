@@ -15,7 +15,7 @@
 
 ```
                         Prefill      Decode      tok/J
-Megakernel (RTX 3090)   37,800       413         1.87  @220W
+Megakernel (RTX 3090)   21,347       413         1.87  @220W
 llama.cpp  (RTX 3090)   11,247       267         0.76
 Apple M5 Max               -         229         1.76
 ```
@@ -41,11 +41,11 @@ So we fused everything into one kernel.
 
 | Method | Prefill pp520 (tok/s) | Decode tg128 (tok/s) |
 |--------|:---------------------:|:--------------------:|
-| **Megakernel** | **37,800** | **413** |
+| **Megakernel** | **21,347** | **413** |
 | llama.cpp BF16 | 11,247 | 267 |
 | PyTorch HuggingFace | 7,578 | 108 |
 
-3.4x faster prefill, 1.55x faster decode, 3.8x faster than PyTorch. Same hardware, same model, same weights.
+1.9x faster prefill, 1.55x faster decode, 2.8x faster than PyTorch. Same hardware, same model, same weights.
 
 ### Energy Efficiency (DVFS Power Sweep)
 
