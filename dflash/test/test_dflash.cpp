@@ -657,7 +657,11 @@ static bool build_target_step(
     sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
     ggml_set_output(sg.logits);
-    ggml_build_forward_expand(sg.gf, sg.logits);
+
+    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+    ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
+    ggml_set_output(sg.argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -729,7 +733,11 @@ static bool build_target_step_tree(
     sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
     ggml_set_output(sg.logits);
-    ggml_build_forward_expand(sg.gf, sg.logits);
+
+    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+    ggml_set_name(sg.argmax_tokens, "tree_verify_argmax");
+    ggml_set_output(sg.argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1906,13 +1914,10 @@ int main(int argc, char ** argv) {
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
-            // Read the N verify logits, compute posterior argmax per slot.
-            ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
-                                    sizeof(float) * vocab * N);
+            // Read the N verify argmax from GPU (N × 4 bytes, not N × 248K × 4).
             std::vector<int32_t> posterior(N);
-            for (int i = 0; i < N; i++) {
-                posterior[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
-            }
+            ggml_backend_tensor_get(sg.argmax_tokens, posterior.data(), 0,
+                                    sizeof(int32_t) * N);
 
             // Walk tree: accepted DFS indices and next bonus token.
             int next_token = -1;
@@ -2191,11 +2196,8 @@ int main(int argc, char ** argv) {
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
-            ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
-                                    sizeof(float) * vocab * q_len);
-            for (int i = 0; i < q_len; i++) {
-                target_tok[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
-            }
+            ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
+                                    sizeof(int32_t) * q_len);
         } else {
             // Sequential verify: q_len independent single-token decodes.
             // Each call writes K/V at slot committed+i and advances SSM by 1.
