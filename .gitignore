@@ -40,9 +40,10 @@ venv/
 env/
 .env
 
-# IDE
+# IDE / tooling caches
 .vscode/
 .idea/
+.serena/
 *.swp
 *.swo
 *~

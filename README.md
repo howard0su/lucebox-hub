@@ -24,7 +24,7 @@
 
 ## Inside the box
 
-Two projects today, more coming. Each one is a self-contained release with its own benchmarks and paper-style writeup.
+Three projects today, more coming. Each one is a self-contained release with its own benchmarks and paper-style writeup.
 
 <p align="center">
   <a href="megakernel/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
@@ -163,6 +163,59 @@ cmake --build build --target test_dflash -j
 
 ---
 
+## 03 · PFlash speculative prefill on RTX 3090
+
+**In-process speculative prefill, C++/CUDA only.** A drafter (Qwen3-0.6B BF16) loaded directly into the dflash daemon scores per-token importance over a long prompt; the heavy target (Qwen3.6-27B Q4_K_M) only prefills the spans that matter. Both models share the same ggml allocator on a single RTX 3090. **No Python, no Triton, no PyTorch at runtime** — just the dflash binary and four custom CUDA kernels (`mean_K → score → select → sparse_fwd`) plus BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention), FA-2 derived, sm_80+) for the long-context drafter forward.
+
+- **~10.4× TTFT** on 128K context: **24.8 s** dflash daemon vs **~257 s** llama.cpp (FA on, Q4_0 KV).
+- **10.0× TTFT** on 64K context: **13.5 s** dflash vs **134.95 s** llama.cpp.
+- **NIAH single-needle retrieved** at every measured context (32K → 128K), `keep_ratio=0.05`, `DFLASH_FP_ALPHA=0.85`.
+
+```bash
+# 1. build dflash + BSA kernel (sm_80+ required for BSA, ~10 min cold compile)
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+                    -DCMAKE_CUDA_ARCHITECTURES=86 \
+                    -DDFLASH27B_ENABLE_BSA=ON
+cmake --build build --target test_dflash test_flashprefill_kernels -j
+
+# 2. fetch weights: 27B Q4_K_M target + 0.6B BF16 drafter (GGUF) + DFlash spec-decode draft
+huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+huggingface-cli download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
+huggingface-cli download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
+
+# 3. run the daemon: compress (drafter scoring) + generate (target spec decode)
+DFLASH_FP_USE_BSA=1 DFLASH_FP_ALPHA=0.85 \
+./build/test_dflash models/Qwen3.6-27B-Q4_K_M.gguf models/draft/model.safetensors --daemon
+# stdin protocol: `compress <ids.bin> <keep_x1000> <drafter.gguf>` →
+#                 stream of compressed token ids, then `generate <…>` →
+#                 stream of generated tokens.
+```
+
+| Source S | dflash TTFT | llama.cpp baseline | Speedup | NIAH |
+|----------|:-----------:|:------------------:|:-------:|:----:|
+| **64K**  | **13.5 s** | 134.95 s (FA off, dense) | **10.0×** | ✅ |
+| **128K** | **24.8 s** | ~257 s (FA on, Q4_0 KV)  | **~10.4×** | ✅ |
+
+Daemon stdin commands: `compress` runs the drafter with FlashPrefill block-sparse attention and returns the compressed token-id stream; `generate` runs the target on that stream with normal speculative decode + DDTree. `park` / `unpark` / `free drafter` swap weights in and out of VRAM so target + drafter coexist on a 24 GB card.
+
+**Runtime tunables** (full list in [`dflash/src/flashprefill.h`](dflash/src/flashprefill.h)):
+```
+DFLASH_FP_USE_BSA=1     # dispatch sparse FA forward through BSA (sm_80+)
+DFLASH_FP_ALPHA=0.85    # block-selection threshold; higher = stricter = fewer K-blocks per Q-row
+DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
+```
+
+**What's ours, what isn't.** Algorithms are from [Cross-Family Speculative Prefill (Liu et al., ICLR 2026)](https://arxiv.org/abs/2603.02631) for the scoring + selection layer and [FlashPrefill (Fan et al., 2026)](https://arxiv.org/abs/2603.06199) for the drafter sparse-attention forward. What we built:
+- C++/CUDA daemon-resident speculative prefill in front of a quantized GGUF target — no PyTorch, no Triton, no per-request subprocess.
+- BSA wired without `libtorch` via a 3-header ATen/c10 stub set under `dflash/deps/bsa_stubs/`.
+- Custom Qwen3-0.6B forward (`qwen3_0p6b_*`) so the drafter runs through the same ggml allocator as the 27B target.
+- 4 CUDA kernels (`flashprefill_kernels.cu`) for the FlashPrefill `mean_K / score / select / sparse_fwd` algorithm.
+
+[Full writeup →](pflash/README.md) · [Daemon-side build / tunables →](dflash/docs/SPEC_PREFILL.md) · [Blog post →](https://lucebox.com/blog/pflash)
+
+---
+
 ## Why this exists
 
 Local AI should be a default, not a privilege: private data, no per-token bill, no vendor lock-in. The hardware to run capable models already sits on desks. The software to run those chips well doesn't.
@@ -197,7 +250,8 @@ PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pin
 ```
 lucebox-hub/
 ├── megakernel/    · fused forward pass for Qwen 3.5-0.8B
-├── dflash/        · DFlash speculative decoding port for Qwen 3.5-27B on RTX 3090
+├── dflash/        · DFlash speculative decoding port for Qwen 3.5/3.6-27B on RTX 3090
+├── pflash/        · speculative-prefill harness in front of dflash (12.5× TTFT at 128K)
 └── assets/        · banners, cards, diagrams
 ```
 

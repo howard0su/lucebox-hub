@@ -552,7 +552,6 @@ static ggml_tensor * build_delta_net_block(
     DeltaNetCapture * cap,        // optional: populated on capture_delta_intermediate
     ggml_tensor * parent_ids      // optional [n_tokens] i32; tree mode when non-null
 ) {
-    const int d_inner      = q35::SSM_D_INNER;
     const int head_k_dim   = q35::HEAD_K_DIM;   // 128
     const int num_k_heads  = q35::SSM_N_GROUP;  // 16
     const int num_v_heads  = q35::SSM_DT_RANK;  // 48

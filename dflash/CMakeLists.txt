@@ -10,7 +10,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 # Bake portable rpath into all executables so bundled libggml-cuda / libggml-base
 # are found regardless of LD_LIBRARY_PATH or stale /usr/local/lib (closes #31).
-set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 set(CMAKE_INSTALL_RPATH "$ORIGIN/deps/llama.cpp/ggml/src;$ORIGIN/deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/../deps/llama.cpp/ggml/src;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-cuda")
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
@@ -18,15 +17,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# ─── ggml (from the llama.cpp submodule's ggml subtree) ─────────────
+# ─── ggml (from the llama.cpp submodule) ─────────────────────────────
 #
-# We pin ggml via llama.cpp's vendored copy for two reasons:
-#   1. It's a known-stable ggml version tested against real model code.
-#   2. llama.cpp's src/models/{qwen35.cpp,delta-net-base.cpp} sit alongside
-#      as READ-ONLY REFERENCE while we port the qwen35 forward pass.
-#      They are never built or linked — CMake only consumes the ggml/ subdir.
+# We use only ggml from the vendored llama.cpp submodule. The drafter is
+# loaded via our own custom Qwen3-0.6B forward (qwen3_0p6b_loader.cpp +
+# qwen3_0p6b_graph.cpp) rather than libllama, so libllama is not built.
 #
-# Hardcoded for CUDA. No libllama, no BLAS, no Metal, no Vulkan.
+# Hardcoded for CUDA. No BLAS, no Metal, no Vulkan, no examples/tests/tools.
 
 set(GGML_CUDA         ON  CACHE BOOL "" FORCE)
 set(GGML_BACKEND_DL   OFF CACHE BOOL "" FORCE)
@@ -42,7 +39,12 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/CMakeLists.txt")
         "deps/llama.cpp submodule missing. Run: "
         "git submodule update --init --recursive")
 endif()
-set(GGML_CUDA_FA_ALL_QUANTS ON CACHE BOOL "Compile fattn kernels for all quant pairs (needed for asymmetric KV-quant)" FORCE)
+# Asymmetric KV-quant (Q4_0 K with Q8_0 V etc) needs all fattn quant pairs.
+# Build time grows ~3x. Set DFLASH27B_FA_ALL_QUANTS=OFF if you only run
+# the spec_prefill demo (target_gen path uses standard quant pairs).
+option(DFLASH27B_FA_ALL_QUANTS "Compile ggml-cuda fattn kernels for all KV-quant pairs" ON)
+set(GGML_CUDA_FA_ALL_QUANTS ${DFLASH27B_FA_ALL_QUANTS} CACHE BOOL "" FORCE)
+# Use only the ggml subtree of llama.cpp (skip libllama).
 add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
 
 # ─── dflash27b static library ──────────────────────────────────────
@@ -53,11 +55,25 @@ add_library(dflash27b STATIC
     src/safetensors_draft.cpp
     src/qwen35_target_graph.cpp
     src/qwen3_dflash_graph.cpp
+    src/qwen3_drafter.cpp
+    src/qwen3_0p6b_loader.cpp
+    src/qwen3_0p6b_graph.cpp
+    src/flashprefill_kernels.cu
+    src/flashprefill_select.cpp
+    src/flashprefill.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/f16_convert.cu
     src/delta_net_chunked.cpp
 )
+# BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
+# path. Default ON so prefill is fast out of the box. Turn OFF if you don't
+# run the spec-prefill stack or are building for sm<80 (cutlass BSA kernels
+# need sm_80+; the auto-detect below also disables BSA on legacy arches).
+if(NOT DEFINED DFLASH27B_ENABLE_BSA)
+    set(DFLASH27B_ENABLE_BSA ON)
+endif()
+
 # Turing (75) and Ampere (86) always; Blackwell consumer (120) and Thor
 # (110 on CUDA 13+) added when nvcc supports them. DGX Spark /
 # GB10 is compute capability 12.1 (121), added at CUDA 12.9+.
@@ -85,12 +101,49 @@ list(GET _dflash27b_archs 0 _dflash27b_min_sm)
 string(REGEX REPLACE "[^0-9]" "" _dflash27b_min_sm "${_dflash27b_min_sm}")
 target_compile_definitions(dflash27b PRIVATE DFLASH27B_MIN_SM=${_dflash27b_min_sm})
 
+# BSA needs sm_80+ (FA-2 derived kernel uses BF16 tensor cores). Auto-disable
+# on legacy arches with a clear message instead of failing the link.
+if(DFLASH27B_ENABLE_BSA)
+    foreach(_arch IN LISTS _dflash27b_archs)
+        if(_arch LESS 80)
+            message(WARNING
+                "DFLASH27B_ENABLE_BSA=ON requested but CUDA_ARCHITECTURES contains '${_arch}' (<80); "
+                "disabling BSA (the spec-prefill path will fall back to the WMMA kernel).")
+            set(DFLASH27B_ENABLE_BSA OFF)
+            break()
+        endif()
+    endforeach()
+endif()
+# BSA also requires the Block-Sparse-Attention submodule (with bundled cutlass).
+# Existing users who `git pull` without `--recurse-submodules` would otherwise
+# hit a missing-header compile error — auto-disable here with a clear message.
+if(DFLASH27B_ENABLE_BSA AND NOT EXISTS
+   "${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/cutlass/include/cutlass/numeric_types.h")
+    message(WARNING
+        "DFLASH27B_ENABLE_BSA=ON requested but the Block-Sparse-Attention submodule "
+        "is missing or its bundled cutlass is not initialized. Run "
+        "`git submodule update --init --recursive` to enable the BSA spec-prefill "
+        "path. Disabling BSA for this build.")
+    set(DFLASH27B_ENABLE_BSA OFF)
+endif()
+if(DFLASH27B_ENABLE_BSA)
+    target_sources(dflash27b PRIVATE src/bsa_fwd_inst.cu src/bsa_launcher.cu)
+endif()
+
 target_include_directories(dflash27b
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+if(DFLASH27B_ENABLE_BSA)
+    target_include_directories(dflash27b PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/bsa_stubs
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/cutlass/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/block_sparse_attn/src)
+    target_compile_options(dflash27b PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    target_compile_definitions(dflash27b PRIVATE FLASHATTENTION_DISABLE_DROPOUT FLASH_NAMESPACE=flash DFLASH27B_HAVE_BSA=1)
+endif()
 
 target_link_libraries(dflash27b
     PUBLIC
@@ -113,6 +166,11 @@ endif()
 
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 if(DFLASH27B_TESTS)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
+        add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
+        set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
+        target_link_libraries(test_flashprefill_kernels PRIVATE dflash27b CUDA::cudart)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kv_quant.cpp")
         add_executable(test_kv_quant test/test_kv_quant.cpp)
         target_include_directories(test_kv_quant PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -131,6 +189,11 @@ if(DFLASH27B_TESTS)
         add_executable(smoke_draft_graph test/smoke_draft_graph.cpp)
         target_include_directories(smoke_draft_graph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(smoke_draft_graph PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen3_0p6b_forward.cpp")
+        add_executable(smoke_qwen3_0p6b_forward test/smoke_qwen3_0p6b_forward.cpp)
+        target_include_directories(smoke_qwen3_0p6b_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_qwen3_0p6b_forward PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)
