@@ -213,8 +213,13 @@ def _require_file(path: str, label: str):
         raise FileNotFoundError(f"{label} not found: {path}")
 
 
-def _prompt_path(i: int) -> Path:
-    return TMPDIR / f"he_prompt_{i:02d}.bin"
+def _tokenizer_slug(tokenizer_id: str) -> str:
+    """Filesystem-safe slug for tokenizer cache keying."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", tokenizer_id)
+
+
+def _prompt_path(i: int, tokenizer_slug: str) -> Path:
+    return TMPDIR / f"he_prompt_{tokenizer_slug}_{i:02d}.bin"
 
 
 def tokenize_prompt(prompt: str, out_path: Path, tokenizer) -> int:
@@ -297,23 +302,43 @@ def main():
                     help="Visible CUDA device id for the draft backend")
     ap.add_argument("--cuda-visible-devices", default=None,
                     help="Optional CUDA_VISIBLE_DEVICES override for test_dflash")
+    ap.add_argument("--target-tokenizer",
+                    default=os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.5-27B"),
+                    help="HuggingFace tokenizer repo for the target. Defaults to "
+                         "$DFLASH_TOKENIZER, then Qwen/Qwen3.5-27B. Override for "
+                         "Qwen3.6 or other variants, e.g. "
+                         "--target-tokenizer Qwen/Qwen3.6-27B")
     args = ap.parse_args()
 
-    print(f"[bench] target = {TARGET}")
-    print(f"[bench] draft  = {DRAFT}")
-    print(f"[bench] bin    = {TEST_DFLASH}")
-    print(f"[bench] tmp    = {TMPDIR}")
+    # Tokenized prompts are cached at TMPDIR/he_prompt_<slug>_NN.bin so
+    # different --target-tokenizer values never collide. Without the slug,
+    # `--skip-tokenize` after a prior run with a different tokenizer would
+    # silently feed the wrong token IDs to the bench.
+    tok_slug = _tokenizer_slug(args.target_tokenizer)
+
+    print(f"[bench] target    = {TARGET}")
+    print(f"[bench] draft     = {DRAFT}")
+    print(f"[bench] bin       = {TEST_DFLASH}")
+    print(f"[bench] tmp       = {TMPDIR}")
+    print(f"[bench] tokenizer = {args.target_tokenizer}")
 
     if not args.skip_tokenize:
-        print("[bench] tokenizing prompts via HF…")
+        print(f"[bench] tokenizing prompts via HF…")
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-27B", trust_remote_code=True)
+        tok = AutoTokenizer.from_pretrained(args.target_tokenizer, trust_remote_code=True)
         for i, (name, p) in enumerate(PROMPTS):
-            path = _prompt_path(i)
+            path = _prompt_path(i, tok_slug)
             n = tokenize_prompt(p, path, tok)
             print(f"  [{i:02d}] {name:26s}  {n:4d} tokens")
     else:
-        print(f"[bench] skipping tokenize (reusing {_prompt_path(0).parent})")
+        if not _prompt_path(0, tok_slug).exists():
+            sys.exit(
+                f"[error] --skip-tokenize requested but no cache for "
+                f"tokenizer={args.target_tokenizer!r} (looked for "
+                f"{_prompt_path(0, tok_slug)}). Drop --skip-tokenize to "
+                f"tokenize fresh, or pass --target-tokenizer matching a "
+                f"previous run.")
+        print(f"[bench] skipping tokenize (reusing {_prompt_path(0, tok_slug).parent})")
 
     print(f"\n[bench] mode={args.mode}  n_gen={args.n_gen}")
     print(f"{'prompt':28s}  {'steps':>6s} {'AL':>6s} {'pct%':>6s} {'tok/s':>8s}")
@@ -333,7 +358,7 @@ def main():
 
     results = []
     for i, (name, _) in enumerate(PROMPTS):
-        path = _prompt_path(i)
+        path = _prompt_path(i, tok_slug)
         try:
             r = run_test_dflash(path, args.n_gen,
                                 fast_rollback=(args.mode == "fast"),
