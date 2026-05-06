@@ -181,7 +181,7 @@ bool create_target_cache_partial(const TargetWeights & w,
                                                        head_v_dim, head_v_dim, w.ssm_dt_rank);
                 ggml_tensor * Cn = ggml_new_tensor_2d(out.rollback_ctx, GGML_TYPE_F32,
                                                        w.ssm_d_conv - 1, conv_channels);
-                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, GGML_TYPE_F16,
+                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, GGML_TYPE_Q8_0,
                                                        head_v_dim, head_v_dim,
                                                        w.ssm_dt_rank, max_verify_tokens);
                 ggml_tensor * Ci = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
@@ -993,7 +993,12 @@ static ggml_tensor * build_delta_net_block(
     //    intermediate states DIRECTLY into the persistent cache buffer,
     //    eliminating the downstream ggml_cpy that would otherwise copy them.
     //    Saves ~5-10 ms per verify step (memory-bandwidth bound) on 27B.
-    ggml_tensor * persist_inter = (parent_ids && cap && cap->ssm_intermediate_states)
+    // tree_persist writes directly to the intermediate buffer. It only supports
+    // F32/F16 output; for Q8_0 intermediates, fall back to the legacy ggml_cpy
+    // path which handles F32→Q8_0 quantization automatically.
+    ggml_tensor * persist_inter = (parent_ids && cap && cap->ssm_intermediate_states
+                                   && (cap->ssm_intermediate_states->type == GGML_TYPE_F32
+                                       || cap->ssm_intermediate_states->type == GGML_TYPE_F16))
         ? cap->ssm_intermediate_states
         : nullptr;
 

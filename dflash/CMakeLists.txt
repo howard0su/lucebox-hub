@@ -119,7 +119,6 @@ add_library(dflash27b STATIC
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
-    src/f16_convert.cu
     src/delta_net_chunked.cpp
 )
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
@@ -234,7 +233,7 @@ endif()
 
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 if(DFLASH27B_TESTS)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
+    if(_dflash27b_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash27b CUDA::cudart)
