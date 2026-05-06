@@ -67,6 +67,16 @@ int main(int argc, char ** argv) {
     }
 
     LagunaTargetCache cache;
+    // Override KV cache dtype via env (Q4_0 fits 128K on a 24 GB GPU; Q8_0 caps near 32K).
+    if (const char * kv_t = std::getenv("DFLASH_KV_TYPE")) {
+        const std::string s = kv_t;
+        if      (s == "q4_0" || s == "Q4_0") { cache.kv_k_type = GGML_TYPE_Q4_0; cache.kv_v_type = GGML_TYPE_Q4_0; }
+        else if (s == "q5_0" || s == "Q5_0") { cache.kv_k_type = GGML_TYPE_Q5_0; cache.kv_v_type = GGML_TYPE_Q5_0; }
+        else if (s == "q8_0" || s == "Q8_0") { cache.kv_k_type = GGML_TYPE_Q8_0; cache.kv_v_type = GGML_TYPE_Q8_0; }
+        else if (s == "f16")                  { cache.kv_k_type = GGML_TYPE_F16;  cache.kv_v_type = GGML_TYPE_F16;  }
+    }
+    std::printf("[bench] KV K=%s V=%s\n",
+                ggml_type_name(cache.kv_k_type), ggml_type_name(cache.kv_v_type));
     if (!create_laguna_target_cache(w, max_len, backend, cache)) {
         std::fprintf(stderr, "cache failed: %s\n", dflash27b_last_error());
         free_laguna_target_weights(w); ggml_backend_free(backend); return 1;
