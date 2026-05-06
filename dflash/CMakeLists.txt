@@ -233,7 +233,7 @@ endif()
 
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 if(DFLASH27B_TESTS)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
+    if(_dflash27b_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash27b CUDA::cudart)

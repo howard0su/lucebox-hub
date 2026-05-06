@@ -744,9 +744,10 @@ static bool draft_feature_mirror_sync_range(const TargetCache & cache,
             (const char *)cache.target_feat->data + (size_t)src_slot * src_stride;
         void * dst =
             (char *)mirror.target_feat->data + (size_t)dst_slot * dst_stride;
+        auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         if (mirror.device == mirror.target_device) {
             cudaSetDevice(mirror.device);
-            dflash27b_launch_bf16_to_f32(src, dst, elems, nullptr);
+            bf16_to_f32(src, (float *)dst, (int64_t)elems, nullptr);
         } else {
             DraftFeatureMirror & mutable_mirror =
                 const_cast<DraftFeatureMirror &>(mirror);
@@ -757,7 +758,7 @@ static bool draft_feature_mirror_sync_range(const TargetCache & cache,
                 return false;
             }
             cudaSetDevice(mirror.device);
-            dflash27b_launch_bf16_to_f32(mirror.bf16_staging, dst, elems, nullptr);
+            bf16_to_f32(mirror.bf16_staging, (float *)dst, (int64_t)elems, nullptr);
         }
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return false;
@@ -3444,13 +3445,13 @@ int main(int argc, char ** argv) {
             auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
             bf16_to_f32(
                 (const char *)cache.target_feat->data + (size_t)slot0 * elt_feat * fc_in,
-                (float *)sg.target_hidden_cat->data,
+                (float *)draft_sg.target_hidden_cat->data,
                 (int64_t)pre_n * fc_in,
                 nullptr);
             if (post_n > 0) {
                 bf16_to_f32(
                     (const char *)cache.target_feat->data,
-                    (float *)((char *)sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float)),
+                    (float *)((char *)draft_sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float)),
                     (int64_t)post_n * fc_in,
                     nullptr);
             }
