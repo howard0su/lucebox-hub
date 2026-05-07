@@ -203,6 +203,33 @@ curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application
 
 The **131K @ keep=0.10 PASS** is the surprising result. Earlier scaffolding had this point failing because pflash drops chunk-boundary tokens, truncating multi-token needles like `BLUEHORIZON-7421` to their first kept fragment (`BLUEH`). The fix lives in `scripts/laguna_pflash_niah.py::cross_tok_compressed`: recover kept-token positions by greedy subsequence-match against the original drafter IDs, group consecutive positions into runs, expand each run outward until both endpoints sit on whitespace, then decode the union once. The expanded set is a **superset** of the kept tokens, so semantic compression is preserved while broken words are pulled back together. This rescued every failing (ctx, keep) point at 64K and 131K.
 
+### Real-prompt NIAH (code corpus filler)
+
+The table above uses synthetic uniform filler. Pass `--filler-file <path>` to
+use a real corpus instead (file or directory; directories are recursively
+concatenated). On `dflash/src` (1.3 MiB of C++/CUDA, ctx=16K, depth=0.5):
+
+| keep | drafter compressed | NIAH |
+|:----:|-------------------:|:----:|
+| no-compress | (full haystack)        | ✅ PASS |
+| 0.10 |    1486 / 15278     | ❌ FAIL |
+| 0.15 |    2254 / 15278     | ❌ FAIL |
+| 0.20 |    3022 / 15278     | ❌ FAIL |
+| 0.30 |    4558 / 15278     | ✅ PASS |
+| 0.50 |    7630 / 15278     | ✅ PASS |
+
+No-compress passes, so the model itself reads the needle out of code; the
+failure mode at low `keep` is the drafter dropping the needle line. Code has
+a denser distribution of "important" tokens than synthetic filler (every
+identifier, syntax token, and semantic span looks informative to the
+attention-based scorer), so the needle line doesn't stand out as an outlier
+until retention is around 3× the synthetic-filler threshold (~0.10 → ~0.30).
+
+Production implication: route by prompt source. Synthetic / prose prompts
+tolerate `keep=0.10`; code-heavy prompts want `keep ≥ 0.30` to keep recall
+intact. A NIAH-aware drafter (or a hybrid scorer that boosts low-frequency
+tokens) is the path to bring code recall to the same ratio as prose.
+
 ### Sampler
 
 `test_laguna_daemon` is greedy by default. When `scripts/laguna_serve.py` (or any caller) appends ` samp=temp,top_p,top_k,rep_pen,seed` to a `generate` line, the daemon strips it and runs a CPU sampler chain (rep_penalty → top_k → softmax(temp) → top_p → draw) over the prompt + emitted history. Verified that greedy / temp=2.0 seed=42 / temp=2.0 seed=43 / top_p=0.5 produce four distinct outputs on the same prompt.

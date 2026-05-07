@@ -56,10 +56,20 @@ def read_counted_i32(path: Path) -> list[int]:
     n = struct.unpack_from("<I", data, 0)[0]
     return list(struct.unpack_from(f"<{n}i", data, 4))
 
-def build_haystack(target_tok, ctx: int, depth_frac: float) -> tuple[str, list[int]]:
+def build_haystack(target_tok, ctx: int, depth_frac: float,
+                    filler_text: str | None = None) -> tuple[str, list[int]]:
     # Build text of ~ctx tokens of filler, insert needle near depth_frac.
+    # When filler_text is provided (--filler-file), use that instead of the
+    # synthetic FILLER constant. The user's filler is repeated to reach the
+    # required char budget so a short source file still produces a long
+    # haystack — but a long source (e.g. concatenated source code or a long
+    # markdown doc) gives a non-uniform filler distribution that is closer to
+    # what real prompts look like, instead of the worst-case uniform repeat.
     needed_chars = max(1024, ctx * 5)
-    text = (FILLER * (needed_chars // len(FILLER) + 1))[:needed_chars]
+    base = filler_text if filler_text else FILLER
+    if not base:
+        base = FILLER
+    text = (base * (needed_chars // len(base) + 1))[:needed_chars]
     insert_at = int(len(text) * depth_frac)
     text = text[:insert_at] + "\n" + NEEDLE + "\n" + text[insert_at:]
     # Truncate by tokens.
@@ -314,6 +324,13 @@ def main():
     ap.add_argument("--target-kv", type=str, default="q4_0")
     ap.add_argument("--no-compress", action="store_true",
                     help="Skip drafter compression; feed full haystack to target.")
+    ap.add_argument("--filler-file", type=Path, default=None,
+                    help="Read filler text from this file/directory instead of "
+                         "the synthetic FILLER constant. Directories are "
+                         "recursively scanned and the contents of every "
+                         "regular file (text-decodable as UTF-8) are "
+                         "concatenated. Use this for real-prompt NIAH on code "
+                         "or doc corpora.")
     args = ap.parse_args()
 
     # Use HF `transformers.AutoTokenizer` for chat-template support. Path must
@@ -324,8 +341,28 @@ def main():
     target_tok = AutoTokenizer.from_pretrained(str(args.laguna_tok), trust_remote_code=True)
     drafter_tok = AutoTokenizer.from_pretrained(str(args.drafter_tok), trust_remote_code=True)
 
-    print(f"[niah] building haystack ctx={args.ctx} depth={args.depth} ...", file=sys.stderr)
-    text, target_full_ids = build_haystack(target_tok, args.ctx, args.depth)
+    filler_text: str | None = None
+    if args.filler_file is not None:
+        if args.filler_file.is_dir():
+            chunks: list[str] = []
+            for p in sorted(args.filler_file.rglob("*")):
+                if not p.is_file():
+                    continue
+                try:
+                    chunks.append(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+            filler_text = "\n\n".join(chunks)
+        else:
+            filler_text = args.filler_file.read_text(encoding="utf-8")
+        if not filler_text.strip():
+            raise SystemExit(f"--filler-file {args.filler_file} produced empty text")
+        print(f"[niah] filler from {args.filler_file} ({len(filler_text)} chars)",
+              file=sys.stderr)
+
+    print(f"[niah] building haystack ctx={args.ctx} depth={args.depth} "
+          f"filler={'real' if filler_text else 'synthetic'}...", file=sys.stderr)
+    text, target_full_ids = build_haystack(target_tok, args.ctx, args.depth, filler_text)
     print(f"[niah] haystack: {len(target_full_ids)} target tokens, {len(text)} chars", file=sys.stderr)
 
     drafter_full_ids = drafter_tok.encode(text, add_special_tokens=False)

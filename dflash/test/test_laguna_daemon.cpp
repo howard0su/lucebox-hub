@@ -1,19 +1,34 @@
-// Minimal Laguna daemon binary for end-to-end testing via stdin protocol.
+// Laguna target daemon. Loads Laguna-XS.2 once, then services request lines
+// from stdin. Two on-the-wire surfaces are supported in parallel:
 //
-// Loads the Laguna target once. Then for each `generate <prompt_ids.bin> <n_gen>
-// <out_ids.bin>` line on stdin:
-//   - reads counted-i32 prompt token IDs (already in LAGUNA vocab),
-//   - chunked-prefills them through build_laguna_graph (causal F32->F16 mask),
-//   - autoregressively decodes n_gen tokens via greedy argmax,
-//   - writes counted-i32 generated IDs to <out_ids.bin>.
-// Stops the loop on `quit` / `exit` / EOF.
+// (1) server.py / scripts/server.py-style protocol — streamed-fd output.
+//     Lines:
+//       <prompt_bin> <gen_len>[ samp=temp,top_p,top_k,rep_pen,seed]
+//     The daemon prefills the counted-i32 prompt, runs `gen_len` greedy
+//     (or sampled) decode steps, and writes every emitted token as a little-
+//     endian int32 to the fd given by `--stream-fd=N` followed by a -1
+//     sentinel. The bare-prompt form is what scripts/server.py'́s
+//     `_build_cmd_line()` produces for the qwen35 stack; it lets a single
+//     server.py instance dispatch by GGUF arch and reuse all of its HTTP
+//     plumbing (PrefillHook, sampler tail, streaming).
 //
-// Reuses the same kernels as bench_laguna_pflash + bench_laguna_generate.
-// Cross-tokenizer (Qwen3 -> Laguna) and PFlash compression are done by the
-// caller (Python orchestrator); this binary is the TARGET-only step.
+// (2) laguna_serve.py-style legacy protocol — file output.
+//     Lines:
+//       generate <prompt_bin> <n_gen> <out_bin>[ samp=...]
+//     Prefills + decodes as above but writes the result to <out_bin> and
+//     prints a `ok N=... gen=... prefill_s=... decode_s=... decode_tok_s=...`
+//     line on stdout. Kept as-is for `scripts/laguna_serve.py` and the
+//     `scripts/laguna_pflash_niah.py` NIAH driver.
+//
+// Both forms accept the optional ` samp=` tail; without it the daemon stays
+// greedy. SNAPSHOT/RESTORE for prefix caching is not yet implemented —
+// PrefixCache slots are disabled when arch=laguna in server.py until then.
+//
+// Stops on `quit` / `exit` / EOF.
 //
 // Usage:
-//   test_laguna_daemon <laguna.gguf> [--max-ctx N] [--kv q4_0|q8_0|f16] [--chunk N]
+//   test_laguna_daemon <laguna.gguf>
+//       [--max-ctx N] [--kv q4_0|q5_0|q8_0|f16] [--chunk N] [--stream-fd N]
 
 #include "laguna_internal.h"
 #include "internal.h"
@@ -36,6 +51,8 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml-alloc.h"
+
+#include <unistd.h>
 
 using namespace dflash27b;
 
@@ -263,21 +280,54 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string laguna_path = argv[1];
-    int max_ctx = 16384;
-    int chunk   = 2048;
+    int max_ctx  = 16384;
+    int chunk    = 2048;
+    int stream_fd = -1;
     ggml_type kv_type = GGML_TYPE_Q8_0;
-    for (int i = 2; i + 1 < argc; ++i) {
-        if (!std::strcmp(argv[i], "--max-ctx")) max_ctx = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--chunk")) chunk = std::atoi(argv[++i]);
+    auto need_arg = [&](int i) {
+        if (i + 1 >= argc) {
+            std::fprintf(stderr, "missing argument for %s\n", argv[i]);
+            std::exit(2);
+        }
+    };
+    for (int i = 2; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--max-ctx")) { need_arg(i); max_ctx = std::atoi(argv[++i]); }
+        else if (!std::strcmp(argv[i], "--chunk")) { need_arg(i); chunk = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--kv")) {
+            need_arg(i);
             std::string s = argv[++i];
             if      (s == "q4_0") kv_type = GGML_TYPE_Q4_0;
             else if (s == "q5_0") kv_type = GGML_TYPE_Q5_0;
             else if (s == "q8_0") kv_type = GGML_TYPE_Q8_0;
             else if (s == "f16")  kv_type = GGML_TYPE_F16;
         }
+        else if (!std::strncmp(argv[i], "--stream-fd=", 12)) {
+            // server.py inherits a writable pipe end and passes the fd here so
+            // the daemon can stream tokens back without going through stdout
+            // (which is reserved for synchronous status lines).
+            stream_fd = std::atoi(argv[i] + 12);
+        }
+        else if (!std::strcmp(argv[i], "--stream-fd")) {
+            need_arg(i);
+            stream_fd = std::atoi(argv[++i]);
+        }
+        else {
+            std::fprintf(stderr, "[laguna-daemon] unknown flag: %s\n", argv[i]);
+        }
     }
     const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
+
+    // stream_fd is consumed by emit_token() on the bare-prompt code path.
+    // Default -1 means "no streaming" — only the `generate` legacy form is
+    // accepted, and tokens are written to a file specified in the request.
+    auto emit_int32 = [&](int32_t v) {
+        if (stream_fd < 0) return;
+        const int32_t w = v;
+        ssize_t n = ::write(stream_fd, &w, sizeof(w));
+        // Best-effort. If the reader closed early we'll fail subsequent writes
+        // and the request errors out cleanly via the status line on stdout.
+        (void)n;
+    };
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
@@ -303,6 +353,88 @@ int main(int argc, char ** argv) {
 
     std::mt19937_64 sampler_rng{std::random_device{}()};
 
+    // Run-prompt helper shared between the bare-prompt and `generate` paths.
+    // When stream_fd >= 0 each emitted token is written as int32 little-
+    // endian and the call closes with a -1 sentinel; otherwise tokens are
+    // accumulated and returned to the caller for file write.
+    auto run_prompt = [&](const std::vector<int32_t> & prompt,
+                          int n_gen,
+                          const SamplerCfg & sampler,
+                          bool do_sample,
+                          bool stream,
+                          double & pf_s_out,
+                          double & g_s_out,
+                          std::vector<int32_t> & generated_out) -> const char * {
+        const int N = (int)prompt.size();
+        if (N + n_gen > max_ctx) return "overflow";
+
+        reset_laguna_target_cache(cache);
+
+        std::vector<float> embed_pf((size_t)N * w.n_embd);
+        if (!w.embedder.embed(prompt.data(), N, embed_pf.data())) return "embed_prefill";
+
+        auto t_pf0 = std::chrono::steady_clock::now();
+        std::vector<float> last_logits;
+        bool ok = true;
+        const int n_chunks = (N + chunk - 1) / chunk;
+        for (int c = 0; c < n_chunks && ok; ++c) {
+            const int kv_start = c * chunk;
+            const int n_tok    = std::min(chunk, N - c * chunk);
+            ok = laguna_step(backend, w, cache,
+                              embed_pf.data() + (size_t)kv_start * w.n_embd,
+                              n_tok, kv_start, no_mask, last_logits);
+        }
+        if (!ok) return "prefill";
+        auto t_pf1 = std::chrono::steady_clock::now();
+        pf_s_out = std::chrono::duration<double>(t_pf1 - t_pf0).count();
+
+        auto argmax = [](const std::vector<float> & ll) {
+            int best = 0; float bv = ll[0];
+            for (size_t i = 1; i < ll.size(); ++i)
+                if (ll[i] > bv) { bv = ll[i]; best = (int)i; }
+            return best;
+        };
+
+        std::vector<int32_t> history;
+        history.reserve((size_t)N + (size_t)n_gen);
+        history.insert(history.end(), prompt.begin(), prompt.end());
+
+        auto pick = [&](const std::vector<float> & ll) -> int {
+            return do_sample
+                ? sample_logits(ll.data(), (int)ll.size(), sampler, history, sampler_rng)
+                : argmax(ll);
+        };
+
+        int next_tok = pick(last_logits);
+        generated_out.clear();
+        generated_out.reserve(n_gen);
+
+        std::vector<float> embed_step((size_t)w.n_embd);
+        auto t_g0 = std::chrono::steady_clock::now();
+        for (int s = 0; s < n_gen; ++s) {
+            if (next_tok == w.eos_id || next_tok == w.eos_chat_id) break;
+            generated_out.push_back(next_tok);
+            history.push_back(next_tok);
+            if (stream) emit_int32(next_tok);
+            if (!w.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
+            std::vector<float> step_logits;
+            if (!laguna_step(backend, w, cache, embed_step.data(), 1,
+                              cache.cur_pos, no_mask, step_logits)) { ok = false; break; }
+            next_tok = pick(step_logits);
+        }
+        auto t_g1 = std::chrono::steady_clock::now();
+        g_s_out = std::chrono::duration<double>(t_g1 - t_g0).count();
+
+        if (stream) emit_int32(-1);
+        return ok ? nullptr : "decode";
+    };
+
+    auto looks_like_path = [](const std::string & s) {
+        if (s.empty()) return false;
+        if (s[0] == '/' || s[0] == '.') return true;
+        return s.find('/') != std::string::npos;
+    };
+
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line == "quit" || line == "exit") break;
@@ -316,102 +448,83 @@ int main(int argc, char ** argv) {
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
-        if (cmd != "generate") {
-            std::fprintf(stderr, "[laguna-daemon] unknown cmd: %s\n", line.c_str());
-            std::printf("err unknown_command\n"); std::fflush(stdout);
+
+        if (cmd == "generate") {
+            // Legacy file-output path used by laguna_serve.py / NIAH driver.
+            std::string in_path, out_path;
+            int n_gen = 0;
+            iss >> in_path >> n_gen >> out_path;
+            if (in_path.empty() || out_path.empty() || n_gen <= 0) {
+                std::fprintf(stderr, "[laguna-daemon] bad: %s\n", line.c_str());
+                std::printf("err bad_args\n"); std::fflush(stdout);
+                continue;
+            }
+            auto prompt = read_counted_i32(in_path);
+            if (prompt.empty()) {
+                std::printf("err empty_prompt\n"); std::fflush(stdout); continue;
+            }
+            double pf_s = 0.0, g_s = 0.0;
+            std::vector<int32_t> generated;
+            const char * err = run_prompt(prompt, n_gen, sampler, do_sample,
+                                          /*stream=*/false, pf_s, g_s, generated);
+            if (err) {
+                std::printf("err %s\n", err); std::fflush(stdout);
+                continue;
+            }
+            if (!write_counted_i32(out_path, generated)) {
+                std::printf("err write_out\n"); std::fflush(stdout); continue;
+            }
+            std::printf("ok N=%d gen=%zu prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f out=%s\n",
+                        (int)prompt.size(), generated.size(), pf_s, g_s,
+                        generated.size() / std::max(1e-9, g_s), out_path.c_str());
+            std::fflush(stdout);
             continue;
         }
-        std::string in_path, out_path;
-        int n_gen = 0;
-        iss >> in_path >> n_gen >> out_path;
-        if (in_path.empty() || out_path.empty() || n_gen <= 0) {
-            std::fprintf(stderr, "[laguna-daemon] bad: %s\n", line.c_str());
-            std::printf("err bad_args\n"); std::fflush(stdout);
+
+        if (looks_like_path(cmd)) {
+            // Bare-prompt server.py-style path: `<prompt_bin> <gen_len>`.
+            // Tokens stream as int32 LE on stream_fd, terminated by -1.
+            const std::string & in_path = cmd;
+            int n_gen = 0;
+            iss >> n_gen;
+            if (n_gen <= 0) {
+                std::fprintf(stderr, "[laguna-daemon] bad: %s\n", line.c_str());
+                std::printf("err bad_args\n"); std::fflush(stdout);
+                emit_int32(-1);
+                continue;
+            }
+            if (stream_fd < 0) {
+                std::fprintf(stderr, "[laguna-daemon] bare-prompt requires --stream-fd\n");
+                std::printf("err no_stream_fd\n"); std::fflush(stdout);
+                continue;
+            }
+            auto prompt = read_counted_i32(in_path);
+            if (prompt.empty()) {
+                std::printf("err empty_prompt\n"); std::fflush(stdout);
+                emit_int32(-1);
+                continue;
+            }
+            double pf_s = 0.0, g_s = 0.0;
+            std::vector<int32_t> generated;
+            const char * err = run_prompt(prompt, n_gen, sampler, do_sample,
+                                          /*stream=*/true, pf_s, g_s, generated);
+            if (err) {
+                // emit_int32(-1) was NOT yet emitted (only on success path).
+                // Send it now so the reader unblocks before the status line.
+                emit_int32(-1);
+                std::printf("err %s\n", err); std::fflush(stdout);
+                continue;
+            }
+            std::printf("ok N=%d gen=%zu prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f stream_fd=%d\n",
+                        (int)prompt.size(), generated.size(), pf_s, g_s,
+                        generated.size() / std::max(1e-9, g_s), stream_fd);
+            std::fflush(stdout);
             continue;
         }
 
-        auto prompt = read_counted_i32(in_path);
-        if (prompt.empty()) {
-            std::printf("err empty_prompt\n"); std::fflush(stdout); continue;
-        }
-        const int N = (int)prompt.size();
-        if (N + n_gen > max_ctx) {
-            std::fprintf(stderr, "[laguna-daemon] N+n_gen=%d > max_ctx=%d\n", N + n_gen, max_ctx);
-            std::printf("err overflow\n"); std::fflush(stdout); continue;
-        }
-
-        // Reset cache (fresh request).
-        reset_laguna_target_cache(cache);
-
-        // Embed full prompt host-side via CpuEmbedder.
-        std::vector<float> embed_pf((size_t)N * w.n_embd);
-        if (!w.embedder.embed(prompt.data(), N, embed_pf.data())) {
-            std::printf("err embed_prefill\n"); std::fflush(stdout); continue;
-        }
-
-        // Chunked prefill.
-        auto t_pf0 = std::chrono::steady_clock::now();
-        std::vector<float> last_logits;
-        bool ok = true;
-        const int n_chunks = (N + chunk - 1) / chunk;
-        for (int c = 0; c < n_chunks && ok; ++c) {
-            const int kv_start = c * chunk;
-            const int n_tok    = std::min(chunk, N - c * chunk);
-            ok = laguna_step(backend, w, cache, embed_pf.data() + (size_t)kv_start * w.n_embd,
-                              n_tok, kv_start, no_mask, last_logits);
-        }
-        auto t_pf1 = std::chrono::steady_clock::now();
-        if (!ok) { std::printf("err prefill\n"); std::fflush(stdout); continue; }
-        const double pf_s = std::chrono::duration<double>(t_pf1 - t_pf0).count();
-
-        // Argmax helper for the greedy default path.
-        auto argmax = [&](const std::vector<float> & ll) {
-            int best = 0; float bv = ll[0];
-            for (size_t i = 1; i < ll.size(); ++i) if (ll[i] > bv) { bv = ll[i]; best = (int)i; }
-            return best;
-        };
-        // History feeds the rep_penalty window: prompt tokens come first so a
-        // sampled token can be down-weighted relative to recent prompt context.
-        std::vector<int32_t> history;
-        history.reserve((size_t)N + (size_t)n_gen);
-        history.insert(history.end(), prompt.begin(), prompt.end());
-
-        auto pick = [&](const std::vector<float> & ll) -> int {
-            if (do_sample) {
-                return sample_logits(ll.data(), (int)ll.size(), sampler, history, sampler_rng);
-            }
-            return argmax(ll);
-        };
-
-        int next_tok = pick(last_logits);
-        std::vector<int32_t> generated;
-        generated.reserve(n_gen);
-
-        std::vector<float> embed_step((size_t)w.n_embd);
-        auto t_g0 = std::chrono::steady_clock::now();
-        for (int s = 0; s < n_gen; ++s) {
-            if (next_tok == w.eos_id || next_tok == w.eos_chat_id) break;
-            generated.push_back(next_tok);
-            history.push_back(next_tok);
-            if (!w.embedder.embed(&next_tok, 1, embed_step.data())) {
-                ok = false; break;
-            }
-            std::vector<float> step_logits;
-            if (!laguna_step(backend, w, cache, embed_step.data(), 1, cache.cur_pos, no_mask, step_logits)) {
-                ok = false; break;
-            }
-            next_tok = pick(step_logits);
-        }
-        auto t_g1 = std::chrono::steady_clock::now();
-        const double g_s = std::chrono::duration<double>(t_g1 - t_g0).count();
-
-        if (!write_counted_i32(out_path, generated)) {
-            std::printf("err write_out\n"); std::fflush(stdout); continue;
-        }
-        std::printf("ok N=%d gen=%zu prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f out=%s\n",
-                    N, generated.size(), pf_s, g_s,
-                    generated.size() / std::max(1e-9, g_s), out_path.c_str());
-        std::fflush(stdout);
+        std::fprintf(stderr, "[laguna-daemon] unknown cmd: %s\n", line.c_str());
+        std::printf("err unknown_command\n"); std::fflush(stdout);
+        emit_int32(-1);
     }
 
     free_laguna_target_cache(cache);
