@@ -130,13 +130,12 @@ static ggml_tensor * build_moe_graph_fused(
     // Post-attention norm → input to MoE FFN
     ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, MOE_EPS);
 
-    // ── Router + top-k ──
+    // ── Router + top-k + weight normalization ──
+    // Node ordering enables ggml-cuda topk_moe fusion (softmax→reshape→argsort→view→get_rows→norm).
     ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, post);
     ggml_tensor * probs  = ggml_soft_max(ctx, logits);
-    ggml_tensor * selected = ggml_cont(ctx, ggml_argsort_top_k(ctx, probs, n_used));
-
-    // ── Weight extraction + normalization ──
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_total, n_tokens);
+    ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, n_used);
     ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);
 
     ggml_tensor * weights_2d  = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
@@ -144,6 +143,9 @@ static ggml_tensor * build_moe_graph_fused(
     weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5f, INFINITY);
     weights_2d  = ggml_div(ctx, weights_2d, weights_sum);
     weights     = ggml_reshape_3d(ctx, weights_2d, 1, n_used, n_tokens);
+
+    // Expand routing chain first to ensure fusion-friendly graph ordering
+    ggml_build_forward_expand(gf, weights);
 
     // ── Expert FFN via mul_mat_id ──
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, post, hidden, 1, n_tokens);
