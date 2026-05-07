@@ -307,28 +307,48 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
             stream_emit(-1);
             continue;
         }
+        if (line == "LIST_SLOTS") {
+            // Server-side prefix_cache.py:startup_sync() asks every freshly
+            // spawned daemon for the list of slots already populated by a
+            // prior run. We allocate snapshots lazily on demand so the list
+            // is whatever is currently `used`. Reply protocol matches the
+            // qwen35 daemon: a single line `[snap] slots=<csv>` (no -1
+            // sentinel — server reads via stdout marker prefix).
+            std::printf("[snap] slots=");
+            bool first = true;
+            for (int i = 0; i < kMaxSlots; ++i) {
+                if (snapshots[i].used) {
+                    std::printf("%s%d", first ? "" : ",", i);
+                    first = false;
+                }
+            }
+            std::printf("\n"); std::fflush(stdout);
+            continue;
+        }
         if (starts_with(line, "SNAPSHOT ")) {
             int slot = std::atoi(line.c_str() + 9);
-            if (!ensure_slot(slot)) { stream_emit(-1); continue; }
-            if (!laguna_snapshot_save(cache, snapshots[slot])) {
+            if (!ensure_slot(slot) ||
+                !laguna_snapshot_save(cache, snapshots[slot])) {
                 std::fprintf(stderr, "[snap] save slot=%d: %s\n",
                               slot, dflash27b_last_error());
-                stream_emit(-1); continue;
             }
+            // server-side _await_reply matches `[snap] inline slot=...`
+            // (no stream_fd sentinel, mirrors qwen35).
             std::printf("[snap] inline slot=%d cur_pos=%d\n",
-                         slot, snapshots[slot].cur_pos);
+                         slot,
+                         snapshots[slot].used ? snapshots[slot].cur_pos : -1);
             std::fflush(stdout);
-            stream_emit(-1);
             continue;
         }
         if (starts_with(line, "FREE_SNAPSHOT ")) {
             int slot = std::atoi(line.c_str() + 14);
             if (slot >= 0 && slot < kMaxSlots) {
                 laguna_snapshot_free(snapshots[slot]);
-                std::printf("[snap] freed slot=%d\n", slot);
-                std::fflush(stdout);
             }
-            stream_emit(-1);
+            // server-side _await_reply expects "[snap] freed slot=N" on
+            // stdout (no stream_fd ack here — mirrors qwen35).
+            std::printf("[snap] freed slot=%d\n", slot);
+            std::fflush(stdout);
             continue;
         }
 
