@@ -121,6 +121,8 @@ add_library(dflash27b STATIC
     src/kv_quant.cpp
     src/f16_convert.cu
     src/delta_net_chunked.cpp
+    src/moe_experts.cpp
+    src/qwen35moe_target_graph.cpp
 )
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
 # the drafter uses ggml's flash_attn_ext instead. Guard added after SM check.
@@ -278,6 +280,7 @@ if(DFLASH27B_TESTS)
         target_include_directories(smoke_load_target PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(smoke_load_target PRIVATE dflash27b ggml ggml-cuda)
     endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_target_forward.cpp")
         add_executable(smoke_target_forward test/smoke_target_forward.cpp)
         target_include_directories(smoke_target_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -289,8 +292,8 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_generate PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
-        add_executable(test_dflash test/test_dflash.cpp)
-        target_include_directories(test_dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_executable(test_dflash test/test_dflash.cpp test/test_dflash_moe.cpp)
+        target_include_directories(test_dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(test_dflash PRIVATE dflash27b ggml ggml-cuda)
         # test_dflash uses cudaMemcpyAsync / cudaMemcpy2DAsync directly for the
         # --fast-rollback path (per-step SSM intermediate state commit). Needs
@@ -303,4 +306,5 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_dflash PRIVATE OpenMP::OpenMP_CXX)
         endif()
     endif()
+
 endif()

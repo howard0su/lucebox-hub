@@ -23,6 +23,7 @@
 #include "gguf.h"
 
 #include "dflash27b.h"
+#include "moe_experts.h"
 
 namespace dflash27b {
 
@@ -71,6 +72,13 @@ struct TargetLayer {
     ggml_tensor * ssm_dt_bias    = nullptr;  // [dt_rank] per-head alpha bias
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
+
+    // MoE fields (non-null only for qwen35moe architecture)
+    ggml_tensor * ffn_gate_inp       = nullptr;  // [hidden, n_experts] F32 — router
+    ggml_tensor * ffn_gate_inp_shexp = nullptr;  // [hidden, 1] F32 — shared expert gate
+    ggml_tensor * shared_w_gate      = nullptr;  // [hidden, expert_ffn] — shared expert FFN
+    ggml_tensor * shared_w_up        = nullptr;  // [hidden, expert_ffn]
+    ggml_tensor * shared_w_down      = nullptr;  // [expert_ffn, hidden]
 };
 
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
@@ -139,6 +147,15 @@ struct TargetWeights {
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
     int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
+
+    // MoE fields (zero/false for dense qwen35 models — no impact on dense path)
+    bool is_moe            = false;
+    int  n_experts         = 0;    // 256 for qwen35moe
+    int  n_experts_active  = 0;    // 8 for qwen35moe
+    int  expert_ffn_dim    = 0;    // 512 for qwen35moe
+
+    // Expert weight source (mmap offsets, types, dims). Populated by loader for MoE.
+    MoeExpertSource expert_source;
 };
 
 struct TargetLoadPlan {
@@ -471,5 +488,27 @@ ggml_tensor * build_qwen35_layer(
     int                   n_tokens,
     bool                  capture,
     int                   fa_window = 0);
+
+// ─── MoE forward pass (qwen35moe) ─────────────────────────────────────
+
+// Full MoE forward pass: all layers + lm_head via fused mega-graph.
+// All expert weights must be pinned in VRAM (no runtime swapping).
+bool run_qwen35moe_forward(
+    ggml_backend_t         backend,
+    const TargetWeights &  w,
+    TargetCache &          cache,
+    PinnedExperts &        pinned,        // all layers pinned in VRAM
+    ggml_tensor *          act_a,        // [hidden, max_tokens] persistent buffer A
+    ggml_tensor *          act_b,        // [hidden, max_tokens] persistent buffer B
+    int                    n_tokens,
+    ggml_tensor *          positions,    // [4*n_tokens] i32 (pre-filled)
+    ggml_tensor *          attn_mask,    // optional [kv_pad, q_pad] f16
+    int                    kv_start,
+    bool                   capture,
+    int                    fa_window,
+    ggml_tensor *          logits_out,   // [vocab, n_tokens] f32 (pre-allocated)
+    ggml_tensor *          argmax_out = nullptr,  // [n_tokens] i32 (or nullptr)
+    ggml_tensor *          parent_ids = nullptr,  // [n_tokens] i32 for DDTree
+    std::vector<DeltaNetCapture> * delta_captures = nullptr);
 
 } // namespace dflash27b
