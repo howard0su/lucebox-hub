@@ -83,6 +83,122 @@ def tokenize_for_drafter(drafter_tok, text: str) -> list[int]:
 def detok_drafter(drafter_tok, ids: list[int]) -> str:
     return drafter_tok.decode(ids, skip_special_tokens=False)
 
+# ------------------------------------------------------------------
+# Cross-tokenizer round-trip helpers (PFlash chunk-boundary recovery).
+#
+# pflash_daemon returns a subset of drafter token IDs (preserving order)
+# but DROPS tokens that fall in low-importance chunks. When a needle word
+# spans a chunk boundary, the drafter may keep the leading token (e.g.
+# "BLUEH") and drop the trailing tokens ("ORIZON-7421"). Decoding the
+# subset alone yields a truncated word.
+#
+# Fix: recover the kept-token positions by greedy subsequence match,
+# group consecutive positions into runs, then expand each run outward
+# until both endpoints sit on whitespace. Concat the expanded spans and
+# decode once. The expanded set is a SUPERSET of the kept tokens, so the
+# semantic compression is preserved while word integrity is restored.
+# ------------------------------------------------------------------
+
+def _recover_kept_indices(full_ids: list[int], kept_ids: list[int]) -> list[int]:
+    """Greedy subsequence match: returns positions in full_ids that align with kept_ids in order."""
+    out: list[int] = []
+    j = 0
+    for i, t in enumerate(full_ids):
+        if j < len(kept_ids) and t == kept_ids[j]:
+            out.append(i)
+            j += 1
+    if j != len(kept_ids):
+        raise RuntimeError(f"kept_ids not a subsequence of full_ids ({j}/{len(kept_ids)} matched)")
+    return out
+
+
+def _group_runs(idxs: list[int]) -> list[tuple[int, int]]:
+    """Group consecutive integers into [start,end] inclusive runs."""
+    if not idxs:
+        return []
+    runs: list[tuple[int, int]] = []
+    a = b = idxs[0]
+    for x in idxs[1:]:
+        if x == b + 1:
+            b = x
+        else:
+            runs.append((a, b))
+            a = b = x
+    runs.append((a, b))
+    return runs
+
+
+def _expand_run_to_word_boundaries(full_ids: list[int], r0: int, r1: int,
+                                    tok, decode_cache: dict[int, str],
+                                    max_extend: int = 24) -> tuple[int, int]:
+    """Extend [r0,r1] outward until both ends sit on a whitespace boundary.
+
+    A token's text "starts on whitespace" if its decoded form begins with a
+    space, newline or tab (Qwen3/Laguna byte-level BPE: a leading 'Ġ' becomes
+    a leading space after decode). max_extend caps growth per side to keep
+    the compression ratio close to the drafter's intent.
+    """
+    def _txt(idx: int) -> str:
+        if idx not in decode_cache:
+            decode_cache[idx] = tok.decode([full_ids[idx]], skip_special_tokens=False)
+        return decode_cache[idx]
+
+    a, b = r0, r1
+    # Extend left: keep prepending tokens until the FIRST token in the span
+    # itself begins with whitespace (so the word is complete on the left).
+    steps = 0
+    while a > 0 and steps < max_extend:
+        cur = _txt(a)
+        if cur and cur[0] in " \n\t\r":
+            break
+        a -= 1
+        steps += 1
+    # Extend right: keep appending tokens until the NEXT token (b+1) begins
+    # with whitespace, indicating the current span ends on a word boundary.
+    steps = 0
+    while b + 1 < len(full_ids) and steps < max_extend:
+        nxt = _txt(b + 1)
+        if nxt and nxt[0] in " \n\t\r":
+            break
+        b += 1
+        steps += 1
+    return a, b
+
+
+def _merge_overlapping(runs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not runs:
+        return []
+    runs = sorted(runs)
+    out = [runs[0]]
+    for a, b in runs[1:]:
+        pa, pb = out[-1]
+        if a <= pb + 1:
+            out[-1] = (pa, max(pb, b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def cross_tok_compressed(drafter_full_ids: list[int], compressed_drafter: list[int],
+                          drafter_tok, target_tok) -> tuple[str, list[int]]:
+    """Decode pflash-compressed drafter IDs to text -> retokenize as target IDs.
+
+    Recovers chunk-boundary words by expanding each contiguous run of kept
+    drafter tokens outward to the surrounding whitespace.
+    """
+    kept_idx = _recover_kept_indices(drafter_full_ids, compressed_drafter)
+    runs = _group_runs(kept_idx)
+    cache: dict[int, str] = {}
+    expanded = [_expand_run_to_word_boundaries(drafter_full_ids, r0, r1, drafter_tok, cache)
+                for r0, r1 in runs]
+    expanded = _merge_overlapping(expanded)
+    expanded_ids: list[int] = []
+    for a, b in expanded:
+        expanded_ids.extend(drafter_full_ids[a:b + 1])
+    text = drafter_tok.decode(expanded_ids, skip_special_tokens=False)
+    target_ids = target_tok.encode(text, add_special_tokens=False)
+    return text, target_ids
+
 class PflashDaemon:
     """Wraps pflash_daemon stdin/stdout protocol with a streamfd pipe."""
     def __init__(self, bin_path: Path, drafter_gguf: Path):
@@ -233,12 +349,24 @@ def main():
               f"({len(compressed_drafter)/len(drafter_full_ids):.4f}) in {drafter_s:.2f}s", file=sys.stderr)
 
         # ---- Phase 2: cross-tokenizer round-trip Qwen3 -> text -> Laguna ----
-        compressed_text = drafter_tok.decode(compressed_drafter, skip_special_tokens=False)
-        laguna_ids = target_tok.encode(compressed_text, add_special_tokens=False)
-        print(f"[niah] cross-tok: {len(compressed_drafter)} qwen3 -> {len(laguna_ids)} laguna tokens", file=sys.stderr)
+        # Word-boundary recovery: expand each contiguous kept run to the
+        # nearest whitespace before decoding, so words split across chunk
+        # boundaries (e.g. needle 'BLUEHORIZON-7421' tokenized as several
+        # Qwen3 tokens) are preserved instead of being truncated to their
+        # first kept fragment.
+        compressed_text, laguna_ids = cross_tok_compressed(
+            drafter_full_ids, compressed_drafter, drafter_tok, target_tok)
+        print(f"[niah] cross-tok: {len(compressed_drafter)} qwen3 (kept) -> "
+              f"{len(laguna_ids)} laguna tokens (after word-boundary recovery)",
+              file=sys.stderr)
 
     # ---- Phase 3: laguna prefill + decode ----
-    max_ctx = max(args.ctx, len(laguna_ids) + args.max_gen + 64)
+    # The target only ever sees the compressed laguna_ids (or the full haystack
+    # when --no-compress is passed). Sizing max_ctx to the compressed length
+    # avoids OOM at huge --ctx values where the original haystack would force a
+    # KV cache allocation that doesn't fit on a 24GB GPU even though the target
+    # never receives that many tokens.
+    max_ctx = len(laguna_ids) + args.max_gen + 64
     print(f"[niah] starting laguna daemon (max_ctx={max_ctx}, kv={args.target_kv}) ...", file=sys.stderr)
     lg = LagunaDaemon(args.laguna_bin, args.target, max_ctx, args.target_kv, args.target_chunk)
     t0 = time.time()

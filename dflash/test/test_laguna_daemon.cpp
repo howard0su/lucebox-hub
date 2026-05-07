@@ -19,6 +19,7 @@
 #include "internal.h"
 #include "dflash27b.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -26,8 +27,10 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "ggml-backend.h"
@@ -35,6 +38,109 @@
 #include "ggml-alloc.h"
 
 using namespace dflash27b;
+
+// ----------------------------------------------------------------------------
+// CPU sampler chain — ported from test_dflash.cpp.
+//
+// The daemon stays greedy by default (cfg.temp == 0). server.py appends a
+// `samp=temp,top_p,top_k,rep_pen,seed` tail to each `generate` line when the
+// HTTP request asks for non-greedy decoding; parse_sampler_token strips it
+// from the line and fills out cfg. sample_logits applies
+// rep_penalty -> top_k -> softmax(temp) -> top_p -> draw.
+// ----------------------------------------------------------------------------
+struct SamplerCfg {
+    float    temp       = 0.0f;
+    float    top_p      = 1.0f;
+    int      top_k      = 0;
+    float    rep_pen    = 1.0f;
+    int      rep_window = 256;
+    uint64_t seed       = 0;
+};
+
+static int sample_logits(const float * logits_in,
+                         int vocab,
+                         const SamplerCfg & cfg,
+                         const std::vector<int32_t> & history,
+                         std::mt19937_64 & rng) {
+    std::vector<std::pair<float,int>> cand(vocab);
+    for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
+
+    if (cfg.rep_pen > 1.0f && !history.empty()) {
+        const int win  = std::min((int)history.size(), cfg.rep_window);
+        const int from = (int)history.size() - win;
+        std::unordered_set<int> seen;
+        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
+        for (auto & c : cand) {
+            if (seen.count(c.second)) {
+                c.first = (c.first > 0.0f) ? c.first / cfg.rep_pen
+                                           : c.first * cfg.rep_pen;
+            }
+        }
+    }
+
+    if (cfg.top_k > 0 && cfg.top_k < vocab) {
+        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
+                          [](auto & a, auto & b){ return a.first > b.first; });
+        cand.resize(cfg.top_k);
+    } else {
+        std::sort(cand.begin(), cand.end(),
+                  [](auto & a, auto & b){ return a.first > b.first; });
+    }
+
+    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
+    const float maxv  = cand.front().first * inv_t;
+    double Z = 0.0;
+    std::vector<float> probs(cand.size());
+    for (size_t i = 0; i < cand.size(); i++) {
+        probs[i] = std::exp(cand[i].first * inv_t - maxv);
+        Z       += probs[i];
+    }
+    for (auto & p : probs) p = (float)(p / Z);
+
+    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+        double cum = 0.0;
+        size_t cut = probs.size();
+        for (size_t i = 0; i < probs.size(); i++) {
+            cum += probs[i];
+            if (cum >= cfg.top_p) { cut = i + 1; break; }
+        }
+        probs.resize(cut); cand.resize(cut);
+        double zz = 0.0;
+        for (auto p : probs) zz += p;
+        for (auto & p : probs) p = (float)(p / zz);
+    }
+
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    const double r   = u(rng);
+    double       acc = 0.0;
+    for (size_t i = 0; i < probs.size(); i++) {
+        acc += probs[i];
+        if (r <= acc) return cand[i].second;
+    }
+    return cand.back().second;
+}
+
+static bool parse_sampler_token(std::string & line, SamplerCfg & out) {
+    auto pos = line.find(" samp=");
+    if (pos == std::string::npos) return false;
+    auto end = line.find(' ', pos + 1);
+    std::string tok = (end == std::string::npos)
+                          ? line.substr(pos + 6)
+                          : line.substr(pos + 6, end - (pos + 6));
+    line.erase(pos, (end == std::string::npos ? std::string::npos : end - pos));
+    float t = 0.0f, tp = 1.0f, rp = 1.0f;
+    int   tk = 0;
+    unsigned long long sd = 0;
+    int n = std::sscanf(tok.c_str(), "%f,%f,%d,%f,%llu",
+                        &t, &tp, &tk, &rp, &sd);
+    if (n < 1) return false;
+    out.temp    = t;
+    out.top_p   = tp;
+    out.top_k   = tk;
+    out.rep_pen = rp;
+    out.seed    = sd;
+    return true;
+}
 
 static std::vector<int32_t> read_counted_i32(const std::string & path) {
     std::ifstream f(path, std::ios::binary);
@@ -195,9 +301,18 @@ int main(int argc, char ** argv) {
                 ggml_type_name(kv_type), chunk);
     std::fflush(stdout);
 
+    std::mt19937_64 sampler_rng{std::random_device{}()};
+
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line == "quit" || line == "exit") break;
+        // Strip optional ` samp=temp,top_p,top_k,rep_pen,seed` tail before
+        // splitting the line — server.py appends this when the HTTP request
+        // sets temperature > 0.
+        SamplerCfg sampler{};
+        const bool have_sampler = parse_sampler_token(line, sampler);
+        if (have_sampler && sampler.seed != 0) sampler_rng.seed(sampler.seed);
+        const bool do_sample = have_sampler && sampler.temp > 0.0f;
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
@@ -249,13 +364,26 @@ int main(int argc, char ** argv) {
         if (!ok) { std::printf("err prefill\n"); std::fflush(stdout); continue; }
         const double pf_s = std::chrono::duration<double>(t_pf1 - t_pf0).count();
 
-        // Argmax sample first generated token.
+        // Argmax helper for the greedy default path.
         auto argmax = [&](const std::vector<float> & ll) {
             int best = 0; float bv = ll[0];
             for (size_t i = 1; i < ll.size(); ++i) if (ll[i] > bv) { bv = ll[i]; best = (int)i; }
             return best;
         };
-        int next_tok = argmax(last_logits);
+        // History feeds the rep_penalty window: prompt tokens come first so a
+        // sampled token can be down-weighted relative to recent prompt context.
+        std::vector<int32_t> history;
+        history.reserve((size_t)N + (size_t)n_gen);
+        history.insert(history.end(), prompt.begin(), prompt.end());
+
+        auto pick = [&](const std::vector<float> & ll) -> int {
+            if (do_sample) {
+                return sample_logits(ll.data(), (int)ll.size(), sampler, history, sampler_rng);
+            }
+            return argmax(ll);
+        };
+
+        int next_tok = pick(last_logits);
         std::vector<int32_t> generated;
         generated.reserve(n_gen);
 
@@ -264,6 +392,7 @@ int main(int argc, char ** argv) {
         for (int s = 0; s < n_gen; ++s) {
             if (next_tok == w.eos_id || next_tok == w.eos_chat_id) break;
             generated.push_back(next_tok);
+            history.push_back(next_tok);
             if (!w.embedder.embed(&next_tok, 1, embed_step.data())) {
                 ok = false; break;
             }
@@ -271,7 +400,7 @@ int main(int argc, char ** argv) {
             if (!laguna_step(backend, w, cache, embed_step.data(), 1, cache.cur_pos, no_mask, step_logits)) {
                 ok = false; break;
             }
-            next_tok = argmax(step_logits);
+            next_tok = pick(step_logits);
         }
         auto t_g1 = std::chrono::steady_clock::now();
         const double g_s = std::chrono::duration<double>(t_g1 - t_g0).count();
