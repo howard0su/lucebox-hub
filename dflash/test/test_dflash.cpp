@@ -22,11 +22,16 @@
 #include "internal.h"
 #include "dflash_graph.h"
 #include "qwen3_drafter.h"
+#include "laguna_daemon.h"  // arch dispatch — laguna targets are served by
+                            // dflash27b::run_laguna_daemon() instead of the
+                            // qwen35 + DFlash + DDTree pipeline below.
 
 #include "ggml.h"
+#include "gguf.h"  // gguf_init_from_file / gguf_find_key for arch detect
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+
 
 #include <cuda_runtime.h>
 
@@ -1192,10 +1197,42 @@ int main(int argc, char ** argv) {
         g_fa_window = std::max(0, std::atoi(s));
     }
     const char * target_path = argv[1];
-    const char * draft_path  = argv[2];
-    const char * prompt_path = (argc >= 6 && argv[3][0] != '-') ? argv[3] : nullptr;
-    int          n_gen       = (argc >= 6 && argv[3][0] != '-') ? std::atoi(argv[4]) : 0;
-    const char * out_path    = (argc >= 6 && argv[3][0] != '-') ? argv[5] : nullptr;
+
+    // ---- Architecture detection ------------------------------------------
+    // Read general.architecture from the target GGUF before parsing argv
+    // shape so we can route laguna requests to run_laguna_daemon() and
+    // accept the no-draft argv layout server.py uses for that arch.
+    auto peek_gguf_arch = [&](const char * path) -> std::string {
+        gguf_init_params gip{};
+        gip.no_alloc = true;
+        gip.ctx = nullptr;
+        gguf_context * gctx = gguf_init_from_file(path, gip);
+        if (!gctx) return std::string();
+        std::string out;
+        const int64_t kid = gguf_find_key(gctx, "general.architecture");
+        if (kid >= 0) {
+            const char * v = gguf_get_val_str(gctx, kid);
+            if (v) out = v;
+        }
+        gguf_free(gctx);
+        return out;
+    };
+    const std::string detected_arch = peek_gguf_arch(target_path);
+    const bool is_laguna = (detected_arch == "laguna");
+
+    // When arch == laguna there is no DFlash draft model (Poolside hasn't
+    // released one); server.py omits --draft from the spawn cmd. Accept the
+    // shorter argv layout: argv[1] = target, argv[2..] = flags. Same fall-
+    // back applies if the user manually drops the draft (argv[2] starts with
+    // a dash) on any arch — keeps the binary friendly to ad-hoc invocation.
+    const bool no_draft_layout = is_laguna || (argc >= 3 && argv[2][0] == '-');
+    const char * draft_path  = no_draft_layout ? nullptr : argv[2];
+    const int    flags_start = no_draft_layout ? 2 : 3;
+    const bool   has_positional_args =
+        (!no_draft_layout) && (argc >= 6 && argv[3][0] != '-');
+    const char * prompt_path = has_positional_args ? argv[3] : nullptr;
+    int          n_gen       = has_positional_args ? std::atoi(argv[4]) : 0;
+    const char * out_path    = has_positional_args ? argv[5] : nullptr;
     // --seq-verify: run the target verify as q_len independent single-token
     // decodes instead of one batched forward with a causal mask. Isolates
     // the correctness-of-batched-verify hypothesis from z-lab issue #57.
@@ -1229,7 +1266,7 @@ int main(int argc, char ** argv) {
     }
     int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
     bool  daemon_mode   = false;
-    for (int i = 3; i < argc; i++) {
+    for (int i = flags_start; i < argc; i++) {
         if      (std::strcmp(argv[i], "--daemon") == 0)        daemon_mode = true;
         else if (std::strcmp(argv[i], "--seq-verify") == 0)    seq_verify = true;
         else if (std::strcmp(argv[i], "--fast-rollback") == 0) fast_rollback = true;
@@ -1292,9 +1329,46 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
+    if (!is_laguna && !daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
         std::fprintf(stderr, "Missing positional arguments for non-daemon mode.\n");
         return 2;
+    }
+
+    // ---- Arch dispatch: hand laguna targets to the dedicated daemon -----
+    // The qwen35 + DFlash + DDTree code path below assumes the target is a
+    // qwen35-shaped hybrid (attention + DeltaNet/SSM) and that a draft model
+    // exists. Laguna is a pure-attention MoE arch with no published draft,
+    // so dispatch to run_laguna_daemon() before any qwen35-specific init.
+    // The daemon protocol it speaks (bare prompt, samp= tail, generate cmd)
+    // matches what scripts/server.py emits, so the OpenAI HTTP path is
+    // byte-identical for the two arches — only the binary'́s internal
+    // forward kernels differ.
+    if (is_laguna) {
+        ggml_type kv = GGML_TYPE_Q8_0;
+        if (const char * kvs = std::getenv("DFLASH27B_KV_K")) {
+            std::string s = kvs;
+            if      (s == "q4_0") kv = GGML_TYPE_Q4_0;
+            else if (s == "q5_0") kv = GGML_TYPE_Q5_0;
+            else if (s == "q8_0") kv = GGML_TYPE_Q8_0;
+            else if (s == "f16")  kv = GGML_TYPE_F16;
+        }
+        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
+        int chunk = 2048;
+        if (const char * ck = std::getenv("DFLASH27B_LAGUNA_CHUNK")) {
+            const int v = std::atoi(ck);
+            if (v > 0) chunk = v;
+        }
+        std::fprintf(stderr,
+            "[test_dflash] arch=laguna -> dispatching to run_laguna_daemon "
+            "(max_ctx=%d kv=%s chunk=%d stream_fd=%d). DFlash + DDTree disabled.\n",
+            max_ctx_eff, ggml_type_name(kv), chunk, stream_fd);
+        dflash27b::LagunaDaemonArgs largs;
+        largs.target_path = target_path;
+        largs.max_ctx     = max_ctx_eff;
+        largs.chunk       = chunk;
+        largs.kv_type     = kv;
+        largs.stream_fd   = stream_fd;
+        return dflash27b::run_laguna_daemon(largs);
     }
 
     // Helper: write a committed token to the stream fd immediately (int32 LE).

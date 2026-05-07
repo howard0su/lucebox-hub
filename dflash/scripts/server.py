@@ -46,14 +46,15 @@ DEFAULT_TARGET = Path(os.environ.get(
 ))
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
 DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
-DEFAULT_LAGUNA_BIN = ROOT / "build" / ("test_laguna_daemon" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
 MODEL_NAME = "luce-dflash"
 
 # Architecture strings stored in `general.architecture` of every GGUF this
-# server can drive. The qwen35 path (test_dflash + DFlash + DDTree) is the
-# canonical one; laguna is a hand-rolled MoE target served by the simpler
-# test_laguna_daemon binary (no spec-decode, no DDTree).
+# server can drive. test_dflash dispatches by GGUF arch internally:
+#   qwen35 / qwen36  -> existing DFlash + DDTree pipeline
+#   laguna           -> dflash27b::run_laguna_daemon() (no spec-decode)
+# server.py just needs to omit --draft + the DFlash/DDTree flags when the
+# arch doesn't support speculative decoding yet.
 _QWEN35_ARCHES = {"qwen35", "qwen36"}
 _LAGUNA_ARCHES  = {"laguna"}
 
@@ -232,18 +233,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         env["PATH"] = dll_dir + os.pathsep + str(Path(bin_abs).parent) + os.pathsep + env.get("PATH", "")
 
     if arch in _LAGUNA_ARCHES:
-        # test_laguna_daemon: no spec-decode, no DDTree. Just the target +
-        # KV-cache config + stream-fd. Tokens stream as int32 LE on the fd,
-        # terminated by a -1 sentinel, exactly matching what the qwen35
-        # daemon emits, so the SSE/stream consumers below stay unchanged.
-        kv_t = os.environ.get("DFLASH27B_KV_K", "q8_0")
-        chunk_env = os.environ.get("DFLASH27B_LAGUNA_CHUNK", "2048")
-        # test_laguna_daemon's argv parser uses space-separated flags for
-        # --max-ctx / --kv / --chunk; --stream-fd accepts both forms.
-        cmd = [bin_abs, str(target),
-               "--max-ctx", str(max_ctx),
-               "--kv",      kv_t,
-               "--chunk",   chunk_env,
+        # test_dflash detects arch=laguna from the GGUF and dispatches
+        # internally to dflash27b::run_laguna_daemon(). No --draft, no
+        # --fast-rollback, no --ddtree (no Laguna spec-decode draft yet).
+        # Tokens stream as int32 LE on stream_fd terminated by -1, byte-
+        # identical to the qwen35 path so SSE/stream consumers stay shared.
+        cmd = [bin_abs, str(target), "--daemon",
+               f"--max-ctx={max_ctx}",
                f"--stream-fd={stream_fd_val}"]
     else:
         if draft is None:
@@ -896,23 +892,22 @@ def main():
     if not args.target.is_file():
         raise SystemExit(f"target GGUF not found at {args.target}")
 
-    # Architecture dispatch: read general.architecture from the GGUF and
-    # pick the matching daemon binary + flags. laguna gets test_laguna_daemon
-    # (no spec-decode), qwen35/qwen36 gets test_dflash. The user can still
-    # override args.bin explicitly to force a specific binary.
+    # Architecture detection. test_dflash itself dispatches by GGUF arch at
+    # main() entry, so server.py just needs to know enough to omit --draft +
+    # DFlash/DDTree flags on archs that lack a spec-decode draft. Same
+    # binary serves every arch.
     arch = _arch_from_gguf(args.target)
-    user_bin = (args.bin != DEFAULT_BIN)
-    if arch in _LAGUNA_ARCHES and not user_bin:
-        args.bin = DEFAULT_LAGUNA_BIN
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin} (arch={arch})")
 
     if arch in _LAGUNA_ARCHES:
-        # No DFlash draft model exists for laguna yet; the binary takes
-        # only the target weights. Prefix caching also requires SNAPSHOT/
-        # RESTORE in test_laguna_daemon (Phase 2b, not yet shipped), so
-        # disable both caches here — every request runs a cold prefill.
+        # No DFlash draft model exists for laguna yet; test_dflash'́s
+        # internal arch dispatch reads general.architecture, accepts the
+        # no-draft argv layout, and routes to run_laguna_daemon(). Prefix
+        # caching also requires SNAPSHOT/RESTORE in the laguna daemon (not
+        # yet shipped), so disable both caches here — every request runs a
+        # cold prefill.
         draft = None
         if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
             print(f"[server] laguna: prefix/prefill cache slots disabled "
