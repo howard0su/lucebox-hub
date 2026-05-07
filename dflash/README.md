@@ -148,12 +148,21 @@ Numbers will move once a Qwen3.6-matched DFlash draft lands; swap it in via `DFL
 
 [Poolside Laguna-XS.2](https://huggingface.co/poolside/Laguna-XS.2) is a 40-layer MoE LLM with 256 experts (top-8) plus an always-on shared expert, per-layer head counts `[48,64,64,64]×10`, and a per-layer SWA pattern (window 512). It is **architecturally distinct from `qwen35`**, so dflash adds a hand-rolled CUDA forward path (`Path A`, ggml-only — no libllama dependency) that mirrors the qwen35 stack. The Q4_K_M GGUF lands at 18.77 GiB on a single RTX 3090; tok_embd stays CPU-only (110 MiB) to keep the GPU budget under 24 GB.
 
+### Single binary, single server
+
+`test_dflash` peeks `general.architecture` from the target GGUF at startup
+and dispatches by arch:
+
+  - `qwen35` / `qwen36` → existing DFlash + DDTree pipeline (no change).
+  - `laguna` → `dflash27b::run_laguna_daemon()` (no spec-decode, no DDTree).
+
+The daemon stdin/stream-fd protocol is identical, so `scripts/server.py`
+drives both arches end-to-end. The only thing the user changes is `--target`.
+
 ### Build + run
 
 ```bash
-cmake --build build --target test_laguna_daemon pflash_daemon \
-                            bench_laguna_ttft bench_laguna_pflash bench_laguna_generate \
-                            smoke_load_target_laguna -j
+cmake --build build --target test_dflash test_laguna_daemon pflash_daemon -j
 
 # 19 GB Q4_K_M target + 1.2 GB Qwen3-0.6B BF16 drafter + tokenizers
 huggingface-cli download Lucebox/Laguna-XS.2-GGUF laguna-xs2-Q4_K_M.gguf --local-dir models/
@@ -161,13 +170,24 @@ huggingface-cli download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-di
 huggingface-cli download poolside/Laguna-XS.2 --local-dir models/Laguna-XS-2 \
     --include 'tokenizer*' '*.json'
 
+# OpenAI-compatible HTTP server (same scripts/server.py used for qwen35).
+# server.py drops --draft and the DFlash/DDTree flags when arch=laguna;
+# test_dflash itself routes to run_laguna_daemon().
+python3 scripts/server.py \
+    --target models/laguna-xs2-Q4_K_M.gguf \
+    --max-ctx 16384 --port 8000
+
+curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"luce-dflash","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
+
 # Smoke (loader only, no forward)
 ./build/smoke_load_target_laguna models/laguna-xs2-Q4_K_M.gguf
 
 # Variable-N TTFT bench (DFLASH_KV_TYPE=q4_0 for ctx > 32K, DFLASH_CHUNK=2048 default)
 DFLASH_KV_TYPE=q4_0 ./build/bench_laguna_ttft models/laguna-xs2-Q4_K_M.gguf '4096,16384,65536'
 
-# NIAH single-needle, with PFlash compression (drafter trims a 131K haystack to keep=0.10 ~13K target tokens)
+# NIAH single-needle, with PFlash compression. The driver still spawns the
+# standalone test_laguna_daemon binary so it can run without server.py.
 python3 scripts/laguna_pflash_niah.py \
     --target models/laguna-xs2-Q4_K_M.gguf \
     --drafter models/Qwen3-0.6B-BF16.gguf \
@@ -176,16 +196,6 @@ python3 scripts/laguna_pflash_niah.py \
     --pflash-bin ./build/pflash_daemon \
     --laguna-bin ./build/test_laguna_daemon \
     --ctx 131072 --depth 0.5 --keep 0.10 --target-kv q4_0
-
-# OpenAI-compatible HTTP server (greedy by default; sampler params plumbed through)
-python3 scripts/laguna_serve.py \
-    --target models/laguna-xs2-Q4_K_M.gguf \
-    --laguna-tok models/Laguna-XS-2 \
-    --laguna-bin ./build/test_laguna_daemon \
-    --max-ctx 16384 --kv q8_0 --port 8000
-
-curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"luce-laguna","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
 ```
 
 ### NIAH retrieval (RTX 3090, depth=0.5, q4_0 KV target, Q8_0 KV at 4K)
@@ -237,6 +247,7 @@ tokens) is the path to bring code recall to the same ratio as prose.
 ### Outstanding
 
 - **No Laguna spec-decode draft published yet.** Current decode is autoregressive only (~111 tok/s on RTX 3090). When a matched draft lands, the DFlash + DDTree machinery already in `test_dflash` ports across.
+- **Prefix cache + in-process PFlash compression** are disabled on the laguna server.py path. Both require `SNAPSHOT` / `RESTORE` / `FREE_SNAPSHOT` and `compress` / `park` / `unpark` commands inside `run_laguna_daemon`. Tracked as follow-ups; the qwen35 path uses them today.
 - **Path B (in-process Python drafter)** is not used here. Path A keeps the dflash daemon ggml-only.
 
 ## Quick start

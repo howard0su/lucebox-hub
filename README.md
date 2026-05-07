@@ -231,17 +231,26 @@ DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
 - **OpenAI-compatible HTTP server** (`scripts/laguna_serve.py`) with `temperature` / `top_p` / `top_k` / `seed` / `frequency_penalty` flowing through to the daemon's CPU sampler chain
 
 ```bash
-# 1. build dflash + Laguna targets (CUDA 12+, sm_86 for RTX 3090)
+# 1. build dflash (single binary serves both qwen35 and laguna; CUDA 12+, sm_86 on 3090)
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build --target test_laguna_daemon pflash_daemon bench_laguna_ttft -j
+cmake --build build --target test_dflash test_laguna_daemon pflash_daemon -j
 
 # 2. fetch weights: 19 GB Laguna Q4_K_M target + 1.2 GB Qwen3-0.6B BF16 drafter + tokenizers
 huggingface-cli download Lucebox/Laguna-XS.2-GGUF laguna-xs2-Q4_K_M.gguf --local-dir models/
 huggingface-cli download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
 huggingface-cli download poolside/Laguna-XS.2 --local-dir models/Laguna-XS-2 --include 'tokenizer*' '*.json'
 
-# 3a. NIAH @ 131K, keep=0.10 (PFlash compress + target prefill + decode)
+# 3a. serve OpenAI-compatible HTTP via the same scripts/server.py used for qwen35.
+#     test_dflash reads general.architecture from the GGUF and dispatches
+#     internally; --target is the only thing that changes between archs.
+python3 scripts/server.py \
+    --target models/laguna-xs2-Q4_K_M.gguf \
+    --max-ctx 16384 --port 8000
+
+# 3b. NIAH @ 131K, keep=0.10 (PFlash compress + target prefill + decode).
+#     The NIAH driver still spawns the standalone test_laguna_daemon binary
+#     so it can run without going through the full server.py stack.
 python3 scripts/laguna_pflash_niah.py \
     --target models/laguna-xs2-Q4_K_M.gguf \
     --drafter models/Qwen3-0.6B-BF16.gguf \
@@ -250,13 +259,6 @@ python3 scripts/laguna_pflash_niah.py \
     --pflash-bin ./build/pflash_daemon \
     --laguna-bin ./build/test_laguna_daemon \
     --ctx 131072 --depth 0.5 --keep 0.10 --target-kv q4_0
-
-# 3b. or serve OpenAI-compatible HTTP
-python3 scripts/laguna_serve.py \
-    --target models/laguna-xs2-Q4_K_M.gguf \
-    --laguna-tok models/Laguna-XS-2 \
-    --laguna-bin ./build/test_laguna_daemon \
-    --max-ctx 16384 --kv q8_0 --port 8000
 ```
 
 | Context | KV   | keep | drafter (s) | target prefill (s) | end-to-end TTFT | NIAH |
@@ -269,13 +271,16 @@ python3 scripts/laguna_serve.py \
 | 131 072 | Q4_0 | 0.30 |       11.4  |              26.43 |         37.84 s |  ✅  |
 
 **What we built.** Path A (ggml-only, no libllama):
-- `src/laguna_target_loader.cpp` — full GGUF loader, validates `arch == "laguna"`, reads per-layer head count as a 40-element array, copies all 678 tensors to a CUDA backend buffer.
-- `src/laguna_target_graph.cpp` — full forward graph (≈2900 ggml nodes): full-attn vs SWA dispatch per layer, dense MLP for layer 0 + sparse MoE (sigmoid router + score-correction bias + sum-norm + scale 2.5 + always-on shared expert) for layers 1–39, per-head softplus attention gate, two-mask SWA design.
-- `test/test_laguna_daemon.cpp` — stdin daemon (`generate <prompt.bin> <n_gen> <out.bin>` + optional ` samp=temp,top_p,top_k,rep_pen,seed` tail), greedy by default, full CPU sampler chain on demand.
+- `src/laguna_target_loader.cpp` — GGUF loader, validates `arch == "laguna"`, reads per-layer head count as a 40-element array, copies all 678 tensors to a CUDA backend buffer.
+- `src/laguna_target_graph.cpp` — forward graph (≈2900 ggml nodes): full-attn vs SWA dispatch per layer, dense MLP for layer 0 + sparse MoE (sigmoid router + score-correction bias + sum-norm + scale 2.5 + always-on shared expert) for layers 1–39, per-head softplus attention gate, two-mask SWA design. Also exposes `laguna_step()` — the turnkey “one forward pass on a fresh ggml graph” helper used by every caller.
+- `src/laguna_daemon.cpp` — stdin protocol loop (bare prompt + samp= tail + legacy `generate` form). Dispatched by `test_dflash` via `general.architecture`, no separate binary in the production path.
+- `src/sampler.{h,cpp}` — shared CPU sampler chain (rep_penalty → top_k → softmax(temp) → top_p → draw); single source of truth for both qwen35 and laguna.
+- `test/test_dflash.cpp` — single daemon binary. Peeks `general.architecture` at startup; routes laguna requests to `dflash27b::run_laguna_daemon()` and qwen35 requests to the existing DFlash + DDTree pipeline.
+- `test/test_laguna_daemon.cpp` — thin CLI wrapper around `run_laguna_daemon()` for the NIAH driver standalone use.
 - `scripts/laguna_pflash_niah.py` — NIAH driver with cross-tokenizer round-trip (Qwen3 → text → Laguna) including word-boundary recovery so needles split across PFlash chunk boundaries (e.g. `BLUEHORIZON-7421`) survive aggressive `keep=0.10` at 131K context.
-- `scripts/laguna_serve.py` — OpenAI-compatible FastAPI server on top of `test_laguna_daemon`.
+- `scripts/server.py` — same OpenAI-compatible FastAPI server used for qwen35; arch-aware spawn flags (omits `--draft` + DFlash/DDTree on laguna).
 
-**Outstanding.** No Laguna draft model is published yet, so the current daemon path is autoregressive only (~111 tok/s on RTX 3090). When a matched draft lands, the existing DFlash + DDTree machinery in `test_dflash` should drop in unchanged.
+**Outstanding.** No Laguna draft model is published yet, so the current daemon path is autoregressive only (~111 tok/s on RTX 3090). When a matched draft lands, the existing DFlash + DDTree machinery in `test_dflash` should drop in unchanged. Prefix-cache slots and in-process PFlash compression are also disabled on the laguna path until SNAPSHOT/RESTORE/FREE_SNAPSHOT and the drafter park/unpark hooks land in `run_laguna_daemon`.
 
 [Full writeup →](dflash/README.md#laguna-xs2-target-experimental-poolside-moe)
 
