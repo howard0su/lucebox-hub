@@ -409,6 +409,21 @@ adds 11 s of fixed overhead which dominates at long context but folds
 below 1× of the target prefill cost as the haystack shrinks (4K @ keep=0.10
 spends 1.5 s drafter + 0.4 s target, net 1.92 s vs llama.cpp 1.7 s).
 
+**Reproducing the 11.11 s drafter number requires Block-Sparse Attention
+on the Qwen3-0.6B drafter forward.** The PflashDaemon Python wrapper sets
+these env vars by default; the dflash daemon honours them at runtime but
+does not force them, so any caller (including `scripts/server.py`) is free
+to opt out:
+
+```bash
+export DFLASH_FP_USE_BSA=1     # mit-han-lab BSA, FA-2 derived (sm_80+)
+export DFLASH_FP_ALPHA=0.85    # importance-score temperature
+```
+
+Without BSA the drafter falls back to dense attention and the 131 K
+drafter forward becomes multi-minute (O(N²) work). At ctx ≤ 8 K the
+fallback is fast enough that BSA is optional.
+
 ### Parity vs HF reference (deferred)
 
 `scripts/parity_laguna.py` runs identical token IDs through the dflash
