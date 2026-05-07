@@ -162,10 +162,46 @@ def build_app(daemon: LagunaDaemon, tokenizer: AutoTokenizer, max_ctx: int) -> F
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest, raw: Request):
         prompt_ids = _render_prompt(req)
-        n_gen = max(1, min(req.max_tokens, max_ctx - len(prompt_ids) - 4))
+        # Headroom is the max number of tokens the daemon can still generate
+        # without exceeding the cache it was started with. The -4 leaves room
+        # for an EOS/EOT token plus a small safety margin against off-by-one
+        # in the daemon's `N + n_gen > max_ctx` overflow guard. When headroom
+        # is non-positive the prompt itself has already filled (or overrun)
+        # max_ctx — forcing n_gen=1 would send the daemon into overflow and
+        # produce an opaque 500. Return an OpenAI-shaped empty completion with
+        # finish_reason="length" instead, mirroring server.py's _gen_len_for
+        # path for the qwen35 stack.
+        headroom = max_ctx - len(prompt_ids) - 4
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         samp = _samp_suffix(req)
+
+        if headroom <= 0:
+            if req.stream:
+                async def empty_sse() -> AsyncIterator[str]:
+                    head = {"id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": MODEL_NAME,
+                            "choices": [{"index": 0, "delta": {"role": "assistant"},
+                                          "finish_reason": None}]}
+                    yield f"data: {json.dumps(head)}\n\n"
+                    tail = {"id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": MODEL_NAME,
+                            "choices": [{"index": 0, "delta": {},
+                                          "finish_reason": "length"}]}
+                    yield f"data: {json.dumps(tail)}\n\n"
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(empty_sse(), media_type="text/event-stream")
+            return {
+                "id": completion_id, "object": "chat.completion",
+                "created": created, "model": MODEL_NAME,
+                "choices": [{"index": 0, "finish_reason": "length",
+                              "message": {"role": "assistant", "content": ""}}],
+                "usage": {"prompt_tokens": len(prompt_ids),
+                          "completion_tokens": 0,
+                          "total_tokens": len(prompt_ids)},
+            }
+
+        n_gen = min(req.max_tokens, headroom)
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
