@@ -155,18 +155,10 @@ static ggml_tensor * build_moe_graph_fused(
 
     experts = ggml_mul(ctx, experts, weights);
 
-    // ── Sum over experts ──
-    ggml_tensor * moe_out = ggml_view_2d(ctx, experts,
-        hidden, n_tokens, experts->nb[2], 0);
-    ggml_build_forward_expand(gf, moe_out);
-
-    for (int i = 1; i < n_used; i++) {
-        ggml_tensor * slice = ggml_view_2d(ctx, experts,
-            hidden, n_tokens, experts->nb[2], (size_t)i * experts->nb[1]);
-        ggml_build_forward_expand(gf, slice);
-        moe_out = ggml_add(ctx, moe_out, slice);
-        ggml_build_forward_expand(gf, moe_out);
-    }
+    // ── Sum over experts (single op: repeat_back sums dim 1) ──
+    ggml_tensor * sum_shape = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, 1, n_tokens);
+    ggml_tensor * moe_sum   = ggml_repeat_back(ctx, experts, sum_shape);
+    ggml_tensor * moe_out   = ggml_reshape_2d(ctx, moe_sum, hidden, n_tokens);
 
     // ── Shared expert FFN ──
     TargetLayer shared_L{};
