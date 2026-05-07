@@ -22,13 +22,12 @@
 #include "internal.h"
 #include "dflash_graph.h"
 #include "qwen3_drafter.h"
+#include "gpu_compat.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
-
-#include <cuda_runtime.h>
 
 // ggml-cuda dequantize: Q8_0/F16/BF16 → F32. Replaces the custom
 // f16_convert.cu kernels with ggml's built-in converter dispatch.
@@ -58,14 +57,18 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #endif
 #else
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #endif
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <queue>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1250,6 +1253,274 @@ static bool parse_float_list(const char * text, std::vector<double> & out) {
     return !out.empty();
 }
 
+static bool write_binary_file(const std::string & path, const void * data, size_t bytes) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    if (bytes > 0) f.write((const char *)data, (std::streamsize)bytes);
+    return (bool)f;
+}
+
+static bool read_binary_file_exact(const std::string & path, void * data, size_t bytes) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    if (bytes > 0) f.read((char *)data, (std::streamsize)bytes);
+    return (bool)f;
+}
+
+static std::string read_line_tail(std::istringstream & iss) {
+    std::string tail;
+    std::getline(iss, tail);
+    const size_t first = tail.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    if (first > 0) tail.erase(0, first);
+    return tail;
+}
+
+#if !defined(_WIN32)
+static bool read_exact_fd(int fd, void * data, size_t bytes) {
+    char * p = (char *)data;
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t n = ::read(fd, p + done, bytes - done);
+        if (n == 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += (size_t)n;
+    }
+    return true;
+}
+
+static bool write_exact_fd(int fd, const void * data, size_t bytes) {
+    const char * p = (const char *)data;
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t n = ::write(fd, p + done, bytes - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += (size_t)n;
+    }
+    return true;
+}
+#endif
+
+class DFlashDraftIpcClient {
+public:
+    DFlashDraftIpcClient() = default;
+    DFlashDraftIpcClient(const DFlashDraftIpcClient &) = delete;
+    DFlashDraftIpcClient & operator=(const DFlashDraftIpcClient &) = delete;
+    ~DFlashDraftIpcClient() { close(); }
+
+    bool start(const std::string & bin,
+               const std::string & draft_path,
+               int draft_gpu,
+               int ring_cap,
+               const std::string & work_dir) {
+#if defined(_WIN32)
+        (void)bin; (void)draft_path; (void)draft_gpu; (void)ring_cap; (void)work_dir;
+        std::fprintf(stderr, "DFlash draft IPC is only implemented on POSIX hosts\n");
+        return false;
+#else
+        close();
+        if (bin.empty() || draft_path.empty() || ring_cap <= 0) return false;
+        if (!init_work_dir(work_dir)) return false;
+
+        int cmd_pipe[2] = {-1, -1};
+        int stream_pipe[2] = {-1, -1};
+        if (::pipe(cmd_pipe) != 0 || ::pipe(stream_pipe) != 0) {
+            std::fprintf(stderr, "draft-ipc pipe failed: %s\n", std::strerror(errno));
+            if (cmd_pipe[0] >= 0) ::close(cmd_pipe[0]);
+            if (cmd_pipe[1] >= 0) ::close(cmd_pipe[1]);
+            if (stream_pipe[0] >= 0) ::close(stream_pipe[0]);
+            if (stream_pipe[1] >= 0) ::close(stream_pipe[1]);
+            return false;
+        }
+
+        pid_ = ::fork();
+        if (pid_ < 0) {
+            std::fprintf(stderr, "draft-ipc fork failed: %s\n", std::strerror(errno));
+            ::close(cmd_pipe[0]); ::close(cmd_pipe[1]);
+            ::close(stream_pipe[0]); ::close(stream_pipe[1]);
+            pid_ = -1;
+            return false;
+        }
+        if (pid_ == 0) {
+            ::dup2(cmd_pipe[0], STDIN_FILENO);
+            ::close(cmd_pipe[0]);
+            ::close(cmd_pipe[1]);
+            ::close(stream_pipe[0]);
+
+            const std::string cap_arg = "--ring-cap=" + std::to_string(ring_cap);
+            const std::string gpu_arg = "--draft-gpu=" + std::to_string(std::max(0, draft_gpu));
+            const std::string fd_arg = "--stream-fd=" + std::to_string(stream_pipe[1]);
+            ::execl(bin.c_str(), bin.c_str(),
+                    "--draft-ipc-daemon", draft_path.c_str(),
+                    cap_arg.c_str(), gpu_arg.c_str(), fd_arg.c_str(),
+                    (char *)nullptr);
+            std::fprintf(stderr, "draft-ipc exec failed: %s: %s\n",
+                         bin.c_str(), std::strerror(errno));
+            _exit(127);
+        }
+
+        ::close(cmd_pipe[0]);
+        ::close(stream_pipe[1]);
+        stream_fd_ = stream_pipe[0];
+        cmd_ = ::fdopen(cmd_pipe[1], "w");
+        if (!cmd_) {
+            std::fprintf(stderr, "draft-ipc fdopen failed: %s\n", std::strerror(errno));
+            ::close(cmd_pipe[1]);
+            close();
+            return false;
+        }
+        int32_t status = -1;
+        if (!read_exact_fd(stream_fd_, &status, sizeof(status)) || status != 0) {
+            std::fprintf(stderr, "draft-ipc daemon did not become ready (status=%d)\n", status);
+            close();
+            return false;
+        }
+        ring_cap_ = ring_cap;
+        active_ = true;
+        std::printf("[draft-ipc] ready bin=%s gpu=%d ring_cap=%d work_dir=%s\n",
+                    bin.c_str(), draft_gpu, ring_cap, work_dir_.c_str());
+        return true;
+#endif
+    }
+
+    bool send_feature_slice(int capture_idx,
+                            int start_pos,
+                            int n_tokens,
+                            const std::vector<float> & slice) {
+#if defined(_WIN32)
+        (void)capture_idx; (void)start_pos; (void)n_tokens; (void)slice;
+        return false;
+#else
+        if (!active_ || !cmd_ || n_tokens <= 0) return false;
+        const size_t expected = (size_t)n_tokens * DFLASH27B_TARGET_HIDDEN;
+        if (slice.size() != expected) return false;
+        const std::string path = next_path("feature");
+        if (!write_binary_file(path, slice.data(), slice.size() * sizeof(float))) {
+            std::fprintf(stderr, "draft-ipc write feature failed: %s\n", path.c_str());
+            return false;
+        }
+        std::fprintf(cmd_, "feature_slice %d %d %d %s\n",
+                     capture_idx, start_pos, n_tokens, path.c_str());
+        std::fflush(cmd_);
+        int32_t status = -1;
+        const bool ok = read_exact_fd(stream_fd_, &status, sizeof(status)) && status == 0;
+        std::remove(path.c_str());
+        if (!ok) {
+            std::fprintf(stderr, "draft-ipc feature_slice failed status=%d\n", status);
+        }
+        return ok;
+#endif
+    }
+
+    bool propose(int committed,
+                 int ctx_len,
+                 const std::vector<float> & noise_embed,
+                 std::vector<float> & hidden_out) {
+#if defined(_WIN32)
+        (void)committed; (void)ctx_len; (void)noise_embed; (void)hidden_out;
+        return false;
+#else
+        if (!active_ || !cmd_ || ctx_len <= 0) return false;
+        const size_t noise_expected =
+            (size_t)DFLASH27B_TARGET_HIDDEN * DFLASH27B_DRAFT_BLOCK_SIZE;
+        if (noise_embed.size() != noise_expected) return false;
+        const std::string path = next_path("noise");
+        if (!write_binary_file(path, noise_embed.data(), noise_embed.size() * sizeof(float))) {
+            std::fprintf(stderr, "draft-ipc write noise failed: %s\n", path.c_str());
+            return false;
+        }
+        std::fprintf(cmd_, "propose %d %d %s\n", committed, ctx_len, path.c_str());
+        std::fflush(cmd_);
+        int32_t status = -1;
+        bool ok = read_exact_fd(stream_fd_, &status, sizeof(status)) && status == 0;
+        if (ok) {
+            hidden_out.assign(noise_expected, 0.0f);
+            ok = read_exact_fd(stream_fd_, hidden_out.data(),
+                               hidden_out.size() * sizeof(float));
+        }
+        std::remove(path.c_str());
+        if (!ok) {
+            std::fprintf(stderr, "draft-ipc propose failed status=%d\n", status);
+        }
+        return ok;
+#endif
+    }
+
+    bool active() const { return active_; }
+    int ring_cap() const { return ring_cap_; }
+
+    void close() {
+#if !defined(_WIN32)
+        if (cmd_) {
+            std::fclose(cmd_);
+            cmd_ = nullptr;
+        }
+        if (stream_fd_ >= 0) {
+            ::close(stream_fd_);
+            stream_fd_ = -1;
+        }
+        if (pid_ > 0) {
+            int status = 0;
+            ::waitpid(pid_, &status, 0);
+            pid_ = -1;
+        }
+        if (owns_work_dir_ && !work_dir_.empty()) {
+            ::rmdir(work_dir_.c_str());
+        }
+#endif
+        active_ = false;
+        ring_cap_ = 0;
+    }
+
+private:
+#if !defined(_WIN32)
+    bool init_work_dir(const std::string & requested) {
+        if (!requested.empty()) {
+            work_dir_ = requested;
+            owns_work_dir_ = false;
+            if (::mkdir(work_dir_.c_str(), 0700) != 0 && errno != EEXIST) {
+                std::fprintf(stderr, "draft-ipc mkdir failed: %s: %s\n",
+                             work_dir_.c_str(), std::strerror(errno));
+                return false;
+            }
+            return true;
+        }
+        const char * tmp = std::getenv("TMPDIR");
+        std::string templ = std::string(tmp && *tmp ? tmp : "/tmp") +
+                            "/dflash-draft-ipc-XXXXXX";
+        std::vector<char> buf(templ.begin(), templ.end());
+        buf.push_back('\0');
+        char * dir = ::mkdtemp(buf.data());
+        if (!dir) {
+            std::fprintf(stderr, "draft-ipc mkdtemp failed: %s\n", std::strerror(errno));
+            return false;
+        }
+        work_dir_ = dir;
+        owns_work_dir_ = true;
+        return true;
+    }
+
+    std::string next_path(const char * prefix) {
+        return work_dir_ + "/" + prefix + "_" + std::to_string(seq_++) + ".bin";
+    }
+
+    pid_t pid_ = -1;
+    FILE * cmd_ = nullptr;
+    int stream_fd_ = -1;
+    std::string work_dir_;
+    int seq_ = 0;
+    bool owns_work_dir_ = false;
+#endif
+    bool active_ = false;
+    int ring_cap_ = 0;
+};
+
 static int inspect_target_layer_count(const char * target_path) {
     ggml_context * meta_ctx = nullptr;
     gguf_init_params gip{};
@@ -1339,6 +1610,35 @@ static bool copy_capture_slice_to_draft_ring(
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
+static bool copy_capture_slice_to_remote_draft(
+        DFlashDraftIpcClient & remote,
+        int capture_idx,
+        const ggml_tensor * act_out,
+        ggml_backend_t src_backend,
+        int chunk_start,
+        int start_pos,
+        int n_tokens) {
+    if (!remote.active() || !act_out || capture_idx < 0 || n_tokens <= 0) return true;
+    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const size_t row_bytes = (size_t)hidden * sizeof(float);
+    const size_t src_stride = act_out->nb[1];
+    std::vector<float> host((size_t)n_tokens * hidden);
+    ggml_backend_synchronize(src_backend);
+    if (src_stride == row_bytes) {
+        ggml_backend_tensor_get(act_out, host.data(),
+                                (size_t)chunk_start * src_stride,
+                                row_bytes * (size_t)n_tokens);
+    } else {
+        for (int i = 0; i < n_tokens; i++) {
+            ggml_backend_tensor_get(act_out,
+                                    host.data() + (size_t)i * hidden,
+                                    (size_t)(chunk_start + i) * src_stride,
+                                    row_bytes);
+        }
+    }
+    return remote.send_feature_slice(capture_idx, start_pos, n_tokens, host);
+}
+
 static bool copy_feature_ring_range_to_tensor(
         const DraftFeatureMirror & feature_ring,
         ggml_tensor * dst,
@@ -1378,6 +1678,194 @@ static bool copy_feature_ring_range_to_tensor(
         done += run;
     }
     return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+static bool stream_status(int stream_fd, int32_t status) {
+#if defined(_WIN32)
+    (void)stream_fd; (void)status;
+    return false;
+#else
+    return write_exact_fd(stream_fd, &status, sizeof(status));
+#endif
+}
+
+static int run_dflash_draft_ipc_daemon(const char * draft_path,
+                                       int ring_cap,
+                                       int draft_gpu,
+                                       int stream_fd) {
+#if defined(_WIN32)
+    (void)draft_path; (void)ring_cap; (void)draft_gpu; (void)stream_fd;
+    std::fprintf(stderr, "DFlash draft IPC daemon is only implemented on POSIX hosts\n");
+    return 2;
+#else
+    if (!draft_path || ring_cap <= 0 || stream_fd < 0) {
+        std::fprintf(stderr, "usage: test_dflash --draft-ipc-daemon <draft> --ring-cap=N --stream-fd=FD [--draft-gpu=N]\n");
+        return 2;
+    }
+
+    ggml_backend_t backend = ggml_backend_cuda_init(std::max(0, draft_gpu));
+    if (!backend) {
+        std::fprintf(stderr, "[draft-ipc-daemon] backend init failed gpu=%d\n", draft_gpu);
+        stream_status(stream_fd, -1);
+        return 1;
+    }
+
+    DraftWeights draft_weights;
+    std::string dp(draft_path);
+    bool draft_ok = false;
+    if (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf") {
+        draft_ok = load_draft_gguf(draft_path, backend, draft_weights);
+    } else {
+        draft_ok = load_draft_safetensors(draft_path, backend, draft_weights);
+    }
+    if (!draft_ok) {
+        std::fprintf(stderr, "[draft-ipc-daemon] draft load failed: %s\n",
+                     dflash27b_last_error());
+        stream_status(stream_fd, -1);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    DraftFeatureMirror feature_ring;
+    if (!draft_feature_mirror_init(feature_ring, backend, draft_gpu, draft_gpu, ring_cap)) {
+        std::fprintf(stderr, "[draft-ipc-daemon] feature ring init failed cap=%d gpu=%d\n",
+                     ring_cap, draft_gpu);
+        stream_status(stream_fd, -1);
+        free_draft_weights(draft_weights);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::fprintf(stderr, "[draft-ipc-daemon] ready gpu=%d ring_cap=%d\n",
+                 draft_gpu, ring_cap);
+    stream_status(stream_fd, 0);
+
+    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int q_len = DFLASH27B_DRAFT_BLOCK_SIZE;
+    StepGraph draft_sg;
+    std::vector<float> noise_embed((size_t)hidden * q_len);
+    std::vector<int32_t> pos_q(q_len);
+    std::vector<int32_t> pos_k;
+    std::vector<float> hidden_out((size_t)hidden * q_len);
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        std::istringstream iss(line);
+        std::string cmd;
+        iss >> cmd;
+        if (cmd == "quit" || cmd == "exit") {
+            break;
+        }
+        if (cmd == "feature_slice") {
+            int capture_idx = -1;
+            int start_pos = -1;
+            int n_tokens = 0;
+            iss >> capture_idx >> start_pos >> n_tokens;
+            std::string path = read_line_tail(iss);
+            if (capture_idx < 0 || capture_idx >= DFLASH27B_DRAFT_N_TARGET_LAYERS ||
+                start_pos < 0 || n_tokens <= 0 || path.empty()) {
+                std::fprintf(stderr, "[draft-ipc-daemon] bad feature_slice: %s\n",
+                             line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            std::vector<float> slice((size_t)n_tokens * hidden);
+            if (!read_binary_file_exact(path, slice.data(), slice.size() * sizeof(float))) {
+                std::fprintf(stderr, "[draft-ipc-daemon] read feature_slice failed: %s\n",
+                             path.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            const size_t dst_stride = feature_ring.target_feat->nb[1];
+            const size_t slice_offset =
+                (size_t)capture_idx * (size_t)hidden * sizeof(float);
+            for (int i = 0; i < n_tokens; i++) {
+                const int slot = (start_pos + i) % feature_ring.cap;
+                const size_t dst_off = (size_t)slot * dst_stride + slice_offset;
+                ggml_backend_tensor_set(feature_ring.target_feat,
+                                        slice.data() + (size_t)i * hidden,
+                                        dst_off,
+                                        (size_t)hidden * sizeof(float));
+            }
+            ggml_backend_synchronize(backend);
+            stream_status(stream_fd, 0);
+            continue;
+        }
+        if (cmd == "propose") {
+            int committed = -1;
+            int ctx_len = 0;
+            iss >> committed >> ctx_len;
+            std::string path = read_line_tail(iss);
+            if (committed < 0 || ctx_len <= 0 || ctx_len > feature_ring.cap || path.empty()) {
+                std::fprintf(stderr, "[draft-ipc-daemon] bad propose: %s\n",
+                             line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            if (!read_binary_file_exact(path, noise_embed.data(),
+                                        noise_embed.size() * sizeof(float))) {
+                std::fprintf(stderr, "[draft-ipc-daemon] read noise failed: %s\n",
+                             path.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+
+            int mirror_slot0 = 0;
+            const bool use_mirror_view =
+                draft_feature_mirror_can_view(feature_ring, committed, ctx_len, mirror_slot0);
+            if (!build_draft_step(draft_sg, draft_weights, nullptr, backend,
+                                  ctx_len, use_mirror_view ? &feature_ring : nullptr,
+                                  committed)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] draft build failed\n");
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            if (!use_mirror_view &&
+                !copy_feature_ring_range_to_tensor(feature_ring,
+                                                   draft_sg.target_hidden_cat,
+                                                   committed - ctx_len,
+                                                   ctx_len)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] feature copy failed\n");
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                    noise_embed.size() * sizeof(float));
+            pos_k.resize((size_t)ctx_len + q_len);
+            for (int i = 0; i < q_len; i++) pos_q[i] = ctx_len + i;
+            for (int i = 0; i < ctx_len + q_len; i++) pos_k[i] = i;
+            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                    pos_q.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                    pos_k.size() * sizeof(int32_t));
+            auto st = ggml_backend_graph_compute(backend, draft_sg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[draft-ipc-daemon] draft compute failed status=%d\n",
+                             (int)st);
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            ggml_backend_tensor_get(draft_sg.hidden_states, hidden_out.data(), 0,
+                                    hidden_out.size() * sizeof(float));
+            if (!stream_status(stream_fd, 0) ||
+                !write_exact_fd(stream_fd, hidden_out.data(),
+                                hidden_out.size() * sizeof(float))) {
+                std::fprintf(stderr, "[draft-ipc-daemon] stream write failed\n");
+                break;
+            }
+            continue;
+        }
+        std::fprintf(stderr, "[draft-ipc-daemon] unknown command: %s\n", line.c_str());
+        stream_status(stream_fd, -1);
+    }
+
+    step_graph_destroy(draft_sg);
+    draft_feature_mirror_free(feature_ring);
+    free_draft_weights(draft_weights);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, "[draft-ipc-daemon] stopped\n");
+    return 0;
+#endif
 }
 
 static bool compute_target_split_argmax(
@@ -1431,7 +1919,8 @@ static bool run_target_layer_split_forward(
         int & last_tok,
         DraftFeatureMirror * feature_ring = nullptr,
         std::vector<int32_t> * argmax_out = nullptr,
-        std::vector<float> * logits_out = nullptr) {
+        std::vector<float> * logits_out = nullptr,
+        DFlashDraftIpcClient * remote_draft = nullptr) {
     if (shards.empty() || tokens.empty()) return false;
     const int hidden = DFLASH27B_TARGET_HIDDEN;
     const int vocab = DFLASH27B_TARGET_VOCAB;
@@ -1532,12 +2021,23 @@ static bool run_target_layer_split_forward(
                 activation_pair_free(acts);
                 return false;
             }
-            if (feature_ring && capture_idx >= 0) {
-                if (!copy_capture_slice_to_draft_ring(*feature_ring, capture_idx,
+            if ((feature_ring || remote_draft) && capture_idx >= 0) {
+                if (feature_ring &&
+                    !copy_capture_slice_to_draft_ring(*feature_ring, capture_idx,
                                                       act_out, shard->gpu,
                                                       start, base_pos + start, n)) {
                     std::fprintf(stderr,
                                  "target-split capture copy failed layer=%d capture=%d gpu=%d\n",
+                                 il, capture_idx, shard->gpu);
+                    activation_pair_free(acts);
+                    return false;
+                }
+                if (remote_draft &&
+                    !copy_capture_slice_to_remote_draft(*remote_draft, capture_idx,
+                                                        act_out, shard->backend,
+                                                        start, base_pos + start, n)) {
+                    std::fprintf(stderr,
+                                 "target-split remote capture failed layer=%d capture=%d gpu=%d\n",
                                  il, capture_idx, shard->gpu);
                     activation_pair_free(acts);
                     return false;
@@ -1584,8 +2084,10 @@ static bool run_target_layer_split_dflash_decode(
         const std::vector<int32_t> & prompt,
         int n_gen,
         int last_tok,
-        const char * out_path) {
-    if (shards.empty() || !feature_ring.target_feat) return false;
+        const char * out_path,
+        DFlashDraftIpcClient * remote_draft = nullptr) {
+    const bool use_remote_draft = remote_draft && remote_draft->active();
+    if (shards.empty() || (!use_remote_draft && !feature_ring.target_feat)) return false;
     const int hidden = DFLASH27B_TARGET_HIDDEN;
     const int vocab = DFLASH27B_TARGET_VOCAB;
     const int q_len = DFLASH27B_DRAFT_BLOCK_SIZE;
@@ -1608,7 +2110,7 @@ static bool run_target_layer_split_dflash_decode(
 
     auto sync_all = [&]() {
         for (auto & shard : shards) ggml_backend_synchronize(shard.backend);
-        ggml_backend_synchronize(draft_backend);
+        if (!use_remote_draft && draft_backend) ggml_backend_synchronize(draft_backend);
     };
 
     auto t_dec0 = std::chrono::steady_clock::now();
@@ -1626,42 +2128,54 @@ static bool run_target_layer_split_dflash_decode(
         }
 
         constexpr int DRAFT_CTX_MAX = 2048;
-        const int draft_ctx = std::min(committed, std::min(feature_ring.cap, DRAFT_CTX_MAX));
+        const int ring_cap = use_remote_draft ? remote_draft->ring_cap() : feature_ring.cap;
+        const int draft_ctx = std::min(committed, std::min(ring_cap, DRAFT_CTX_MAX));
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
+            !use_remote_draft &&
             draft_feature_mirror_can_view(feature_ring, committed, draft_ctx, mirror_slot0);
-        if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
-                              draft_ctx, use_mirror_view ? &feature_ring : nullptr,
-                              committed)) {
-            std::fprintf(stderr, "target-split-dflash draft build failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-        if (!use_mirror_view &&
-            !copy_feature_ring_range_to_tensor(feature_ring, draft_sg.target_hidden_cat,
-                                               draft_start, draft_ctx)) {
-            std::fprintf(stderr, "target-split-dflash draft feature copy failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-        ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                sizeof(float) * noise_embed.size());
-        pos_k.resize((size_t)draft_ctx + q_len);
-        for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-        for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-        ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                sizeof(int32_t) * pos_q.size());
-        ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                sizeof(int32_t) * pos_k.size());
-        auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "target-split-dflash draft compute %d\n", (int)st);
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
+        std::vector<float> remote_hidden;
+        if (use_remote_draft) {
+            if (!remote_draft->propose(committed, draft_ctx, noise_embed, remote_hidden)) {
+                std::fprintf(stderr, "target-split-dflash remote draft propose failed\n");
+                step_graph_destroy(draft_sg);
+                step_graph_destroy(proj_sg);
+                return false;
+            }
+        } else {
+            if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
+                                  draft_ctx, use_mirror_view ? &feature_ring : nullptr,
+                                  committed)) {
+                std::fprintf(stderr, "target-split-dflash draft build failed\n");
+                step_graph_destroy(draft_sg);
+                step_graph_destroy(proj_sg);
+                return false;
+            }
+            if (!use_mirror_view &&
+                !copy_feature_ring_range_to_tensor(feature_ring, draft_sg.target_hidden_cat,
+                                                   draft_start, draft_ctx)) {
+                std::fprintf(stderr, "target-split-dflash draft feature copy failed\n");
+                step_graph_destroy(draft_sg);
+                step_graph_destroy(proj_sg);
+                return false;
+            }
+            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                    sizeof(float) * noise_embed.size());
+            pos_k.resize((size_t)draft_ctx + q_len);
+            for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
+            for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                    sizeof(int32_t) * pos_q.size());
+            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                    sizeof(int32_t) * pos_k.size());
+            auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "target-split-dflash draft compute %d\n", (int)st);
+                step_graph_destroy(draft_sg);
+                step_graph_destroy(proj_sg);
+                return false;
+            }
         }
 
         if (!proj_sg.gf || !proj_sg.hidden_input || proj_sg.hidden_input->ne[1] != q_len) {
@@ -1673,18 +2187,23 @@ static bool run_target_layer_split_dflash_decode(
                 return false;
             }
         }
-        const size_t hidden_bytes = ggml_nbytes(draft_sg.hidden_states);
-        if (!copy_peer_async(proj_sg.hidden_input->data, output_gpu,
-                             draft_sg.hidden_states->data, draft_gpu,
-                             hidden_bytes)) {
-            std::fprintf(stderr, "target-split-dflash hidden peer copy failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
+        if (use_remote_draft) {
+            ggml_backend_tensor_set(proj_sg.hidden_input, remote_hidden.data(), 0,
+                                    remote_hidden.size() * sizeof(float));
+        } else {
+            const size_t hidden_bytes = ggml_nbytes(draft_sg.hidden_states);
+            if (!copy_peer_async(proj_sg.hidden_input->data, output_gpu,
+                                 draft_sg.hidden_states->data, draft_gpu,
+                                 hidden_bytes)) {
+                std::fprintf(stderr, "target-split-dflash hidden peer copy failed\n");
+                step_graph_destroy(draft_sg);
+                step_graph_destroy(proj_sg);
+                return false;
+            }
+            cudaSetDevice(output_gpu);
+            cudaDeviceSynchronize();
         }
-        cudaSetDevice(output_gpu);
-        cudaDeviceSynchronize();
-        st = ggml_backend_graph_compute(output_backend, proj_sg.gf);
+        auto st = ggml_backend_graph_compute(output_backend, proj_sg.gf);
         if (st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "target-split-dflash projection compute %d\n", (int)st);
             step_graph_destroy(draft_sg);
@@ -1701,7 +2220,7 @@ static bool run_target_layer_split_dflash_decode(
         if (!run_target_layer_split_forward(shards, shards.front().weights,
                                             draft_tok, committed, q_len,
                                             verify_last_tok, &feature_ring,
-                                            &target_tok)) {
+                                            &target_tok, nullptr, remote_draft)) {
             std::fprintf(stderr, "target-split-dflash verify failed\n");
             step_graph_destroy(draft_sg);
             step_graph_destroy(proj_sg);
@@ -1729,7 +2248,8 @@ static bool run_target_layer_split_dflash_decode(
         int replay_last_tok = -1;
         if (!run_target_layer_split_forward(shards, shards.front().weights,
                                             replay_tok, committed, commit_n,
-                                            replay_last_tok, &feature_ring)) {
+                                            replay_last_tok, &feature_ring,
+                                            nullptr, nullptr, remote_draft)) {
             std::fprintf(stderr, "target-split-dflash replay failed\n");
             step_graph_destroy(draft_sg);
             step_graph_destroy(proj_sg);
@@ -1778,7 +2298,11 @@ static int run_target_layer_split_harness(
         bool run_draft_smoke,
         bool run_dflash,
         int max_ctx,
-        int max_verify_tokens) {
+        int max_verify_tokens,
+        const char * draft_ipc_bin = nullptr,
+        int draft_ipc_gpu = 0,
+        const char * draft_ipc_work_dir = nullptr,
+        int draft_ipc_ring_cap = 0) {
     if (!prompt_path || !out_path) {
         std::fprintf(stderr, "target layer split requires prompt/n_gen/out positional args\n");
         return 2;
@@ -1848,53 +2372,66 @@ static int run_target_layer_split_harness(
     ggml_backend_t draft_backend = nullptr;
     DraftWeights draft_weights;
     DraftFeatureMirror feature_ring;
+    DFlashDraftIpcClient remote_draft;
     bool draft_backend_owned = false;
+    const bool use_remote_draft = draft_ipc_bin && *draft_ipc_bin;
     if (load_draft) {
-        for (auto & shard : shards) {
-            if (shard.gpu == draft_gpu) {
-                draft_backend = shard.backend;
-                break;
-            }
-        }
-        if (!draft_backend) {
-            draft_backend = ggml_backend_cuda_init(draft_gpu);
-            if (!draft_backend) {
-                std::fprintf(stderr, "target-split draft cuda init failed for gpu %d\n", draft_gpu);
+        const int cap = draft_ipc_ring_cap > 0
+            ? std::min(draft_ipc_ring_cap, max_ctx)
+            : std::min(max_ctx, 4096);
+        if (use_remote_draft) {
+            if (!remote_draft.start(draft_ipc_bin, draft_path, draft_ipc_gpu,
+                                    cap, draft_ipc_work_dir ? draft_ipc_work_dir : "")) {
+                std::fprintf(stderr, "target-split remote draft start failed\n");
                 free_target_layer_split_shards(shards);
                 return 1;
             }
-            draft_backend_owned = true;
-        }
-        std::string dp(draft_path);
-        bool draft_ok = false;
-        if (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf") {
-            draft_ok = load_draft_gguf(draft_path, draft_backend, draft_weights);
         } else {
-            draft_ok = load_draft_safetensors(draft_path, draft_backend, draft_weights);
+            for (auto & shard : shards) {
+                if (shard.gpu == draft_gpu) {
+                    draft_backend = shard.backend;
+                    break;
+                }
+            }
+            if (!draft_backend) {
+                draft_backend = ggml_backend_cuda_init(draft_gpu);
+                if (!draft_backend) {
+                    std::fprintf(stderr, "target-split draft cuda init failed for gpu %d\n", draft_gpu);
+                    free_target_layer_split_shards(shards);
+                    return 1;
+                }
+                draft_backend_owned = true;
+            }
+            std::string dp(draft_path);
+            bool draft_ok = false;
+            if (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf") {
+                draft_ok = load_draft_gguf(draft_path, draft_backend, draft_weights);
+            } else {
+                draft_ok = load_draft_safetensors(draft_path, draft_backend, draft_weights);
+            }
+            if (!draft_ok) {
+                std::fprintf(stderr, "target-split draft load gpu=%d: %s\n",
+                             draft_gpu, dflash27b_last_error());
+                free_draft_weights(draft_weights);
+                if (draft_backend_owned) ggml_backend_free(draft_backend);
+                free_target_layer_split_shards(shards);
+                return 1;
+            }
+            std::printf("[target-split] draft loaded on gpu=%d format=%s\n",
+                        draft_gpu,
+                        (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
+                            ? "gguf" : "safetensors");
+            if (!draft_feature_mirror_init(feature_ring, draft_backend,
+                                           draft_gpu, draft_gpu, cap)) {
+                std::fprintf(stderr, "target-split feature ring init failed on gpu=%d\n", draft_gpu);
+                draft_feature_mirror_free(feature_ring);
+                free_draft_weights(draft_weights);
+                if (draft_backend_owned) ggml_backend_free(draft_backend);
+                free_target_layer_split_shards(shards);
+                return 1;
+            }
+            std::printf("[target-split] draft feature ring cap=%d gpu=%d\n", cap, draft_gpu);
         }
-        if (!draft_ok) {
-            std::fprintf(stderr, "target-split draft load gpu=%d: %s\n",
-                         draft_gpu, dflash27b_last_error());
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        std::printf("[target-split] draft loaded on gpu=%d format=%s\n",
-                    draft_gpu,
-                    (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-                        ? "gguf" : "safetensors");
-        const int cap = std::min(max_ctx, 4096);
-        if (!draft_feature_mirror_init(feature_ring, draft_backend,
-                                       draft_gpu, draft_gpu, cap)) {
-            std::fprintf(stderr, "target-split feature ring init failed on gpu=%d\n", draft_gpu);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        std::printf("[target-split] draft feature ring cap=%d gpu=%d\n", cap, draft_gpu);
     }
 
     auto prompt = read_int32_file(prompt_path);
@@ -1927,7 +2464,9 @@ static int run_target_layer_split_harness(
     auto t_pf0 = std::chrono::steady_clock::now();
     if (!run_target_layer_split_forward(shards, shards.front().weights,
                                         prompt, 0, ubatch, last_tok,
-                                        load_draft ? &feature_ring : nullptr)) {
+                                        (load_draft && !use_remote_draft) ? &feature_ring : nullptr,
+                                        nullptr, nullptr,
+                                        (load_draft && use_remote_draft) ? &remote_draft : nullptr)) {
         std::fprintf(stderr, "target-split prefill failed\n");
         draft_feature_mirror_free(feature_ring);
         free_draft_weights(draft_weights);
@@ -1943,79 +2482,99 @@ static int run_target_layer_split_harness(
     if (run_draft_smoke) {
         const int hidden = DFLASH27B_TARGET_HIDDEN;
         const int q_len = DFLASH27B_DRAFT_BLOCK_SIZE;
-        const int draft_ctx = std::min((int)prompt.size(), feature_ring.cap);
+        const int ring_cap = use_remote_draft ? remote_draft.ring_cap() : feature_ring.cap;
+        const int draft_ctx = std::min((int)prompt.size(), ring_cap);
         const int draft_start = (int)prompt.size() - draft_ctx;
-        StepGraph draft_sg;
-        int mirror_slot0 = 0;
-        const bool use_mirror_view =
-            draft_feature_mirror_can_view(feature_ring, (int)prompt.size(),
-                                          draft_ctx, mirror_slot0);
-        if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
-                              draft_ctx, use_mirror_view ? &feature_ring : nullptr,
-                              (int)prompt.size())) {
-            std::fprintf(stderr, "target-split draft smoke build failed\n");
-            step_graph_destroy(draft_sg);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        if (!use_mirror_view &&
-            !copy_feature_ring_range_to_tensor(feature_ring,
-                                               draft_sg.target_hidden_cat,
-                                               draft_start, draft_ctx)) {
-            std::fprintf(stderr, "target-split draft smoke feature copy failed\n");
-            step_graph_destroy(draft_sg);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
         std::vector<int32_t> noise_ids(q_len, DFLASH27B_DRAFT_MASK_TOKEN_ID);
         noise_ids[0] = last_tok;
         std::vector<float> noise_embed((size_t)hidden * q_len);
         if (!shards.front().weights.embedder.embed(noise_ids.data(), q_len, noise_embed.data())) {
             std::fprintf(stderr, "target-split draft smoke embed failed\n");
-            step_graph_destroy(draft_sg);
             draft_feature_mirror_free(feature_ring);
             free_draft_weights(draft_weights);
             if (draft_backend_owned) ggml_backend_free(draft_backend);
             free_target_layer_split_shards(shards);
             return 1;
         }
-        ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                sizeof(float) * noise_embed.size());
-        std::vector<int32_t> pos_q(q_len), pos_k(draft_ctx + q_len);
-        for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-        for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-        ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                sizeof(int32_t) * pos_q.size());
-        ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                sizeof(int32_t) * pos_k.size());
-        auto t_ds0 = std::chrono::steady_clock::now();
-        auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
-        auto t_ds1 = std::chrono::steady_clock::now();
-        if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "target-split draft smoke compute failed status=%d\n", (int)st);
+        if (use_remote_draft) {
+            std::vector<float> hidden_out;
+            auto t_ds0 = std::chrono::steady_clock::now();
+            const bool ok = remote_draft.propose((int)prompt.size(), draft_ctx,
+                                                 noise_embed, hidden_out);
+            auto t_ds1 = std::chrono::steady_clock::now();
+            if (!ok) {
+                std::fprintf(stderr, "target-split remote draft smoke failed\n");
+                draft_feature_mirror_free(feature_ring);
+                free_draft_weights(draft_weights);
+                if (draft_backend_owned) ggml_backend_free(draft_backend);
+                free_target_layer_split_shards(shards);
+                return 1;
+            }
+            std::printf("[target-split] remote draft smoke ctx=%d q=%d time=%.3f ms\n",
+                        draft_ctx, q_len,
+                        std::chrono::duration<double, std::milli>(t_ds1 - t_ds0).count());
+        } else {
+            StepGraph draft_sg;
+            int mirror_slot0 = 0;
+            const bool use_mirror_view =
+                draft_feature_mirror_can_view(feature_ring, (int)prompt.size(),
+                                              draft_ctx, mirror_slot0);
+            if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
+                                  draft_ctx, use_mirror_view ? &feature_ring : nullptr,
+                                  (int)prompt.size())) {
+                std::fprintf(stderr, "target-split draft smoke build failed\n");
+                step_graph_destroy(draft_sg);
+                draft_feature_mirror_free(feature_ring);
+                free_draft_weights(draft_weights);
+                if (draft_backend_owned) ggml_backend_free(draft_backend);
+                free_target_layer_split_shards(shards);
+                return 1;
+            }
+            if (!use_mirror_view &&
+                !copy_feature_ring_range_to_tensor(feature_ring,
+                                                   draft_sg.target_hidden_cat,
+                                                   draft_start, draft_ctx)) {
+                std::fprintf(stderr, "target-split draft smoke feature copy failed\n");
+                step_graph_destroy(draft_sg);
+                draft_feature_mirror_free(feature_ring);
+                free_draft_weights(draft_weights);
+                if (draft_backend_owned) ggml_backend_free(draft_backend);
+                free_target_layer_split_shards(shards);
+                return 1;
+            }
+            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                    sizeof(float) * noise_embed.size());
+            std::vector<int32_t> pos_q(q_len), pos_k(draft_ctx + q_len);
+            for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
+            for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                    sizeof(int32_t) * pos_q.size());
+            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                    sizeof(int32_t) * pos_k.size());
+            auto t_ds0 = std::chrono::steady_clock::now();
+            auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
+            auto t_ds1 = std::chrono::steady_clock::now();
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "target-split draft smoke compute failed status=%d\n", (int)st);
+                step_graph_destroy(draft_sg);
+                draft_feature_mirror_free(feature_ring);
+                free_draft_weights(draft_weights);
+                if (draft_backend_owned) ggml_backend_free(draft_backend);
+                free_target_layer_split_shards(shards);
+                return 1;
+            }
+            std::printf("[target-split] draft smoke ctx=%d q=%d time=%.3f ms\n",
+                        draft_ctx, q_len,
+                        std::chrono::duration<double, std::milli>(t_ds1 - t_ds0).count());
             step_graph_destroy(draft_sg);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
         }
-        std::printf("[target-split] draft smoke ctx=%d q=%d time=%.3f ms\n",
-                    draft_ctx, q_len,
-                    std::chrono::duration<double, std::milli>(t_ds1 - t_ds0).count());
-        step_graph_destroy(draft_sg);
     }
 
     if (run_dflash) {
         const bool ok = run_target_layer_split_dflash_decode(
             shards, draft_weights, draft_backend, draft_gpu, feature_ring,
-            prompt, n_gen, last_tok, out_path);
+            prompt, n_gen, last_tok, out_path,
+            use_remote_draft ? &remote_draft : nullptr);
         draft_feature_mirror_free(feature_ring);
         free_draft_weights(draft_weights);
         if (draft_backend_owned) ggml_backend_free(draft_backend);
@@ -2031,7 +2590,9 @@ static int run_target_layer_split_harness(
         int next_tok = -1;
         if (!run_target_layer_split_forward(shards, shards.front().weights,
                                             one, (int)out_all.size(), 1, next_tok,
-                                            load_draft ? &feature_ring : nullptr)) {
+                                            (load_draft && !use_remote_draft) ? &feature_ring : nullptr,
+                                            nullptr, nullptr,
+                                            (load_draft && use_remote_draft) ? &remote_draft : nullptr)) {
             std::fprintf(stderr, "target-split decode failed at %d\n", generated);
             draft_feature_mirror_free(feature_ring);
             free_draft_weights(draft_weights);
@@ -2064,9 +2625,42 @@ static SamplerCfg     g_sampler;
 static std::mt19937_64 g_sampler_rng{std::random_device{}()};
 
 int main(int argc, char ** argv) {
+    if (argc >= 2 && std::strcmp(argv[1], "--draft-ipc-daemon") == 0) {
+        if (argc < 3) {
+            std::fprintf(stderr,
+                "usage: %s --draft-ipc-daemon <draft.safetensors|draft.gguf> --ring-cap=N --stream-fd=FD [--draft-gpu=N]\n",
+                argv[0]);
+            return 2;
+        }
+        const char * ipc_draft_path = argv[2];
+        int ipc_ring_cap = 4096;
+        int ipc_draft_gpu = 0;
+        int ipc_stream_fd = -1;
+        for (int i = 3; i < argc; i++) {
+            if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
+                ipc_ring_cap = std::atoi(argv[i] + 11);
+            } else if (std::strcmp(argv[i], "--ring-cap") == 0) {
+                if (i + 1 < argc) ipc_ring_cap = std::atoi(argv[++i]);
+            } else if (std::strncmp(argv[i], "--draft-gpu=", 12) == 0) {
+                ipc_draft_gpu = std::max(0, std::atoi(argv[i] + 12));
+            } else if (std::strcmp(argv[i], "--draft-gpu") == 0) {
+                if (i + 1 < argc) ipc_draft_gpu = std::max(0, std::atoi(argv[++i]));
+            } else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
+                ipc_stream_fd = std::atoi(argv[i] + 12);
+            } else if (std::strcmp(argv[i], "--stream-fd") == 0) {
+                if (i + 1 < argc) ipc_stream_fd = std::atoi(argv[++i]);
+            }
+        }
+        return run_dflash_draft_ipc_daemon(ipc_draft_path,
+                                           ipc_ring_cap,
+                                           ipc_draft_gpu,
+                                           ipc_stream_fd);
+    }
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: %s <target.gguf> <draft.safetensors> [<prompt_ids.bin> <n_gen> <out_ids.bin>] [--daemon] [-ctk <type>] [-ctv <type>] ...\n", argv[0]);
+            "usage: %s <target.gguf> <draft.safetensors> [<prompt_ids.bin> <n_gen> <out_ids.bin>] [--daemon] [-ctk <type>] [-ctv <type>] ...\n"
+            "       %s --draft-ipc-daemon <draft.safetensors|draft.gguf> --ring-cap=N --stream-fd=FD [--draft-gpu=N]\n",
+            argv[0], argv[0]);
         return 2;
     }
     // TurboQuant FA kernel requires kv_len aligned to FATTN_KQ_STRIDE=256.
@@ -2112,6 +2706,10 @@ int main(int argc, char ** argv) {
     bool  target_split_dflash = false;
     int   target_gpu = 0;
     int   draft_gpu = 0;
+    const char * draft_ipc_bin = nullptr;
+    const char * draft_ipc_work_dir = nullptr;
+    int   draft_ipc_gpu = 0;
+    int   draft_ipc_ring_cap = 0;
     std::vector<int> target_gpus;
     std::vector<double> target_split_weights;
     if (const char * s = std::getenv("DFLASH_TARGET_GPU")) {
@@ -2119,6 +2717,18 @@ int main(int argc, char ** argv) {
     }
     if (const char * s = std::getenv("DFLASH_DRAFT_GPU")) {
         draft_gpu = std::max(0, std::atoi(s));
+    }
+    if (const char * s = std::getenv("DFLASH_DRAFT_IPC_BIN")) {
+        draft_ipc_bin = s;
+    }
+    if (const char * s = std::getenv("DFLASH_DRAFT_IPC_GPU")) {
+        draft_ipc_gpu = std::max(0, std::atoi(s));
+    }
+    if (const char * s = std::getenv("DFLASH_DRAFT_IPC_WORK_DIR")) {
+        draft_ipc_work_dir = s;
+    }
+    if (const char * s = std::getenv("DFLASH_DRAFT_IPC_RING_CAP")) {
+        draft_ipc_ring_cap = std::max(0, std::atoi(s));
     }
     if (const char * s = std::getenv("DFLASH_TARGET_GPUS")) {
         if (!parse_int_list(s, target_gpus)) {
@@ -2197,6 +2807,30 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--draft-gpu") == 0) {
             if (i + 1 < argc) draft_gpu = std::max(0, std::atoi(argv[++i]));
         }
+        else if (std::strncmp(argv[i], "--draft-ipc-bin=", 16) == 0) {
+            draft_ipc_bin = argv[i] + 16;
+        }
+        else if (std::strcmp(argv[i], "--draft-ipc-bin") == 0) {
+            if (i + 1 < argc) draft_ipc_bin = argv[++i];
+        }
+        else if (std::strncmp(argv[i], "--draft-ipc-gpu=", 16) == 0) {
+            draft_ipc_gpu = std::max(0, std::atoi(argv[i] + 16));
+        }
+        else if (std::strcmp(argv[i], "--draft-ipc-gpu") == 0) {
+            if (i + 1 < argc) draft_ipc_gpu = std::max(0, std::atoi(argv[++i]));
+        }
+        else if (std::strncmp(argv[i], "--draft-ipc-work-dir=", 21) == 0) {
+            draft_ipc_work_dir = argv[i] + 21;
+        }
+        else if (std::strcmp(argv[i], "--draft-ipc-work-dir") == 0) {
+            if (i + 1 < argc) draft_ipc_work_dir = argv[++i];
+        }
+        else if (std::strncmp(argv[i], "--draft-ipc-ring-cap=", 21) == 0) {
+            draft_ipc_ring_cap = std::max(0, std::atoi(argv[i] + 21));
+        }
+        else if (std::strcmp(argv[i], "--draft-ipc-ring-cap") == 0) {
+            if (i + 1 < argc) draft_ipc_ring_cap = std::max(0, std::atoi(argv[++i]));
+        }
         else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
             profile_scaling = true;
         }
@@ -2254,10 +2888,24 @@ int main(int argc, char ** argv) {
     if (target_split_dflash) target_split_load_draft = true;
     if (target_gpus.empty()) target_gpus.push_back(target_gpu);
     if (target_gpus.size() == 1) target_gpu = target_gpus[0];
+    if (draft_ipc_bin && target_gpus.size() <= 1) {
+        std::fprintf(stderr,
+                     "--draft-ipc-bin currently applies to --target-gpus layer-split DFlash only\n");
+        return 2;
+    }
+    if (draft_ipc_bin && !target_split_load_draft) {
+        std::fprintf(stderr,
+                     "--draft-ipc-bin requires --target-split-dflash or --target-split-load-draft\n");
+        return 2;
+    }
     std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_feature_mirror=%d target_gpu=%d draft_gpu=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
                 ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window,
                 (int)draft_feature_mirror, target_gpu, draft_gpu);
+    if (draft_ipc_bin) {
+        std::printf("[cfg] draft_ipc_bin=%s draft_ipc_gpu=%d draft_ipc_ring_cap=%d\n",
+                    draft_ipc_bin, draft_ipc_gpu, draft_ipc_ring_cap);
+    }
 
     int cuda_device_count = 0;
     cudaGetDeviceCount(&cuda_device_count);
@@ -2268,7 +2916,8 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (target_gpu >= cuda_device_count || draft_gpu >= cuda_device_count) {
+    if (target_gpu >= cuda_device_count ||
+        (!draft_ipc_bin && draft_gpu >= cuda_device_count)) {
         std::fprintf(stderr, "bad gpu ids target=%d draft=%d device_count=%d\n",
                      target_gpu, draft_gpu, cuda_device_count);
         return 2;
@@ -2288,10 +2937,14 @@ int main(int argc, char ** argv) {
                                              target_split_load_draft,
                                              target_split_load_draft && !target_split_dflash,
                                              target_split_dflash,
-                                             g_max_ctx_override > 0 ? g_max_ctx_override : 4096,
-                                             ddtree_mode
-                                                 ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
-                                                 : DFLASH27B_DRAFT_BLOCK_SIZE);
+                                                 g_max_ctx_override > 0 ? g_max_ctx_override : 4096,
+                                                 ddtree_mode
+                                                     ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
+                                                     : DFLASH27B_DRAFT_BLOCK_SIZE,
+                                                 draft_ipc_bin,
+                                                 draft_ipc_gpu,
+                                                 draft_ipc_work_dir,
+                                                 draft_ipc_ring_cap);
     }
 
     const bool split_gpus = target_gpu != draft_gpu;

@@ -51,36 +51,64 @@ DFLASH_FP_PROFILE=1    # log mean/score/select/forward stage timings
 
 See `src/flashprefill.h` for the full list and defaults.
 
-## Dual-GPU PFlash phase split
+## Hybrid PFlash phase split
 
 PFlash targets the prefill side of long-context requests. The dual-GPU phase
 split harness is an opt-in benchmark/runtime path for measuring the PFlash
-prefill phase as its own resident CUDA process:
+prefill phase as its own resident process. It can now place the PFlash drafter
+phase and the later target generation phase on different ggml GPU backends:
 
 - `pflash_daemon` keeps the Qwen3-0.6B PFlash drafter resident.
 - `scripts/phase_split_dual_gpu.py` sends counted token IDs to the daemon.
-- `--pflash-gpu` selects the CUDA GPU used for the PFlash phase.
-- The report records compressed token/text outputs, PFlash timing, and GPU
-  resource peaks for the PFlash worker.
+- `--pflash-backend cuda|hip` and `--pflash-visible-devices` select the
+  backend/device set used for the PFlash phase.
+- `--run-target` can launch `test_dflash` afterward with
+  `--target-backend cuda|hip` and `--target-visible-devices`.
+- The report records compressed token/text outputs, PFlash timing, target
+  generation timing, return code, and GPU resource peaks for the PFlash worker.
 
-The harness produces the compressed prompt artifact used by later target
-prefill experiments. It does not measure or modify decode.
+The cross-backend boundary is host-side token/text data: the PFlash daemon
+returns compressed drafter-token IDs, the harness decodes them to text, and
+the target tokenizer re-encodes that text for `test_dflash`. This keeps the
+hybrid path compatible with the existing PFlash phase split, DFlash target/draft
+split, and DFlash target layer split harnesses without adding cross-vendor GPU
+activation transfers.
+
+Target layer split remains inside one backend binary. For example, use HIP
+PFlash on an AMD card with CUDA target layer split across two NVIDIA cards, or
+CUDA PFlash on an NVIDIA card with HIP target layer split across AMD cards.
+Cross-backend target layer split is intentionally out of scope for this phase.
 
 Build:
 
 ```
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target pflash_daemon -j
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_GPU_BACKEND=cuda
+cmake --build build-cuda --target pflash_daemon test_dflash -j
+
+cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES=<your-gfx-arch>
+cmake --build build-hip --target pflash_daemon test_dflash -j
 ```
 
-Run a synthetic NIAH sweep:
+Run a HIP PFlash drafter followed by CUDA target layer split:
 
 ```
 python scripts/phase_split_dual_gpu.py bench-niah \
-  --build-dir build \
-  --contexts 4096,8192,16384 \
+  --build-dir build-hip \
+  --pflash-backend hip \
+  --pflash-visible-devices 0 \
+  --run-target \
+  --target-bin build-cuda/test_dflash \
+  --target-backend cuda \
+  --target-visible-devices 0,1 \
+  --target-gpus 0,1 \
+  --target-layer-split 1,1 \
+  --target-gen-tokens 8 \
+  --contexts 4096 \
   --local-files-only \
-  --report-dir reports/pflash_phase_split_context_sweep
+  --report-dir reports/pflash_hybrid_hip_drafter_cuda_target
 ```
 
 Compress a real prompt:

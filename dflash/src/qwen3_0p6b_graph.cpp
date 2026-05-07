@@ -34,7 +34,7 @@
 #include "internal.h"
 #include "flashprefill.h"
 
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
 #include <cuda_runtime.h>
 #endif
 
@@ -146,9 +146,10 @@ bool forward_qwen3_0p6b_drafter(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
-        // Use BF16 on Ampere+ (native tensor core support), F16 on Turing.
+        // Use BF16 only when the CUDA WMMA fastpath is compiled. Other CUDA
+        // arches and HIP use F16 with ggml flash_attn_ext for the portable path.
         const ggml_type half_type =
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
             GGML_TYPE_BF16;
 #else
             GGML_TYPE_F16;
@@ -323,18 +324,19 @@ bool forward_qwen3_0p6b_drafter(
 
         // ── Attention dispatch ──
         // Use the ggml FA path (flash_prefill_forward_q8) when:
-        //   - SM < 80 (BF16 WMMA unavailable), OR
-        //   - The drafter's persistent buffers are not BF16 (e.g. F16 on Turing)
-        // Use the custom BF16 WMMA path on SM >= 80 with BF16 buffers.
+        //   - the CUDA BF16 WMMA kernels were not compiled, OR
+        //   - the drafter's persistent buffers are not BF16
+        // Use the custom CUDA BF16 WMMA path only when it is compiled and the
+        // buffers are BF16.
         auto tF0 = std::chrono::steady_clock::now();
         const bool use_bf16_fp = (Q_buf.t->type == GGML_TYPE_BF16)
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
                                  && true;
 #else
                                  && false;  // WMMA kernels not compiled
 #endif
         if (use_bf16_fp) {
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
             int rc = flashprefill::flash_prefill_forward_bf16(
                 Q_buf.t->data,
                 K_curr_v[il].t->data,
@@ -360,7 +362,7 @@ bool forward_qwen3_0p6b_drafter(
                 V_curr_v[il].t->data,
                 attn_out_buf.t->data,
                 1, S, H, Hk, D, scale,
-                (int)ggml_element_size(Q_buf.t),
+                Q_buf.t->type,
                 fp_cfg);
             if (rc != 0) {
                 set_last_error("flash_prefill_forward_q8 failed at layer " + std::to_string(il));
