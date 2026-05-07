@@ -15,9 +15,14 @@
 #include "laguna_internal.h"
 #include "internal.h"
 #include "dflash27b.h"
-#include "sampler.h"  // shared CPU sampler chain (SamplerCfg /
-                      // sample_logits / parse_sampler_token), defined once
-                      // in src/sampler.cpp and reused by test_dflash.cpp.
+#include "sampler.h"          // shared CPU sampler chain (SamplerCfg /
+                              // sample_logits / parse_sampler_token), defined
+                              // once in src/sampler.cpp.
+#include "qwen3_drafter.h"   // Qwen3-0.6B drafter — same one used by
+                              // pflash_daemon and the qwen35 compress dance.
+                              // Loaded lazily on the first `compress` command
+                              // so a server that never asks for compression
+                              // never pays the drafter weight load.
 
 #include <algorithm>
 #include <chrono>
@@ -131,6 +136,49 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
 
     std::mt19937_64 sampler_rng{std::random_device{}()};
 
+    // PFlash compression state. The drafter (Qwen3-0.6B BF16 GGUF) is loaded
+    // lazily on the first `compress` command and freed on `free drafter` /
+    // shutdown. While the drafter is resident the target weights are parked
+    // (released to host) so the two don'́t fight for VRAM on a 24 GB card:
+    // target ~18.77 GiB + drafter ~1.2 GiB + scratch leaves no room for
+    // activations. The lifecycle mirrors qwen35'́s daemon — server.py'́s
+    // _prefill_hook drives `park target` -> `compress ...` -> `unpark target`
+    // unchanged.
+    DrafterContext drafter_ctx{};
+    bool drafter_loaded = false;
+    bool target_parked  = false;
+
+    auto park_target = [&]() -> bool {
+        if (target_parked) return true;
+        free_laguna_target_cache(cache);
+        free_laguna_target_weights(w);
+        target_parked = true;
+        std::printf("[park] target released\n"); std::fflush(stdout);
+        return true;
+    };
+    auto unpark_target = [&]() -> bool {
+        if (!target_parked) return true;
+        if (!load_target_gguf_laguna(args.target_path, backend, w)) {
+            std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
+            return false;
+        }
+        cache.kv_k_type = args.kv_type;
+        cache.kv_v_type = args.kv_type;
+        if (!create_laguna_target_cache(w, args.max_ctx, backend, cache)) {
+            std::fprintf(stderr, "[unpark] cache: %s\n", dflash27b_last_error());
+            return false;
+        }
+        target_parked = false;
+        std::printf("[unpark] target restored\n"); std::fflush(stdout);
+        return true;
+    };
+
+    auto stream_emit = [&](int32_t v) {
+        if (stream_fd < 0) return;
+        ssize_t n = ::write(stream_fd, &v, sizeof(v));
+        (void)n;
+    };
+
     auto run_prompt = [&](const std::vector<int32_t> & prompt,
                           int n_gen,
                           const SamplerCfg & sampler,
@@ -209,14 +257,103 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
         return s.find('/') != std::string::npos;
     };
 
+    auto starts_with = [](const std::string & s, const std::string & p) {
+        return s.size() >= p.size() && std::memcmp(s.data(), p.data(), p.size()) == 0;
+    };
+
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line == "quit" || line == "exit") break;
 
+        // ---- Lifecycle commands (no sampler tail expected) -----------------
+        // server.py'́s _prefill_hook calls `_send_and_ack(...)` which reads a
+        // -1 sentinel off stream_fd after every park / unpark / compress /
+        // free drafter. Each handler emits one when it is done.
+        if (starts_with(line, "park")) {
+            const bool want_target = (line == "park" || line == "park all" || line == "park target");
+            // "park draft" is a no-op on the laguna path (no DFlash draft).
+            if (want_target) park_target();
+            stream_emit(-1);
+            continue;
+        }
+        if (starts_with(line, "unpark")) {
+            const bool want_target = (line == "unpark" || line == "unpark all" || line == "unpark target");
+            if (want_target && !unpark_target()) { stream_emit(-1); continue; }
+            stream_emit(-1);
+            continue;
+        }
+        if (line == "free drafter" || line == "drafter free") {
+            if (drafter_loaded) {
+                free_drafter(drafter_ctx);
+                drafter_loaded = false;
+                std::printf("[drafter] freed\n"); std::fflush(stdout);
+            }
+            stream_emit(-1);
+            continue;
+        }
+        if (starts_with(line, "compress ")) {
+            // Format mirrors qwen35'́s daemon so server.py'́s _prefill_hook
+            // is byte-identical for both arches:
+            //   compress <ids.bin> <keep_x1000> <drafter.gguf>
+            // The driver may have already issued `park target` to make room
+            // for the drafter — we still re-park here defensively if it
+            // hasn'́t, and re-unpark on exit so the next generate works.
+            char ppath[1024];
+            int  keep_x1000 = 0;
+            char drafter_path[1024];
+            const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
+                                       ppath, &keep_x1000, drafter_path);
+            if (n != 3) {
+                std::fprintf(stderr,
+                              "[compress] bad args, need: <bin> <keep_x1000> <drafter.gguf>\n");
+                stream_emit(-1); continue;
+            }
+            auto src_ids = read_uncounted_i32(ppath);
+            if (src_ids.empty()) {
+                std::fprintf(stderr, "[compress] empty input\n");
+                stream_emit(-1); continue;
+            }
+
+            const bool restore_target = !target_parked;
+            if (restore_target && !park_target()) { stream_emit(-1); continue; }
+
+            if (!drafter_loaded) {
+                if (!load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx)) {
+                    std::fprintf(stderr, "[compress] load_drafter failed: %s\n",
+                                  dflash27b_last_error());
+                    stream_emit(-1); continue;
+                }
+                drafter_loaded = true;
+                std::printf("[drafter] loaded %s vocab=%d\n",
+                             drafter_path, drafter_ctx.weights.n_vocab);
+                std::fflush(stdout);
+            }
+
+            const float keep = (float)keep_x1000 / 1000.0f;
+            auto compressed = drafter_score_and_compress(drafter_ctx, src_ids, keep);
+            std::printf("[compress] %zu -> %zu tokens (keep_ratio=%.3f)\n",
+                         src_ids.size(), compressed.size(), keep);
+            std::fflush(stdout);
+
+            if (restore_target && !unpark_target()) { stream_emit(-1); continue; }
+
+            for (int32_t t : compressed) stream_emit(t);
+            stream_emit(-1);
+            continue;
+        }
+
+        // ---- Generate / bare-prompt commands (sampler tail honored) -------
         SamplerCfg sampler{};
         const bool have_sampler = parse_sampler_token(line, sampler);
         if (have_sampler && sampler.seed != 0) sampler_rng.seed(sampler.seed);
         const bool do_sample = have_sampler && sampler.temp > 0.0f;
+        if (target_parked) {
+            std::fprintf(stderr,
+                          "[laguna-daemon] target is parked; expected unpark before generate\n");
+            std::printf("err target_parked\n"); std::fflush(stdout);
+            stream_emit(-1);
+            continue;
+        }
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
@@ -294,8 +431,11 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
         emit_int32(-1);
     }
 
-    free_laguna_target_cache(cache);
-    free_laguna_target_weights(w);
+    if (drafter_loaded) free_drafter(drafter_ctx);
+    if (!target_parked) {
+        free_laguna_target_cache(cache);
+        free_laguna_target_weights(w);
+    }
     ggml_backend_free(backend);
     return 0;
 }

@@ -904,29 +904,21 @@ def main():
     if arch in _LAGUNA_ARCHES:
         # No DFlash draft model exists for laguna yet; test_dflash'́s
         # internal arch dispatch reads general.architecture, accepts the
-        # no-draft argv layout, and routes to run_laguna_daemon(). Prefix
-        # caching also requires SNAPSHOT/RESTORE in the laguna daemon (not
-        # yet shipped), so disable both caches here — every request runs a
-        # cold prefill.
+        # no-draft argv layout, and routes to run_laguna_daemon(). PFlash
+        # speculative-prefill compression IS wired through the laguna
+        # daemon (drafter co-hosted, same `compress` / `park target` /
+        # `unpark target` / `free drafter` protocol the qwen35 stack
+        # uses), so --prefill-compression auto/always works on this path.
         draft = None
+        # Prefix caching still requires SNAPSHOT/RESTORE in the laguna
+        # daemon (follow-up work). Force the slots to 0 so PrefixCache
+        # short-circuits to the bare-prompt path on every request.
         if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
-            print(f"[server] laguna: prefix/prefill cache slots disabled "
-                  f"(SNAPSHOT/RESTORE not yet implemented in test_laguna_daemon)",
+            print("[server] laguna: prefix/prefill cache slots disabled "
+                  "(SNAPSHOT/RESTORE not yet implemented in run_laguna_daemon)",
                   flush=True)
         args.prefix_cache_slots = 0
         args.prefill_cache_slots = 0
-        if prefill_cfg.enabled:
-            print("[server] laguna: in-process PFlash compression not yet "
-                  "wired through this path (sidecar pflash_daemon planned); "
-                  "running uncompressed.", flush=True)
-            prefill_cfg = config_from_args(
-                argparse.Namespace(
-                    prefill_compression="off",
-                    prefill_threshold=args.prefill_threshold,
-                    prefill_keep_ratio=args.prefill_keep_ratio,
-                    prefill_drafter=args.prefill_drafter,
-                    prefill_drafter_tokenizer=args.prefill_drafter_tokenizer,
-                ))
     else:
         draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
         if not draft.is_file():
