@@ -18,6 +18,9 @@ struct DraftGraphInputs {
     // hidden states. Used for DFlash integration where the draft shares the
     // target's lm_head.
     ggml_tensor * lm_head;
+    // Optional: YaRN RoPE frequency factors [head_dim/2] f32.
+    // If non-null, passed to ggml_rope_ext to correct for YaRN scaling.
+    ggml_tensor * rope_freq_factors = nullptr;
 };
 
 struct DraftGraphOutputs {

@@ -548,6 +548,7 @@ int run_moe_dflash(
         ggml_tensor * target_hidden_cat = nullptr;
         ggml_tensor * positions_q = nullptr;
         ggml_tensor * positions_k = nullptr;
+        ggml_tensor * rope_freq_factors = nullptr;
         ggml_tensor * logits = nullptr;
         ggml_tensor * argmax_tokens = nullptr;
     };
@@ -556,6 +557,40 @@ int run_moe_dflash(
         if (d.ctx) { ggml_free(d.ctx); d.ctx = nullptr; }
         d.gf = nullptr;
     };
+
+    // Pre-compute YaRN RoPE freq_factors for the draft model.
+    // The draft was trained with YaRN scaling (factor=64, beta_fast=32, beta_slow=1,
+    // original_max_position_embeddings=4096) but we were using vanilla RoPE.
+    const int rope_dim = dw.head_dim;  // 128
+    const int n_freq   = rope_dim / 2; // 64
+    std::vector<float> yarn_freq_factors(n_freq, 1.0f);
+    {
+        const float rope_theta  = DFLASH27B_ROPE_THETA;          // 10^7
+        const float yarn_factor = 64.0f;
+        const float beta_fast   = 32.0f;
+        const float beta_slow   = 1.0f;
+        const int   orig_ctx    = 4096;
+
+        // _yarn_find_correction_dim: dim * log(max_pos / (num_rotations * 2π)) / (2 * log(base))
+        auto correction_dim = [&](float num_rotations) -> float {
+            return (float)rope_dim * std::log((float)orig_ctx / (num_rotations * 2.0f * (float)M_PI))
+                   / (2.0f * std::log(rope_theta));
+        };
+        int low  = std::max((int)std::floor(correction_dim(beta_fast)), 0);
+        int high = std::min((int)std::ceil(correction_dim(beta_slow)), n_freq - 1);
+
+        for (int i = 0; i < n_freq; i++) {
+            float ramp = (high > low) ? std::clamp((float)(i - low) / (float)(high - low), 0.0f, 1.0f) : 0.0f;
+            // ramp=0 at low → extrapolation (vanilla, factor=1)
+            // ramp=1 at high → interpolation (factor=yarn_factor)
+            float ff = 1.0f + ramp * (yarn_factor - 1.0f);
+            yarn_freq_factors[i] = ff;
+        }
+        std::printf("[draft] YaRN freq_factors: low=%d high=%d, ff[0]=%.1f ff[%d]=%.1f ff[%d]=%.1f\n",
+                    low, high, yarn_freq_factors[0], n_freq/2, yarn_freq_factors[n_freq/2],
+                    n_freq-1, yarn_freq_factors[n_freq-1]);
+    }
+
     auto draft_build = [&](MoeDraftCtx & d, int ctx_len) -> bool {
         draft_free(d);
         ggml_init_params ip{};
@@ -572,6 +607,8 @@ int run_moe_dflash(
         ggml_set_name(d.positions_q, "positions_q"); ggml_set_input(d.positions_q);
         d.positions_k = ggml_new_tensor_1d(d.ctx, GGML_TYPE_I32, ctx_len + draft_block);
         ggml_set_name(d.positions_k, "positions_k"); ggml_set_input(d.positions_k);
+        d.rope_freq_factors = ggml_new_tensor_1d(d.ctx, GGML_TYPE_F32, n_freq);
+        ggml_set_name(d.rope_freq_factors, "rope_ff"); ggml_set_input(d.rope_freq_factors);
         d.gf = ggml_new_graph_custom(d.ctx, 4096, false);
         DraftGraphInputs gi{};
         gi.ctx_len = ctx_len;
@@ -580,6 +617,7 @@ int run_moe_dflash(
         gi.positions_q = d.positions_q;
         gi.positions_k = d.positions_k;
         gi.lm_head = w.output;
+        gi.rope_freq_factors = d.rope_freq_factors;
         DraftGraphOutputs go = build_draft_graph(d.ctx, dw, gi);
         d.logits = go.logits;
         if (!d.logits) return false;
@@ -588,7 +626,11 @@ int run_moe_dflash(
         ggml_set_output(d.argmax_tokens);
         ggml_build_forward_expand(d.gf, d.argmax_tokens);
         if (!d.alloc) d.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(draft_backend));
-        return ggml_gallocr_alloc_graph(d.alloc, d.gf);
+        if (!ggml_gallocr_alloc_graph(d.alloc, d.gf)) return false;
+        // Set constant freq_factors after allocation
+        ggml_backend_tensor_set(d.rope_freq_factors, yarn_freq_factors.data(), 0,
+                                sizeof(float) * n_freq);
+        return true;
     };
 
     // ── Decode loop ──
@@ -651,6 +693,7 @@ int run_moe_dflash(
         ggml_backend_graph_compute(draft_backend, dctx.gf);
         // Read first q_len tokens from the 16 draft outputs
         ggml_backend_tensor_get(dctx.argmax_tokens, draft_tok.data(), 0, sizeof(int32_t) * q_len);
+
         draft_tok[0] = last_tok;
 
         // ── DDTree path ──

@@ -94,15 +94,15 @@ DraftGraphOutputs build_draft_graph(
 
         V = ggml_reshape_3d(ctx, V, head_dim, n_kv, total_k);
 
-        // ── 2d. RoPE (NEOX, theta=10M)
+        // ── 2d. RoPE (NEOX, theta=10M, with optional YaRN freq_factors)
         //   Q: positions_q  [q_len]      values [ctx_len..ctx_len+q_len-1]
         //   K: positions_k  [total_k]    values [0..total_k-1]
-        Q = ggml_rope_ext(ctx, Q, in.positions_q, /*freq_factors=*/nullptr,
+        Q = ggml_rope_ext(ctx, Q, in.positions_q, in.rope_freq_factors,
                           head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
                           rope_base, /*freq_scale=*/1.0f,
                           /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
                           /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
-        K = ggml_rope_ext(ctx, K, in.positions_k, nullptr,
+        K = ggml_rope_ext(ctx, K, in.positions_k, in.rope_freq_factors,
                           head_dim, GGML_ROPE_TYPE_NEOX, 0,
                           rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
