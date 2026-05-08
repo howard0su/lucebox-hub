@@ -210,6 +210,161 @@ static bool parse_sampler_token(std::string & line, SamplerCfg & out) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Filtered probability distribution for one-hot rejection sampling.
+//
+// build_filtered_dist() applies the full sampler chain (rep_pen → top_k →
+// temp softmax → top_p → renormalize) to raw logits and returns a compact
+// probability vector.  From that distribution we can:
+//   - read the acceptance probability for a specific draft token,
+//   - draw a regular sample,
+//   - draw a sample excluding one token (the correction / rejection dist).
+// ---------------------------------------------------------------------------
+
+struct FilteredDist {
+    std::vector<float> probs;  // probability for each candidate
+    std::vector<int>   ids;    // token id for each candidate
+};
+
+// Reusable workspace for build_filtered_dist to avoid repeated 248k allocations.
+struct SamplerWorkspace {
+    std::vector<std::pair<float,int>> cand;  // (logit, token_id) pairs
+    std::vector<float> probs;
+    void ensure(int vocab) {
+        if ((int)cand.size() < vocab) cand.resize(vocab);
+    }
+};
+
+static FilteredDist build_filtered_dist(const float * logits_in,
+                                        int vocab,
+                                        const SamplerCfg & cfg,
+                                        const std::vector<int32_t> & history,
+                                        SamplerWorkspace & ws) {
+    ws.ensure(vocab);
+
+    // Copy logits into workspace (we'll mutate for rep_pen)
+    for (int i = 0; i < vocab; i++) ws.cand[i] = {logits_in[i], i};
+
+    // 1. Repetition penalty — only touch tokens in the history window,
+    //    not the full vocab. O(rep_window) instead of O(vocab).
+    if (cfg.rep_pen > 1.0f && !history.empty()) {
+        const int win  = std::min((int)history.size(), cfg.rep_window);
+        const int from = (int)history.size() - win;
+        for (int i = from; i < (int)history.size(); i++) {
+            int t = history[i];
+            if (t >= 0 && t < vocab) {
+                auto & v = ws.cand[t].first;
+                v = (v > 0.0f) ? v / cfg.rep_pen : v * cfg.rep_pen;
+            }
+        }
+    }
+
+    // 2. Top-K: nth_element is O(n) vs partial_sort's O(n log k)
+    int n_keep = vocab;
+    if (cfg.top_k > 0 && cfg.top_k < vocab) {
+        std::nth_element(ws.cand.begin(), ws.cand.begin() + cfg.top_k,
+                         ws.cand.begin() + vocab,
+                         [](auto & a, auto & b){ return a.first > b.first; });
+        n_keep = cfg.top_k;
+        // Sort only the top-k for deterministic ordering
+        std::sort(ws.cand.begin(), ws.cand.begin() + n_keep,
+                  [](auto & a, auto & b){ return a.first > b.first; });
+    } else {
+        std::sort(ws.cand.begin(), ws.cand.begin() + vocab,
+                  [](auto & a, auto & b){ return a.first > b.first; });
+    }
+
+    // 3. Temperature softmax (only over the kept candidates)
+    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
+    float maxv = ws.cand[0].first * inv_t;
+    double Z   = 0.0;
+    ws.probs.resize(n_keep);
+    for (int i = 0; i < n_keep; i++) {
+        ws.probs[i] = std::exp(ws.cand[i].first * inv_t - maxv);
+        Z          += ws.probs[i];
+    }
+    for (int i = 0; i < n_keep; i++) ws.probs[i] = (float)(ws.probs[i] / Z);
+
+    // 4. Top-P (nucleus) truncation
+    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+        double cum = 0.0;
+        int cut = n_keep;
+        for (int i = 0; i < n_keep; i++) {
+            cum += ws.probs[i];
+            if (cum >= cfg.top_p) { cut = i + 1; break; }
+        }
+        n_keep = cut;
+        double zz = 0.0;
+        for (int i = 0; i < n_keep; i++) zz += ws.probs[i];
+        for (int i = 0; i < n_keep; i++) ws.probs[i] = (float)(ws.probs[i] / zz);
+    }
+
+    FilteredDist d;
+    d.probs.resize(n_keep);
+    d.ids.resize(n_keep);
+    for (int i = 0; i < n_keep; i++) {
+        d.probs[i] = ws.probs[i];
+        d.ids[i]   = ws.cand[i].second;
+    }
+    return d;
+}
+
+// Look up the probability of a specific token in the filtered distribution.
+// Returns 0 if the token was filtered out (not in the nucleus / top-k set).
+static float acceptance_prob(const FilteredDist & d, int token_id) {
+    for (size_t i = 0; i < d.ids.size(); i++) {
+        if (d.ids[i] == token_id) return d.probs[i];
+    }
+    return 0.0f;
+}
+
+// Draw a sample from the filtered distribution.
+static int sample_from(const FilteredDist & d, std::mt19937_64 & rng) {
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    double r   = u(rng);
+    double acc = 0.0;
+    for (size_t i = 0; i < d.probs.size(); i++) {
+        acc += d.probs[i];
+        if (r <= acc) return d.ids[i];
+    }
+    return d.ids.back();
+}
+
+// Draw a sample from the filtered distribution excluding one token.
+// Used for the correction distribution on rejection: p'(x) = p(x)/(1 - p(t*))
+// for x ≠ t*.
+static int sample_excluding(const FilteredDist & d, int exclude_token,
+                             std::mt19937_64 & rng) {
+    // Compute remaining mass
+    double remain = 0.0;
+    for (size_t i = 0; i < d.ids.size(); i++) {
+        if (d.ids[i] != exclude_token) remain += d.probs[i];
+    }
+    if (remain <= 0.0) {
+        // Fallback: all mass was on the excluded token. Pick uniformly from
+        // the remaining candidates (should be extremely rare).
+        for (size_t i = 0; i < d.ids.size(); i++) {
+            if (d.ids[i] != exclude_token) return d.ids[i];
+        }
+        return d.ids.back();
+    }
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    double r   = u(rng) * remain;
+    double acc = 0.0;
+    for (size_t i = 0; i < d.ids.size(); i++) {
+        if (d.ids[i] == exclude_token) continue;
+        acc += d.probs[i];
+        if (r <= acc) return d.ids[i];
+    }
+    // Fallback
+    for (int i = (int)d.ids.size() - 1; i >= 0; i--) {
+        if (d.ids[i] != exclude_token) return d.ids[i];
+    }
+    // All mass on excluded token — rejection should be impossible in this case.
+    // Return the excluded token as a last-resort safety fallback.
+    return exclude_token;
+}
+
 // ggml_flash_attn_ext expects kv_len aligned to KQ_MASK_PAD (32) on the
 // f16/Q* paths, and to FATTN_KQ_STRIDE (256) on the TurboQuant FA paths.
 // The global `g_kq_stride_pad` below is set at init time and applied by
@@ -524,6 +679,63 @@ static std::vector<int> follow_verified_tree(const DDTree & tree,
         current_index = it->second;
         accepted.push_back(current_index);
         next_token = posterior[current_index];
+    }
+    out_next_token = next_token;
+    if (out_node_idx) *out_node_idx = current_index;
+    return accepted;
+}
+
+// Stochastic tree walk for temperature > 0. Instead of following the target's
+// argmax at each node, we sample one token from the target's filtered
+// distribution and match it against the node's children. If it matches, we
+// descend; otherwise we stop and use the sampled token as the bonus.
+//
+// Uses lazy per-node logits readback to avoid fetching the full [vocab×N]
+// tensor — only visited nodes' logits are read.
+static std::vector<int> follow_verified_tree_stochastic(
+        const DDTree & tree,
+        ggml_tensor * logits_tensor,   // [vocab, N_actual] on GPU
+        int vocab,
+        const SamplerCfg & cfg,
+        const std::vector<int32_t> & base_history,
+        int last_tok,                  // root token (pending from previous iter)
+        std::mt19937_64 & rng,
+        SamplerWorkspace & ws,
+        int & out_next_token,
+        int * out_node_idx = nullptr) {
+    std::vector<int> accepted;
+    accepted.reserve(tree.n_nodes + 1);
+    accepted.push_back(0);  // always accept root
+
+    std::vector<float> node_logits(vocab);
+    std::vector<int32_t> walk_history = base_history;
+    walk_history.push_back(last_tok);
+
+    int current_index = 0;
+    // Read logits for root node, sample a token from the target distribution
+    ggml_backend_tensor_get(logits_tensor, node_logits.data(),
+                            (size_t)current_index * logits_tensor->nb[1],
+                            (size_t)vocab * sizeof(float));
+    FilteredDist dist = build_filtered_dist(node_logits.data(), vocab, cfg, walk_history, ws);
+    int next_token = sample_from(dist, rng);
+
+    while (true) {
+        const auto & children = tree.child_maps[current_index];
+        auto it = children.find(next_token);
+        if (it == children.end()) break;
+        current_index = it->second;
+        accepted.push_back(current_index);
+
+        // Add the accepted token to history for rep_pen
+        const int32_t accepted_tok = tree.token_ids[current_index - 1];
+        walk_history.push_back(accepted_tok);
+
+        // Read logits for this node, sample next
+        ggml_backend_tensor_get(logits_tensor, node_logits.data(),
+                                (size_t)current_index * logits_tensor->nb[1],
+                                (size_t)vocab * sizeof(float));
+        dist = build_filtered_dist(node_logits.data(), vocab, cfg, walk_history, ws);
+        next_token = sample_from(dist, rng);
     }
     out_next_token = next_token;
     if (out_node_idx) *out_node_idx = current_index;
@@ -3761,13 +3973,19 @@ int main(int argc, char ** argv) {
             // Walk tree: accepted DFS indices and next bonus token.
             int next_token = -1;
             int bonus_node_idx = 0;
-            std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token, &bonus_node_idx);
+            std::vector<int> accepted;
+            SamplerWorkspace tree_sampler_ws;
             if (g_sampler.temp > 0.0f) {
-                std::vector<float> bonus_logits(vocab);
-                ggml_backend_tensor_get(sg.logits, bonus_logits.data(),
-                                        (size_t)bonus_node_idx * sg.logits->nb[1],
-                                        (size_t)vocab * sizeof(float));
-                next_token = sample_logits(bonus_logits.data(), vocab, g_sampler, out_all, g_sampler_rng);
+                // Stochastic tree walk: sample from target distribution at each
+                // node, match against children. Bonus token is the last sampled
+                // token that didn't match any child.
+                accepted = follow_verified_tree_stochastic(
+                    tree, sg.logits, vocab, g_sampler,
+                    out_all, last_tok, g_sampler_rng, tree_sampler_ws,
+                    next_token, &bonus_node_idx);
+            } else {
+                // Greedy tree walk: follow target argmax at each node.
+                accepted = follow_verified_tree(tree, posterior.data(), next_token, &bonus_node_idx);
             }
             const int accept_depth = (int)accepted.size();  // includes root
 
@@ -4048,6 +4266,9 @@ int main(int argc, char ** argv) {
 
             ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
                                     sizeof(int32_t) * q_len);
+            // When temp > 0, logits are read lazily per-position in the accept
+            // loop below to avoid transferring the full [vocab × q_len] tensor
+            // (~15 MB). Only the positions actually visited are transferred.
         } else {
             // Sequential verify: q_len independent single-token decodes.
             // Each call writes K/V at slot committed+i and advances SSM by 1.
@@ -4086,7 +4307,7 @@ int main(int argc, char ** argv) {
 
         std::printf("[step %d] committed=%d last_tok=%d\n", n_draft_steps, committed, last_tok);
 
-        // 5) Greedy longest-prefix accept with standard spec-decoding comparison.
+        // 5) Accept with spec-decoding comparison.
         //
         //   - draft_tok[0] should equal last_tok (the correct first token from the
         //     previous forward). Accept it unconditionally.
@@ -4095,11 +4316,68 @@ int main(int argc, char ** argv) {
         //   - So the check is: draft_tok[i+1] == target_tok[i], for i=0..q_len-2.
         //   - First mismatch at i=k → accept draft_tok[0..k] (k+1 tokens),
         //     bonus = target_tok[k] (the correct replacement for draft_tok[k+1]).
+        //
+        // When temp > 0 we use one-hot rejection sampling: accept draft_tok[i+1]
+        // with probability p_target(draft_tok[i+1]; T, top_p). On rejection,
+        // sample the correction token from p_target excluding the rejected draft
+        // token. This is mathematically lossless — output follows the exact
+        // temperature-scaled target distribution. At temp=0 this reduces to the
+        // greedy path.
 
         int accept_n = 1;  // draft_tok[0] assumed = last_tok
-        for (int i = 0; i < q_len - 1; i++) {
-            if (draft_tok[i + 1] == target_tok[i]) accept_n++;
-            else break;
+        int sampled_bonus = -1;  // set by stochastic path on rejection or full accept
+        // Lazy logits buffer: only read positions as needed (1 position = ~1 MB
+        // vs bulk 15 MB). Tracks which position was last loaded so the
+        // fast-rollback re-sample path can reuse it without a redundant transfer.
+        int last_loaded_pos = -1;
+        SamplerWorkspace sampler_ws;  // reused across all build_filtered_dist calls
+        if (g_sampler.temp > 0.0f) {
+            // Stochastic acceptance: one-hot rejection sampling.
+            // Build extended history for repetition penalty.
+            // Note: draft_tok[0] == last_tok, so we don't push last_tok separately.
+            std::vector<int32_t> accept_history = out_all;
+            for (int i = 0; i < q_len - 1; i++) {
+                accept_history.push_back(draft_tok[i]);
+                // Lazy per-position logits readback from GPU
+                ggml_backend_tensor_get(sg.logits,
+                                        verify_logits_buf.data() + (size_t)i * vocab,
+                                        (size_t)i * sg.logits->nb[1],
+                                        (size_t)vocab * sizeof(float));
+                last_loaded_pos = i;
+                const float * pos_logits = verify_logits_buf.data() + (size_t)i * vocab;
+                FilteredDist dist = build_filtered_dist(pos_logits, vocab, g_sampler,
+                                                        accept_history, sampler_ws);
+                float p_accept = acceptance_prob(dist, draft_tok[i + 1]);
+                std::uniform_real_distribution<float> u(0.0f, 1.0f);
+                if (u(g_sampler_rng) < p_accept) {
+                    accept_n++;
+                } else {
+                    // Rejection: sample correction token excluding the draft token
+                    sampled_bonus = sample_excluding(dist, draft_tok[i + 1], g_sampler_rng);
+                    break;
+                }
+            }
+            if (sampled_bonus < 0) {
+                // All q_len-1 draft tokens accepted — sample bonus from last pos
+                std::vector<int32_t> full_history = accept_history;
+                full_history.push_back(draft_tok[q_len - 1]);
+                const int last_pos = q_len - 1;
+                ggml_backend_tensor_get(sg.logits,
+                                        verify_logits_buf.data() + (size_t)last_pos * vocab,
+                                        (size_t)last_pos * sg.logits->nb[1],
+                                        (size_t)vocab * sizeof(float));
+                last_loaded_pos = last_pos;
+                const float * last_logits = verify_logits_buf.data() + (size_t)last_pos * vocab;
+                FilteredDist dist = build_filtered_dist(last_logits, vocab, g_sampler,
+                                                        full_history, sampler_ws);
+                sampled_bonus = sample_from(dist, g_sampler_rng);
+            }
+        } else {
+            // Greedy acceptance: unchanged fast path.
+            for (int i = 0; i < q_len - 1; i++) {
+                if (draft_tok[i + 1] == target_tok[i]) accept_n++;
+                else break;
+            }
         }
         // Two commit strategies:
         //   - Legacy (replay path): commit_n = accept_n + 1, the extra is the
@@ -4116,7 +4394,9 @@ int main(int argc, char ** argv) {
             commit_n = accept_n;
         } else {
             if (accept_n < q_len) {
-                bonus_tok = target_tok[accept_n - 1];
+                bonus_tok = (g_sampler.temp > 0.0f && sampled_bonus >= 0)
+                    ? sampled_bonus
+                    : target_tok[accept_n - 1];
             }
             commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
         }
@@ -4225,10 +4505,38 @@ int main(int argc, char ** argv) {
 
             // Next last_tok: target's prediction at position committed+accept_n
             // given the accepted prefix.
-            //   - commit_n < q_len: verify_logits[accept_n-1] (target_tok[accept_n-1]).
-            //   - commit_n == q_len: verify_logits[q_len-1]  (target_tok[q_len-1]).
-            // Both already computed as `target_tok[commit_n-1]` during accept.
-            last_tok = target_tok[commit_n - 1];
+            //   - Greedy (temp=0): target_tok[commit_n-1] (argmax, same as before).
+            //   - Stochastic (temp>0): sampled_bonus holds the sampled next token
+            //     from one-hot rejection sampling (either the correction on
+            //     rejection, or a free sample if all accepted).
+            //   When commit_n was clipped below accept_n (budget limit), the
+            //   sampled_bonus was computed for a deeper prefix than what we
+            //   committed. Re-sample from the clipped commit point.
+            if (g_sampler.temp > 0.0f) {
+                if (commit_n == accept_n && sampled_bonus >= 0) {
+                    last_tok = sampled_bonus;
+                } else {
+                    // commit_n < accept_n (budget clipped) or no bonus was set.
+                    // Re-sample from verify logits at the clipped position.
+                    // Lazy-read if this position wasn't already loaded.
+                    const int rp = commit_n - 1;
+                    if (rp != last_loaded_pos) {
+                        ggml_backend_tensor_get(sg.logits,
+                                                verify_logits_buf.data() + (size_t)rp * vocab,
+                                                (size_t)rp * sg.logits->nb[1],
+                                                (size_t)vocab * sizeof(float));
+                    }
+                    std::vector<int32_t> hist = out_all;
+                    for (int i = 0; i < commit_n; i++) hist.push_back(draft_tok[i]);
+                    const float * lp = verify_logits_buf.data()
+                                       + (size_t)rp * vocab;
+                    FilteredDist d = build_filtered_dist(lp, vocab, g_sampler, hist,
+                                                         sampler_ws);
+                    last_tok = sample_from(d, g_sampler_rng);
+                }
+            } else {
+                last_tok = target_tok[commit_n - 1];
+            }
 
             auto T_rb1 = sync_us();
             t_rollback_us = std::chrono::duration<double, std::micro>(T_rb1 - T_rb0).count();
@@ -4298,7 +4606,17 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_get(sg.logits, last_logits.data(),
                                     sizeof(float) * vocab * (commit_n - 1),
                                     sizeof(float) * vocab);
-            last_tok = argmax_f32(last_logits.data(), vocab);
+            if (g_sampler.temp > 0.0f) {
+                // Build history including the replayed tokens for correct rep_pen
+                std::vector<int32_t> replay_history = out_all;
+                for (int i = 0; i < commit_n; i++) replay_history.push_back(replay_tok[i]);
+                FilteredDist dist = build_filtered_dist(last_logits.data(), vocab,
+                                                        g_sampler, replay_history,
+                                                        sampler_ws);
+                last_tok = sample_from(dist, g_sampler_rng);
+            } else {
+                last_tok = argmax_f32(last_logits.data(), vocab);
+            }
             auto T_replay_logits = sync_us();
             tt_replay_logits += std::chrono::duration<double, std::micro>(T_replay_logits - T_replay_compute).count();
 
