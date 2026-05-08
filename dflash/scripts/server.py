@@ -332,8 +332,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
         ``template_kwargs`` is passed through to ``apply_chat_template`` so callers
         can toggle template knobs like ``enable_thinking`` per-request.
+
+        Thinking is disabled by default (enable_thinking=False) because Qwen3.6's
+        think mode wrecks DFlash acceptance rates. Clients can opt in by sending
+        ``"chat_template_kwargs": {"enable_thinking": true}`` in the request.
         """
-        tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
+        tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True,
+                            "enable_thinking": False}
         tpl_kwargs.update(
             {k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS}
         )
@@ -370,6 +375,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             drafter_tokenizer=drafter_tokenizer,
             cfg=prefill_cfg,
             prompt_text=long_text,
+            skip_park=prefill_cfg.skip_park,
         )
 
         new_msgs = list(msgs)
@@ -888,6 +894,8 @@ def main():
         os.environ.setdefault("DFLASH27B_FA_WINDOW", "0")
         os.environ.setdefault("DFLASH_FP_USE_BSA", "1")
         os.environ.setdefault("DFLASH_FP_ALPHA",   "0.85")
+        if prefill_cfg.skip_park:
+            os.environ["DFLASH_COMPRESS_NO_PARK"] = "1"
 
     if not args.target.is_file():
         raise SystemExit(f"target GGUF not found at {args.target}")
