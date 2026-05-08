@@ -26,10 +26,10 @@ All speedups measured on **RTX 3090 24 GB** vs vendored llama.cpp (`-fa 1`, matc
 
 | Model | TTFT speedup | Decode speedup |
 |-------|:------------:|:--------------:|
-| Qwen 3.5-0.8B (megakernel) | — | **~2×** vs F16 |
-| Qwen 3.5-27B Q4_K_M (dflash + DDTree) | — | **3.43×** vs AR |
-| Qwen 3.6-27B Q4_K_M (dflash + PFlash) | **10.4×** @ 128K | **~2×** vs AR (draft in training) |
-| Laguna-XS.2 33B-A3B Q4_K_M (dflash + PFlash) | **5.4×** @ 128K | autoregressive (draft pending) |
+| Qwen 3.5-0.8B (Megakernel) | — | **~2×** vs F16 |
+| Qwen 3.5-27B Q4_K_M (DFlash + DDTree) | — | **3.43×** vs AR |
+| Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **10.4×** @ 128K | **~3×** vs AR (draft in training) |
+| Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K | autoregressive (draft pending) |
 
 ---
 
