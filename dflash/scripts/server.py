@@ -38,7 +38,7 @@ from transformers import AutoTokenizer
 
 from _prefill_hook import (
     PrefillConfig, add_cli_flags, config_from_args,
-    compress_text_via_daemon,
+    compress_text_via_daemon, _drain_until_sentinel,
 )
 from prefix_cache import DaemonStdoutBus, PrefixCache
 
@@ -446,7 +446,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
               prefill_cache_slots: int = 4,
-              arch: str = "qwen35") -> FastAPI:
+              arch: str = "qwen35",
+              lazy_draft: bool = False) -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server")
 
@@ -533,6 +534,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     async def _startup():
         bus.start(asyncio.get_running_loop())
         await prefix_cache.startup_sync()
+        if lazy_draft:
+            log.info("lazy-draft: parking decode draft at startup to free ~3.3 GB")
+            daemon_proc.stdin.write(b"park draft\n")
+            daemon_proc.stdin.flush()
+            _drain_until_sentinel(r_pipe)
 
     # FIX 4: /health endpoint — Open WebUI and many clients ping this before
     # sending requests. Without it they show a permanent "disconnected" badge.
@@ -737,8 +743,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     def _write_cmd(cmd_line: str):
         if daemon_proc.poll() is not None:
             raise RuntimeError("dflash daemon has exited unexpectedly")
+        if lazy_draft:
+            log.debug("lazy-draft: unpark draft before generate")
+            daemon_proc.stdin.write(b"unpark draft\n")
+            daemon_proc.stdin.flush()
+            _drain_until_sentinel(r_pipe)
         daemon_proc.stdin.write(cmd_line.encode("utf-8"))
         daemon_proc.stdin.flush()
+
+    def _park_draft_if_lazy():
+        """Park decode draft to free ~3.3 GB VRAM. Call after tokens consumed."""
+        if not lazy_draft:
+            return
+        log.debug("lazy-draft: park draft after generate")
+        daemon_proc.stdin.write(b"park draft\n")
+        daemon_proc.stdin.flush()
+        _drain_until_sentinel(r_pipe)
 
     def _build_cmd_line(req, cur_bin, cur_ids, gen_len, prefix_cache,
                         prompt_ids, full_snap_prep_ref: list,
@@ -962,6 +982,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             if full_hit is None:
                                 try: cur_bin.unlink()
                                 except Exception: pass
+                            _park_draft_if_lazy()
                             return
 
                         # Flush remaining
@@ -1006,6 +1027,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
                     elif snap_prep:
                         prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+                    _park_draft_if_lazy()
 
                     yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                     if include_usage:
@@ -1079,6 +1101,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
             elif snap_prep:
                 prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+            _park_draft_if_lazy()
 
         if full_hit is None:
             try: cur_bin.unlink()
@@ -1267,6 +1290,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
                     elif snap_prep:
                         prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+                    _park_draft_if_lazy()
 
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
                     msg_delta = {
@@ -1332,6 +1356,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
             elif snap_prep:
                 prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+            _park_draft_if_lazy()
 
         if full_hit is None:
             try: cur_bin.unlink()
@@ -1574,6 +1599,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
             elif snap_prep:
                 prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+            _park_draft_if_lazy()
 
         if full_hit is None:
             try: cur_bin.unlink()
@@ -1801,6 +1827,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
                 elif snap_prep:
                     prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+                _park_draft_if_lazy()
 
                 # Build final output items
                 final_output: list[dict] = []
@@ -1924,6 +1951,9 @@ def main():
     ap.add_argument("--fa-window", type=int, default=None,
                     help="Sliding window for FA layers. 0 = full attention.")
     ap.add_argument("--tokenizer", type=str, default=None)
+    ap.add_argument("--lazy-draft", action="store_true",
+                    help="Park decode draft (~3.3 GB) when idle; unpark/park "
+                         "around each generate to free VRAM for longer context.")
     ap.add_argument("--prefix-cache-slots", type=int, default=4)
     ap.add_argument("--prefill-cache-slots", type=int, default=4)
     ap.add_argument("--daemon", action="store_true")
@@ -1992,7 +2022,8 @@ def main():
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
                     prefill_cache_slots=args.prefill_cache_slots,
-                    arch=arch)
+                    arch=arch,
+                    lazy_draft=args.lazy_draft)
 
     import uvicorn
     logging.basicConfig(
@@ -2008,6 +2039,8 @@ def main():
     print(f"  budget    = {args.budget}")
     print(f"  max_ctx   = {args.max_ctx}")
     print(f"  tokenizer = {tokenizer_id}")
+    if args.lazy_draft:
+        print("  lazy_draft= ON (decode draft parked when idle)")
     if prefill_cfg.enabled:
         print(f"  pflash    = {prefill_cfg.mode} · threshold={prefill_cfg.threshold} "
               f"keep={prefill_cfg.keep_ratio} drafter={prefill_cfg.drafter_gguf}")
