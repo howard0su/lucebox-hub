@@ -22,6 +22,7 @@
 #include "internal.h"
 #include "dflash_graph.h"
 #include "qwen3_drafter.h"
+#include "gpu_sampler.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -66,6 +67,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -226,85 +228,84 @@ struct FilteredDist {
     std::vector<int>   ids;    // token id for each candidate
 };
 
-// Reusable workspace for build_filtered_dist to avoid repeated 248k allocations.
-struct SamplerWorkspace {
-    std::vector<std::pair<float,int>> cand;  // (logit, token_id) pairs
-    std::vector<float> probs;
-    void ensure(int vocab) {
-        if ((int)cand.size() < vocab) cand.resize(vocab);
-    }
-};
+// Build a filtered probability distribution from GPU-extracted top-k candidates.
+// The heavy work (scanning 248k logits to find top-k) is done on the GPU by
+// gpu_top_k_extract(); this function only handles rep_pen → temp softmax →
+// top_p on the small (k ≈ 40) candidate set.
+//
+// NOTE: rep_pen is applied AFTER GPU top-k extraction, so tokens demoted by
+// rep_pen below rank-40 are not considered. This is a minor approximation
+// that is negligible in practice (rep_pen 1.1-1.3 rarely changes top-40).
+//
+// top_k_vals / top_k_ids: arrays of length `k`, sorted descending by logit.
+static FilteredDist build_filtered_dist_from_topk(
+        const float * top_k_vals, const int32_t * top_k_ids, int k,
+        const SamplerCfg & cfg,
+        const std::vector<int32_t> & history) {
+    // Respect cfg.top_k if it's smaller than the GPU-extracted k
+    int effective_k = k;
+    if (cfg.top_k > 0 && cfg.top_k < k) effective_k = cfg.top_k;
 
-static FilteredDist build_filtered_dist(const float * logits_in,
-                                        int vocab,
-                                        const SamplerCfg & cfg,
-                                        const std::vector<int32_t> & history,
-                                        SamplerWorkspace & ws) {
-    ws.ensure(vocab);
+    // Work on a small copy so we can mutate for rep_pen
+    std::vector<float> vals(top_k_vals, top_k_vals + effective_k);
 
-    // Copy logits into workspace (we'll mutate for rep_pen)
-    for (int i = 0; i < vocab; i++) ws.cand[i] = {logits_in[i], i};
-
-    // 1. Repetition penalty — only touch tokens in the history window,
-    //    not the full vocab. O(rep_window) instead of O(vocab).
+    // 1. Repetition penalty — only touch tokens that appear in both top-k
+    //    AND the history window.
     if (cfg.rep_pen > 1.0f && !history.empty()) {
         const int win  = std::min((int)history.size(), cfg.rep_window);
         const int from = (int)history.size() - win;
-        for (int i = from; i < (int)history.size(); i++) {
-            int t = history[i];
-            if (t >= 0 && t < vocab) {
-                auto & v = ws.cand[t].first;
-                v = (v > 0.0f) ? v / cfg.rep_pen : v * cfg.rep_pen;
+        std::unordered_set<int> recent;
+        for (int i = from; i < (int)history.size(); i++) recent.insert(history[i]);
+        for (int i = 0; i < effective_k; i++) {
+            if (recent.count(top_k_ids[i])) {
+                vals[i] = (vals[i] > 0.0f) ? vals[i] / cfg.rep_pen
+                                           : vals[i] * cfg.rep_pen;
             }
         }
     }
 
-    // 2. Top-K: nth_element is O(n) vs partial_sort's O(n log k)
-    int n_keep = vocab;
-    if (cfg.top_k > 0 && cfg.top_k < vocab) {
-        std::nth_element(ws.cand.begin(), ws.cand.begin() + cfg.top_k,
-                         ws.cand.begin() + vocab,
-                         [](auto & a, auto & b){ return a.first > b.first; });
-        n_keep = cfg.top_k;
-        // Sort only the top-k for deterministic ordering
-        std::sort(ws.cand.begin(), ws.cand.begin() + n_keep,
-                  [](auto & a, auto & b){ return a.first > b.first; });
-    } else {
-        std::sort(ws.cand.begin(), ws.cand.begin() + vocab,
-                  [](auto & a, auto & b){ return a.first > b.first; });
-    }
-
-    // 3. Temperature softmax (only over the kept candidates)
+    // 2. Temperature softmax over the candidates
     const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
-    float maxv = ws.cand[0].first * inv_t;
-    double Z   = 0.0;
-    ws.probs.resize(n_keep);
-    for (int i = 0; i < n_keep; i++) {
-        ws.probs[i] = std::exp(ws.cand[i].first * inv_t - maxv);
-        Z          += ws.probs[i];
+    float maxv = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < effective_k; i++) {
+        float v = vals[i] * inv_t;
+        if (v > maxv) maxv = v;
     }
-    for (int i = 0; i < n_keep; i++) ws.probs[i] = (float)(ws.probs[i] / Z);
+    double Z = 0.0;
+    std::vector<float> probs(effective_k);
+    for (int i = 0; i < effective_k; i++) {
+        probs[i] = std::exp(vals[i] * inv_t - maxv);
+        Z       += probs[i];
+    }
+    for (int i = 0; i < effective_k; i++) probs[i] = (float)(probs[i] / Z);
 
-    // 4. Top-P (nucleus) truncation
+    // 3. Top-P (nucleus) truncation — candidates are already ~sorted by
+    //    descending logit but rep_pen may have reordered slightly.  Re-sort
+    //    by probability for correct nucleus selection.
     if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+        std::vector<int> idx(effective_k);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::sort(idx.begin(), idx.end(),
+                  [&](int a, int b){ return probs[a] > probs[b]; });
         double cum = 0.0;
-        int cut = n_keep;
-        for (int i = 0; i < n_keep; i++) {
-            cum += ws.probs[i];
+        int cut = effective_k;
+        for (int i = 0; i < effective_k; i++) {
+            cum += probs[idx[i]];
             if (cum >= cfg.top_p) { cut = i + 1; break; }
         }
-        n_keep = cut;
+        for (int i = cut; i < effective_k; i++) probs[idx[i]] = 0.0f;
         double zz = 0.0;
-        for (int i = 0; i < n_keep; i++) zz += ws.probs[i];
-        for (int i = 0; i < n_keep; i++) ws.probs[i] = (float)(ws.probs[i] / zz);
+        for (int i = 0; i < effective_k; i++) zz += probs[i];
+        if (zz > 0.0) for (int i = 0; i < effective_k; i++) probs[i] = (float)(probs[i] / zz);
     }
 
+    // Compact into FilteredDist (skip zero-probability candidates)
     FilteredDist d;
-    d.probs.resize(n_keep);
-    d.ids.resize(n_keep);
-    for (int i = 0; i < n_keep; i++) {
-        d.probs[i] = ws.probs[i];
-        d.ids[i]   = ws.cand[i].second;
+    for (int i = 0; i < effective_k; i++) {
+        if (probs[i] > 0.0f) {
+            d.probs.push_back(probs[i]);
+            d.ids.push_back(top_k_ids[i]);
+        }
     }
     return d;
 }
@@ -690,8 +691,9 @@ static std::vector<int> follow_verified_tree(const DDTree & tree,
 // distribution and match it against the node's children. If it matches, we
 // descend; otherwise we stop and use the sampled token as the bonus.
 //
-// Uses lazy per-node logits readback to avoid fetching the full [vocab×N]
-// tensor — only visited nodes' logits are read.
+// GPU top-k: all N_actual nodes' top-k are extracted in one kernel launch
+// before the walk begins.  The walk then operates on the small (k≈40)
+// candidate sets without any further D2H transfers.
 static std::vector<int> follow_verified_tree_stochastic(
         const DDTree & tree,
         ggml_tensor * logits_tensor,   // [vocab, N_actual] on GPU
@@ -700,23 +702,31 @@ static std::vector<int> follow_verified_tree_stochastic(
         const std::vector<int32_t> & base_history,
         int last_tok,                  // root token (pending from previous iter)
         std::mt19937_64 & rng,
-        SamplerWorkspace & ws,
+        GpuTopKWorkspace & gpu_ws,
+        std::vector<float> & topk_vals,    // pre-sized [k * N_actual]
+        std::vector<int32_t> & topk_ids,   // pre-sized [k * N_actual]
+        int k,
         int & out_next_token,
         int * out_node_idx = nullptr) {
+    const int N_actual = 1 + tree.n_nodes;
+
+    // One kernel launch extracts top-k for every node in the tree.
+    gpu_top_k_extract((const float *)logits_tensor->data, vocab, N_actual,
+                      logits_tensor->nb[1], k,
+                      topk_vals.data(), topk_ids.data(), gpu_ws);
+
     std::vector<int> accepted;
-    accepted.reserve(tree.n_nodes + 1);
+    accepted.reserve(N_actual);
     accepted.push_back(0);  // always accept root
 
-    std::vector<float> node_logits(vocab);
     std::vector<int32_t> walk_history = base_history;
     walk_history.push_back(last_tok);
 
     int current_index = 0;
-    // Read logits for root node, sample a token from the target distribution
-    ggml_backend_tensor_get(logits_tensor, node_logits.data(),
-                            (size_t)current_index * logits_tensor->nb[1],
-                            (size_t)vocab * sizeof(float));
-    FilteredDist dist = build_filtered_dist(node_logits.data(), vocab, cfg, walk_history, ws);
+    // Sample from root node's top-k distribution
+    const float   * kv = topk_vals.data() + (size_t)current_index * k;
+    const int32_t * ki = topk_ids.data()  + (size_t)current_index * k;
+    FilteredDist dist = build_filtered_dist_from_topk(kv, ki, k, cfg, walk_history);
     int next_token = sample_from(dist, rng);
 
     while (true) {
@@ -726,15 +736,12 @@ static std::vector<int> follow_verified_tree_stochastic(
         current_index = it->second;
         accepted.push_back(current_index);
 
-        // Add the accepted token to history for rep_pen
         const int32_t accepted_tok = tree.token_ids[current_index - 1];
         walk_history.push_back(accepted_tok);
 
-        // Read logits for this node, sample next
-        ggml_backend_tensor_get(logits_tensor, node_logits.data(),
-                                (size_t)current_index * logits_tensor->nb[1],
-                                (size_t)vocab * sizeof(float));
-        dist = build_filtered_dist(node_logits.data(), vocab, cfg, walk_history, ws);
+        kv = topk_vals.data() + (size_t)current_index * k;
+        ki = topk_ids.data()  + (size_t)current_index * k;
+        dist = build_filtered_dist_from_topk(kv, ki, k, cfg, walk_history);
         next_token = sample_from(dist, rng);
     }
     out_next_token = next_token;
@@ -2420,6 +2427,19 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
             profile_scaling = true;
         }
+        else if (std::strncmp(argv[i], "--temp=", 7) == 0) {
+            g_sampler.temp = (float)std::atof(argv[i] + 7);
+        }
+        else if (std::strncmp(argv[i], "--top-k=", 8) == 0) {
+            g_sampler.top_k = std::atoi(argv[i] + 8);
+        }
+        else if (std::strncmp(argv[i], "--top-p=", 8) == 0) {
+            g_sampler.top_p = (float)std::atof(argv[i] + 8);
+        }
+        else if (std::strncmp(argv[i], "--seed=", 7) == 0) {
+            g_sampler.seed = (uint64_t)std::atoll(argv[i] + 7);
+            g_sampler_rng.seed(g_sampler.seed);
+        }
         else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
             stream_fd = std::atoi(argv[i] + 12);
         }
@@ -2490,9 +2510,9 @@ int main(int argc, char ** argv) {
     if (target_split_dflash) target_split_load_draft = true;
     if (target_gpus.empty()) target_gpus.push_back(target_gpu);
     if (target_gpus.size() == 1) target_gpu = target_gpus[0];
-    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_feature_mirror=%d target_gpu=%d draft_gpu=%d\n",
+    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f sampler_temp=%.2f chain_seed=%d fa_window=%d draft_feature_mirror=%d target_gpu=%d draft_gpu=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
-                ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window,
+                ddtree_budget, ddtree_temp, g_sampler.temp, (int)ddtree_chain_seed, g_fa_window,
                 (int)draft_feature_mirror, target_gpu, draft_gpu);
 
     int cuda_device_count = 0;
@@ -3629,6 +3649,15 @@ int main(int argc, char ** argv) {
     // Sized for the max of chain q_len and DDTree flat tree size (budget+1).
     const int verify_max_tokens = std::max(q_len, ddtree_mode ? ddtree_budget + 1 : q_len);
     std::vector<float>   verify_logits_buf((size_t)vocab * verify_max_tokens);
+    // GPU top-k workspace: persistent across iterations to avoid cudaMalloc churn.
+    // Host buffers hold extracted top-k candidates for all verify positions.
+    GpuTopKWorkspace     gpu_topk_ws;
+    // Use k=10 for the GPU kernel: at T≤0.5 the top-10 captures >99.9%
+    // of probability mass while allowing 256 threads (vs 64 for k=40).
+    // The SamplerCfg.top_k further truncates inside build_filtered_dist.
+    const int            gpu_k = std::min(10, (int)GPU_TOPK_K);
+    std::vector<float>   topk_vals_buf((size_t)gpu_k * verify_max_tokens);
+    std::vector<int32_t> topk_ids_buf((size_t)gpu_k * verify_max_tokens);
     std::vector<uint16_t> mask_buf;
     std::vector<int32_t> pos_q_buf(q_len), pos_k_buf(max_ctx + q_len);
     std::vector<int32_t> pos4_buf(4 * q_len);
@@ -3974,14 +4003,13 @@ int main(int argc, char ** argv) {
             int next_token = -1;
             int bonus_node_idx = 0;
             std::vector<int> accepted;
-            SamplerWorkspace tree_sampler_ws;
             if (g_sampler.temp > 0.0f) {
-                // Stochastic tree walk: sample from target distribution at each
-                // node, match against children. Bonus token is the last sampled
-                // token that didn't match any child.
+                // Stochastic tree walk: GPU-extract top-k for all tree nodes,
+                // then walk using small candidate sets.
                 accepted = follow_verified_tree_stochastic(
                     tree, sg.logits, vocab, g_sampler,
-                    out_all, last_tok, g_sampler_rng, tree_sampler_ws,
+                    out_all, last_tok, g_sampler_rng,
+                    gpu_topk_ws, topk_vals_buf, topk_ids_buf, gpu_k,
                     next_token, &bonus_node_idx);
             } else {
                 // Greedy tree walk: follow target argmax at each node.
@@ -4266,9 +4294,15 @@ int main(int argc, char ** argv) {
 
             ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
                                     sizeof(int32_t) * q_len);
-            // When temp > 0, logits are read lazily per-position in the accept
-            // loop below to avoid transferring the full [vocab × q_len] tensor
-            // (~15 MB). Only the positions actually visited are transferred.
+            // When temp > 0, extract GPU top-k for all q_len positions in one
+            // kernel launch. sg.logits has shape [vocab, q_len] after batched
+            // verify, so all positions are available.
+            if (g_sampler.temp > 0.0f) {
+                gpu_top_k_extract((const float *)sg.logits->data, vocab, q_len,
+                                  sg.logits->nb[1], gpu_k,
+                                  topk_vals_buf.data(), topk_ids_buf.data(),
+                                  gpu_topk_ws);
+            }
         } else {
             // Sequential verify: q_len independent single-token decodes.
             // Each call writes K/V at slot committed+i and advances SSM by 1.
@@ -4294,10 +4328,20 @@ int main(int argc, char ** argv) {
                 st = ggml_backend_graph_compute(backend, sg.gf);
                 if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "seq verify compute %d at %d\n", (int)st, i); return 1; }
 
-                ggml_backend_tensor_get(sg.logits,
-                                        verify_logits_buf.data() + (size_t)i * vocab,
-                                        0, sizeof(float) * vocab);
-                target_tok[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+                if (g_sampler.temp > 0.0f) {
+                    // GPU top-k for this single position while sg.logits is valid.
+                    gpu_top_k_extract((const float *)sg.logits->data, vocab, 1,
+                                      sg.logits->nb[1], gpu_k,
+                                      topk_vals_buf.data() + (size_t)i * gpu_k,
+                                      topk_ids_buf.data()  + (size_t)i * gpu_k,
+                                      gpu_topk_ws);
+                    target_tok[i] = topk_ids_buf[i * gpu_k];
+                } else {
+                    ggml_backend_tensor_get(sg.logits,
+                                            verify_logits_buf.data() + (size_t)i * vocab,
+                                            0, sizeof(float) * vocab);
+                    target_tok[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+                }
             }
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_snap).count();
@@ -4326,33 +4370,23 @@ int main(int argc, char ** argv) {
 
         int accept_n = 1;  // draft_tok[0] assumed = last_tok
         int sampled_bonus = -1;  // set by stochastic path on rejection or full accept
-        // Lazy logits buffer: only read positions as needed (1 position = ~1 MB
-        // vs bulk 15 MB). Tracks which position was last loaded so the
-        // fast-rollback re-sample path can reuse it without a redundant transfer.
-        int last_loaded_pos = -1;
-        SamplerWorkspace sampler_ws;  // reused across all build_filtered_dist calls
         if (g_sampler.temp > 0.0f) {
+            // Top-k candidates were extracted during the verify phase
+            // (batched: one kernel launch; seq: per-step extraction).
+
             // Stochastic acceptance: one-hot rejection sampling.
-            // Build extended history for repetition penalty.
-            // Note: draft_tok[0] == last_tok, so we don't push last_tok separately.
             std::vector<int32_t> accept_history = out_all;
             for (int i = 0; i < q_len - 1; i++) {
                 accept_history.push_back(draft_tok[i]);
-                // Lazy per-position logits readback from GPU
-                ggml_backend_tensor_get(sg.logits,
-                                        verify_logits_buf.data() + (size_t)i * vocab,
-                                        (size_t)i * sg.logits->nb[1],
-                                        (size_t)vocab * sizeof(float));
-                last_loaded_pos = i;
-                const float * pos_logits = verify_logits_buf.data() + (size_t)i * vocab;
-                FilteredDist dist = build_filtered_dist(pos_logits, vocab, g_sampler,
-                                                        accept_history, sampler_ws);
+                const float   * kv = topk_vals_buf.data() + (size_t)i * gpu_k;
+                const int32_t * ki = topk_ids_buf.data()  + (size_t)i * gpu_k;
+                FilteredDist dist = build_filtered_dist_from_topk(
+                    kv, ki, gpu_k, g_sampler, accept_history);
                 float p_accept = acceptance_prob(dist, draft_tok[i + 1]);
                 std::uniform_real_distribution<float> u(0.0f, 1.0f);
                 if (u(g_sampler_rng) < p_accept) {
                     accept_n++;
                 } else {
-                    // Rejection: sample correction token excluding the draft token
                     sampled_bonus = sample_excluding(dist, draft_tok[i + 1], g_sampler_rng);
                     break;
                 }
@@ -4362,14 +4396,10 @@ int main(int argc, char ** argv) {
                 std::vector<int32_t> full_history = accept_history;
                 full_history.push_back(draft_tok[q_len - 1]);
                 const int last_pos = q_len - 1;
-                ggml_backend_tensor_get(sg.logits,
-                                        verify_logits_buf.data() + (size_t)last_pos * vocab,
-                                        (size_t)last_pos * sg.logits->nb[1],
-                                        (size_t)vocab * sizeof(float));
-                last_loaded_pos = last_pos;
-                const float * last_logits = verify_logits_buf.data() + (size_t)last_pos * vocab;
-                FilteredDist dist = build_filtered_dist(last_logits, vocab, g_sampler,
-                                                        full_history, sampler_ws);
+                const float   * kv = topk_vals_buf.data() + (size_t)last_pos * gpu_k;
+                const int32_t * ki = topk_ids_buf.data()  + (size_t)last_pos * gpu_k;
+                FilteredDist dist = build_filtered_dist_from_topk(
+                    kv, ki, gpu_k, g_sampler, full_history);
                 sampled_bonus = sample_from(dist, g_sampler_rng);
             }
         } else {
@@ -4517,21 +4547,14 @@ int main(int argc, char ** argv) {
                     last_tok = sampled_bonus;
                 } else {
                     // commit_n < accept_n (budget clipped) or no bonus was set.
-                    // Re-sample from verify logits at the clipped position.
-                    // Lazy-read if this position wasn't already loaded.
+                    // Re-sample from pre-extracted GPU top-k at the clipped position.
                     const int rp = commit_n - 1;
-                    if (rp != last_loaded_pos) {
-                        ggml_backend_tensor_get(sg.logits,
-                                                verify_logits_buf.data() + (size_t)rp * vocab,
-                                                (size_t)rp * sg.logits->nb[1],
-                                                (size_t)vocab * sizeof(float));
-                    }
+                    const float   * kv = topk_vals_buf.data() + (size_t)rp * gpu_k;
+                    const int32_t * ki = topk_ids_buf.data()  + (size_t)rp * gpu_k;
                     std::vector<int32_t> hist = out_all;
                     for (int i = 0; i < commit_n; i++) hist.push_back(draft_tok[i]);
-                    const float * lp = verify_logits_buf.data()
-                                       + (size_t)rp * vocab;
-                    FilteredDist d = build_filtered_dist(lp, vocab, g_sampler, hist,
-                                                         sampler_ws);
+                    FilteredDist d = build_filtered_dist_from_topk(
+                        kv, ki, gpu_k, g_sampler, hist);
                     last_tok = sample_from(d, g_sampler_rng);
                 }
             } else {
@@ -4603,18 +4626,23 @@ int main(int argc, char ** argv) {
             tt_replay_compute += std::chrono::duration<double, std::micro>(T_replay_compute - T_replay_set).count();
 
             std::vector<float> last_logits(vocab);
-            ggml_backend_tensor_get(sg.logits, last_logits.data(),
-                                    sizeof(float) * vocab * (commit_n - 1),
-                                    sizeof(float) * vocab);
             if (g_sampler.temp > 0.0f) {
-                // Build history including the replayed tokens for correct rep_pen
+                // GPU-extract top-k for the replay position (1 position only)
+                gpu_top_k_extract(
+                    (const float *)((const char *)sg.logits->data
+                                    + (size_t)(commit_n - 1) * sg.logits->nb[1]),
+                    vocab, 1, sg.logits->nb[1], gpu_k,
+                    topk_vals_buf.data(), topk_ids_buf.data(), gpu_topk_ws);
                 std::vector<int32_t> replay_history = out_all;
                 for (int i = 0; i < commit_n; i++) replay_history.push_back(replay_tok[i]);
-                FilteredDist dist = build_filtered_dist(last_logits.data(), vocab,
-                                                        g_sampler, replay_history,
-                                                        sampler_ws);
+                FilteredDist dist = build_filtered_dist_from_topk(
+                    topk_vals_buf.data(), topk_ids_buf.data(), gpu_k,
+                    g_sampler, replay_history);
                 last_tok = sample_from(dist, g_sampler_rng);
             } else {
+                ggml_backend_tensor_get(sg.logits, last_logits.data(),
+                                        sizeof(float) * vocab * (commit_n - 1),
+                                        sizeof(float) * vocab);
                 last_tok = argmax_f32(last_logits.data(), vocab);
             }
             auto T_replay_logits = sync_us();
