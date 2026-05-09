@@ -24,7 +24,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware          # FIX 1: add CORS
@@ -134,13 +134,55 @@ def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
     return default
 
 
+# ─── tool-call & reasoning parsers ─────────────────────────────────
+# Ported from server_tools.py which ports from vLLM (Apache-2.0):
+#   vllm/reasoning/qwen3_reasoning_parser.py
+#   vllm/tool_parsers/qwen3coder_tool_parser.py
+
+TOOL_CALL_COMPLETE_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+TOOL_CALL_FUNCTION_RE = re.compile(
+    r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL,
+)
+TOOL_CALL_PARAMETER_RE = re.compile(
+    r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+    re.DOTALL,
+)
+TOOL_OPEN_TAG = "<tool_call>"
+THINK_OPEN_TAG = "<think>"
+THINK_CLOSE_TAG = "</think>"
+
+
+def normalize_stop(stop) -> list[str]:
+    """Coerce OpenAI's stop field (str | list[str] | None) to list[str]."""
+    if not stop:
+        return []
+    if isinstance(stop, str):
+        return [stop]
+    return [s for s in stop if isinstance(s, str) and s]
+
+
+def first_stop_match(text: str, stops: list[str]) -> int:
+    """Return the earliest index where any stop sequence appears, or -1."""
+    best = -1
+    for s in stops:
+        i = text.find(s)
+        if i != -1 and (best == -1 or i < best):
+            best = i
+    return best
+
+
 def parse_reasoning(
     text: str,
     thinking_enabled: bool = True,
     started_in_thinking: bool = False,
 ) -> tuple[str, str | None]:
-    # Qwen chat templates can prefill `<think>\n` into the prompt, so the
-    # generated output contains only the reasoning body plus `</think>`.
+    """Extract reasoning content from Qwen3.x's <think>...</think> blocks.
+
+    Handles paired, headless, and disabled thinking flavors.
+    ``started_in_thinking`` accounts for prompts that end with ``<think>\n``
+    so the generated text contains only the reasoning body + ``</think>``.
+    Returns (cleaned_content, reasoning_content).
+    """
     parts = text.partition(THINK_OPEN_TAG)
     saw_open_tag = bool(parts[1])
     rest = parts[2] if saw_open_tag else parts[0]
@@ -152,60 +194,105 @@ def parse_reasoning(
     return content.strip(), (reasoning.strip() or None)
 
 
-def prompt_starts_in_thinking(prompt: str) -> bool:
-    return bool(re.search(r"<think>\s*$", prompt))
+def _find_tool_properties(tools, function_name):
+    """Returns the parameters dict for a given function name, or {}."""
+    for t in tools or []:
+        fn = t.function if hasattr(t, "function") else t.get("function", {})
+        if hasattr(fn, "model_dump"):
+            fn = fn.model_dump()
+        if fn.get("name") == function_name:
+            params = fn.get("parameters", {})
+            if isinstance(params, dict):
+                return params.get("properties", {})
+    return {}
 
 
-def consume_stream_piece(window: str, mode: str, piece: str):
-    outputs = []
-    holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG))
-    window += piece
-    while True:
-        if mode == "reasoning":
-            idx = window.find(THINK_CLOSE_TAG)
-            if idx != -1:
-                pre = window[:idx]
-                if pre:
-                    outputs.append(("reasoning_content", pre))
-                window = window[idx + len(THINK_CLOSE_TAG):]
-                mode = "content"
-                continue
-            if len(window) > holdback:
-                safe = window[:-holdback]
-                if safe:
-                    outputs.append(("reasoning_content", safe))
-                window = window[-holdback:]
-            break
+def _convert_param_value(param_value: str, param_name: str, param_config: dict,
+                         func_name: str):
+    """Coerce stringified XML values to their JSON-schema type."""
+    import ast
+    if param_value.lower() == "null":
+        return None
+    if param_name not in param_config:
+        return param_value
+    cfg = param_config[param_name]
+    if isinstance(cfg, dict) and "type" in cfg:
+        ptype = str(cfg["type"]).strip().lower()
+    elif isinstance(cfg, dict) and "anyOf" in cfg:
+        ptype = "object"
+    else:
+        ptype = "string"
+    if ptype in ("string", "str", "text", "varchar", "char", "enum"):
+        return param_value
+    if any(ptype.startswith(p) for p in ("int", "uint", "long", "short", "unsigned")):
+        try: return int(param_value)
+        except (ValueError, TypeError): return param_value
+    if ptype.startswith("num") or ptype.startswith("float"):
+        try:
+            f = float(param_value)
+            return f if f - int(f) != 0 else int(f)
+        except (ValueError, TypeError):
+            return param_value
+    if ptype in ("boolean", "bool", "binary"):
+        return param_value.lower() == "true"
+    if (ptype in ("object", "array", "arr")
+            or ptype.startswith("dict") or ptype.startswith("list")):
+        try: return json.loads(param_value)
+        except (json.JSONDecodeError, TypeError, ValueError): pass
+    try: return ast.literal_eval(param_value)
+    except (ValueError, SyntaxError, TypeError): return param_value
 
-        idx = window.find(THINK_OPEN_TAG)
-        if idx != -1:
-            pre = window[:idx]
-            if pre:
-                outputs.append(("content", pre))
-            window = window[idx + len(THINK_OPEN_TAG):]
-            mode = "reasoning"
+
+def parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
+    """Parse Qwen3.x <tool_call> XML blocks into OpenAI tool_calls format.
+
+    Returns (cleaned_content, tool_calls_list).
+    """
+    tool_calls: list[dict] = []
+    cleaned_parts: list[str] = []
+    cursor = 0
+    for m in TOOL_CALL_COMPLETE_RE.finditer(text):
+        cleaned_parts.append(text[cursor:m.start()])
+        cursor = m.end()
+        body = m.group(1)
+        fn_match = TOOL_CALL_FUNCTION_RE.search(body)
+        if not fn_match:
             continue
-        if len(window) > holdback:
-            safe = window[:-holdback]
-            if safe:
-                outputs.append(("content", safe))
-            window = window[-holdback:]
-        break
-
-    return outputs, window, mode
-
-
-def flush_stream_deltas(window: str, mode: str):
-    if not window:
-        return []
-    kind = "reasoning_content" if mode == "reasoning" else "content"
-    return [(kind, window)]
+        fn_text = fn_match.group(1) or fn_match.group(2) or ""
+        end_idx = fn_text.find(">")
+        if end_idx == -1:
+            continue
+        function_name = fn_text[:end_idx].strip()
+        params_region = fn_text[end_idx + 1:]
+        param_config = _find_tool_properties(tools, function_name)
+        args: dict = {}
+        for match_text in TOOL_CALL_PARAMETER_RE.findall(params_region):
+            eq_idx = match_text.find(">")
+            if eq_idx == -1:
+                continue
+            k = match_text[:eq_idx].strip()
+            v = match_text[eq_idx + 1:]
+            if v.startswith("\n"): v = v[1:]
+            if v.endswith("\n"): v = v[:-1]
+            args[k] = _convert_param_value(v, k, param_config, function_name)
+        tool_calls.append({
+            "id": "call_" + uuid.uuid4().hex[:24],
+            "type": "function",
+            "function": {
+                "name": function_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        })
+    cleaned_parts.append(text[cursor:])
+    return "".join(cleaned_parts).strip(), tool_calls
 
 
 # FIX 2: _content_to_str helper used for BOTH OpenAI and Anthropic message
 # content fields (str | list[dict]). Previously OpenAI list[dict] content
 # was passed raw to the tokenizer and caused a crash.
-def _content_to_str(content: "str | list[dict]") -> str:
+def _content_to_str(content: "str | list[dict] | None") -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     parts = []
@@ -215,10 +302,31 @@ def _content_to_str(content: "str | list[dict]") -> str:
     return "".join(parts)
 
 
+# ─── pydantic schemas ──────────────────────────────────────────────
+
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str  # JSON string per OpenAI spec
+
+
+class ToolCall(BaseModel):
+    id: str | None = None
+    type: str = "function"
+    function: ToolCallFunction
+
+
 class ChatMessage(BaseModel):
     role: str
     # FIX 2 cont: accept list[dict] in the model but always stringify it
-    content: str | list[dict]
+    content: Any | None = None  # str, list, or null when tool_calls present
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[ToolCall] | None = None
+
+
+class ToolDef(BaseModel):
+    type: str = "function"
+    function: dict  # {name, description, parameters: {...JSON schema...}}
 
 
 class ChatRequest(BaseModel):
@@ -232,7 +340,10 @@ class ChatRequest(BaseModel):
     top_k: int | None = None           # top-k, applied when temperature > 0
     frequency_penalty: float | None = None  # OAI -> rep_pen = 1 + freq_pen (sampling only)
     stop: list[str] | str | None = None  # FIX 3: accept stop field (Open WebUI sends it)
+    tools: list[ToolDef] | None = None
+    tool_choice: Any | None = None  # "auto" | "none" | {"function": {...}}
     chat_template_kwargs: dict | None = None
+    stream_options: dict | None = None  # e.g. {"include_usage": true}
 
 
 class AnthropicMessage(BaseModel):
@@ -252,6 +363,65 @@ class AnthropicMessagesRequest(BaseModel):
     frequency_penalty: float | None = None
     stop_sequences: list[str] | None = None
     chat_template_kwargs: dict | None = None
+
+
+# ─── Responses API schemas (Codex wire protocol) ──────────────────
+
+class ResponseInputMessage(BaseModel):
+    type: str = "message"
+    id: str | None = None
+    role: str = "user"
+    content: Any  # str or list[dict] content parts
+    status: str | None = None
+
+
+class ResponseFunctionCall(BaseModel):
+    type: str = "function_call"
+    id: str | None = None
+    call_id: str
+    name: str
+    arguments: str
+    status: str | None = None
+
+
+class ResponseFunctionCallOutput(BaseModel):
+    type: str = "function_call_output"
+    id: str | None = None
+    call_id: str
+    output: Any  # str or structured
+    status: str | None = None
+
+
+class ResponseToolFunction(BaseModel):
+    type: str = "function"
+    name: str
+    description: str | None = None
+    parameters: dict | None = None
+    strict: bool | None = None
+
+
+class ResponseReasoningConfig(BaseModel):
+    effort: str | None = None  # "low" | "medium" | "high"
+    summary: str | None = None  # "auto" | "concise" | "detailed" | "none"
+
+
+class ResponsesCreateRequest(BaseModel):
+    model: str = MODEL_NAME
+    input: Any  # str or list[InputItem dicts]
+    instructions: str | None = None
+    tools: list[dict] | None = None
+    tool_choice: str | None = "auto"
+    parallel_tool_calls: bool | None = None
+    stream: bool | None = None
+    max_output_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    reasoning: ResponseReasoningConfig | None = None
+    store: bool | None = None
+    include: list[str] | None = None
+    text: dict | None = None
+    metadata: dict | None = None
+    previous_response_id: str | None = None
 
 
 def _samp_suffix(req) -> str:
@@ -373,7 +543,26 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     # FIX 5: richer /v1/models response — Open WebUI uses `context_length` and
     # `created` to populate the model picker and context-bar correctly.
     @app.get("/v1/models")
-    def list_models():
+    def list_models(request: Request):
+        # Codex sends ?client_version= — serve the Codex-specific schema
+        if "client_version" in request.query_params:
+            return {"models": [{
+                "slug": MODEL_NAME,
+                "display_name": MODEL_NAME,
+                "description": "Local DFlash speculative-decoding server",
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "No thinking"},
+                    {"effort": "medium", "description": "Thinking enabled"},
+                ],
+                "shell_type": "shell_command",
+                "visibility": "list",
+                "supported_in_api": True,
+                "priority": 1,
+                "context_window": max_ctx,
+                "supports_reasoning_summaries": False,
+                "supports_parallel_tool_calls": False,
+            }]}
         return {
             "object": "list",
             "data": [{
@@ -394,7 +583,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         return Path(path)
 
     def _render_messages(msgs_list: list[dict],
-                         template_kwargs: dict | None = None
+                         template_kwargs: dict | None = None,
+                         tools_arg: list[dict] | None = None,
                          ) -> tuple[Path, list[int], str]:
         """Apply chat template to msgs_list and return (bin path, ids, raw prompt).
 
@@ -413,22 +603,46 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         tpl_kwargs.update(
             {k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS}
         )
+        if tools_arg:
+            tpl_kwargs["tools"] = tools_arg
         prompt = tokenizer.apply_chat_template(msgs_list, **tpl_kwargs)
+        started_in_thinking = bool(re.search(r"<think>\s*$", prompt))
         ids = tokenizer.encode(prompt, add_special_tokens=False)
         return _ids_to_bin(ids), ids, prompt
 
-    def _thinking_enabled(kwargs: dict | None) -> bool:
-        if kwargs:
-            return kwargs.get("enable_thinking", True)
-        return True
-
-    # FIX 2 applied: always call _content_to_str on message content
     def _tokenize_prompt(req: ChatRequest) -> tuple[Path, list[int], list[dict], bool]:
-        msgs = [{"role": m.role, "content": _content_to_str(m.content)}
-                for m in req.messages]
-        path, ids, prompt = _render_messages(msgs, req.chat_template_kwargs)
-        think = _thinking_enabled(req.chat_template_kwargs) and prompt_starts_in_thinking(prompt)
-        return path, ids, msgs, think
+        """Returns (bin, ids, raw_msgs, started_in_thinking)."""
+        msgs: list[dict] = []
+        for m in req.messages:
+            d: dict = {"role": m.role}
+            if m.content is not None:
+                d["content"] = _content_to_str(m.content)
+            if m.name is not None:
+                d["name"] = m.name
+            if m.tool_call_id is not None:
+                d["tool_call_id"] = m.tool_call_id
+            if m.tool_calls is not None:
+                d["tool_calls"] = []
+                for tc in m.tool_calls:
+                    args = tc.function.arguments
+                    if isinstance(args, str):
+                        try: args_obj = json.loads(args)
+                        except (json.JSONDecodeError, ValueError): args_obj = {"_raw": args}
+                    else:
+                        args_obj = args
+                    d["tool_calls"].append({
+                        "id": tc.id, "type": tc.type,
+                        "function": {"name": tc.function.name, "arguments": args_obj},
+                    })
+            msgs.append(d)
+
+        tools_arg = None
+        if req.tools:
+            tools_arg = [t.model_dump() for t in req.tools]
+
+        path, ids, _prompt = _render_messages(msgs, req.chat_template_kwargs, tools_arg)
+        started_in_thinking = bool(re.search(r"<think>\s*$", _prompt))
+        return path, ids, msgs, started_in_thinking
 
     def _maybe_compress(msgs: list[dict], prompt_bin: Path, prompt_ids: list[int],
                         template_kwargs: dict | None = None
@@ -576,6 +790,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         slot, cached_cur_bin, cached_cur_ids_len = full_hit
                         cur_bin = Path(cached_cur_bin)
                         prompt_len = cached_cur_ids_len
+                        started_in_thinking = False  # cached: no think prefill
                         gen_len = _gen_len_for(prompt_len, req.max_tokens)
                         if gen_len <= 0:
                             try: prompt_bin.unlink()
@@ -627,30 +842,139 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     yield f"data: {json.dumps(head)}\n\n"
                     window, mode = "", ("reasoning" if started_in_thinking else "content")
 
+                    include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
+
+                    def chunk(delta_obj, finish=None):
+                        return {"id": completion_id, "object": "chat.completion.chunk",
+                                "created": created, "model": MODEL_NAME,
+                                "choices": [{"index": 0, "delta": delta_obj,
+                                              "finish_reason": finish}]}
+
+                    # State machine: mode ∈ {'reasoning', 'content', 'tool_buffer'}
+                    mode = "reasoning" if started_in_thinking else "content"
+                    window = ""
+                    tool_buffer = ""
+                    stops = normalize_stop(req.stop)
+                    tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
+                    stop_holdback = max((len(s) for s in stops), default=0)
+                    HOLDBACK = max(tag_holdback, stop_holdback)
+                    completion_tokens = 0
+                    stop_hit = False
+
+                    def emit_delta(text, kind):
+                        if not text:
+                            return None
+                        return f"data: {json.dumps(chunk({kind: text}))}\n\n"
+
                     try:
                         async for tok_id in _astream_tokens(r_pipe, gen_len):
-                            outputs, window, mode = consume_stream_piece(
-                                window, mode, tokenizer.decode([tok_id]))
-                            for kind, text in outputs:
-                                chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created, "model": MODEL_NAME,
-                                    "choices": [{"index": 0,
-                                                 "delta": {kind: text},
-                                                 "finish_reason": None}],
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
-                        for kind, text in flush_stream_deltas(window, mode):
-                            chunk = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created, "model": MODEL_NAME,
-                                "choices": [{"index": 0,
-                                             "delta": {kind: text},
-                                             "finish_reason": None}],
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
+                            completion_tokens += 1
+                            piece = tokenizer.decode([tok_id])
+                            window += piece
+
+                            if stops and mode != "tool_buffer":
+                                si = first_stop_match(window, stops)
+                                if si != -1:
+                                    window = window[:si]
+                                    stop_hit = True
+                                    kind = "reasoning_content" if mode == "reasoning" else "content"
+                                    out = emit_delta(window, kind)
+                                    if out: yield out
+                                    window = ""
+                                    break
+
+                            while True:
+                                if mode == "tool_buffer":
+                                    tool_buffer += window
+                                    window = ""
+                                    break
+
+                                if mode == "reasoning":
+                                    idx = window.find(THINK_CLOSE_TAG)
+                                    if idx != -1:
+                                        pre = window[:idx]
+                                        out = emit_delta(pre, "reasoning_content")
+                                        if out: yield out
+                                        window = window[idx + len(THINK_CLOSE_TAG):]
+                                        mode = "content"
+                                        continue
+                                    if len(window) > HOLDBACK:
+                                        safe = window[:-HOLDBACK]
+                                        out = emit_delta(safe, "reasoning_content")
+                                        if out: yield out
+                                        window = window[-HOLDBACK:]
+                                    break
+
+                                else:  # mode == "content"
+                                    think_idx = window.find(THINK_OPEN_TAG)
+                                    tool_idx  = window.find(TOOL_OPEN_TAG)
+                                    hits = [(i, t) for i, t in
+                                            ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
+                                    if hits:
+                                        hits.sort()
+                                        idx, which = hits[0]
+                                        pre = window[:idx]
+                                        out = emit_delta(pre, "content")
+                                        if out: yield out
+                                        if which == "think":
+                                            window = window[idx + len(THINK_OPEN_TAG):]
+                                            mode = "reasoning"
+                                        else:
+                                            tool_buffer = window[idx:]
+                                            window = ""
+                                            mode = "tool_buffer"
+                                        continue
+                                    if len(window) > HOLDBACK:
+                                        safe = window[:-HOLDBACK]
+                                        out = emit_delta(safe, "content")
+                                        if out: yield out
+                                        window = window[-HOLDBACK:]
+                                    break
+
+                        if stop_hit:
+                            finish_reason = "stop"
+                            yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
+                            if include_usage:
+                                usage_chunk = {"id": completion_id, "object": "chat.completion.chunk",
+                                               "created": created, "model": MODEL_NAME, "choices": [],
+                                               "usage": {"prompt_tokens": prompt_len,
+                                                          "completion_tokens": completion_tokens,
+                                                          "total_tokens": prompt_len + completion_tokens}}
+                                yield f"data: {json.dumps(usage_chunk)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            if full_hit is None:
+                                try: cur_bin.unlink()
+                                except Exception: pass
+                            return
+
+                        # Flush remaining
+                        if mode == "reasoning" and window:
+                            out = emit_delta(window, "reasoning_content")
+                            if out: yield out
+                        elif mode == "content" and window:
+                            out = emit_delta(window, "content")
+                            if out: yield out
+                        elif mode == "tool_buffer":
+                            tool_buffer += window
+                        window = ""
+
+                        finish_reason = "stop"
+                        if mode == "tool_buffer":
+                            cleaned_after, tool_calls = parse_tool_calls(tool_buffer, tools=req.tools)
+                            if tool_calls:
+                                if cleaned_after:
+                                    out = emit_delta(cleaned_after, "content")
+                                    if out: yield out
+                                tc_delta_list = [{
+                                    "index": i, "id": tc["id"], "type": "function",
+                                    "function": {"name": tc["function"]["name"],
+                                                  "arguments": tc["function"]["arguments"]},
+                                } for i, tc in enumerate(tool_calls)]
+                                yield f"data: {json.dumps(chunk({'tool_calls': tc_delta_list}))}\n\n"
+                                finish_reason = "tool_calls"
+                            else:
+                                out = emit_delta(tool_buffer, "content")
+                                if out: yield out
                     finally:
                         if full_hit is None:
                             try: cur_bin.unlink()
@@ -666,13 +990,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     elif snap_prep:
                         prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
 
-                    tail = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": MODEL_NAME,
-                        "choices": [{"index": 0, "delta": {},
-                                     "finish_reason": "stop"}],
-                    }
-                    yield f"data: {json.dumps(tail)}\n\n"
+                    yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
+                    if include_usage:
+                        usage_chunk = {
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": MODEL_NAME,
+                            "choices": [],
+                            "usage": {"prompt_tokens": prompt_len,
+                                       "completion_tokens": completion_tokens,
+                                       "total_tokens": prompt_len + completion_tokens},
+                        }
+                        yield f"data: {json.dumps(usage_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(sse(), media_type="text/event-stream")
@@ -736,14 +1064,34 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             except Exception: pass
 
         text = tokenizer.decode(tokens, skip_special_tokens=True)
+        # Stop sequences
+        stops = normalize_stop(req.stop)
+        if stops:
+            i = first_stop_match(text, stops)
+            if i != -1:
+                text = text[:i]
+        # Parse reasoning and tool calls
+        thinking_enabled = True
+        if req.chat_template_kwargs:
+            thinking_enabled = req.chat_template_kwargs.get("enable_thinking", True)
+        cleaned, tool_calls = parse_tool_calls(text, tools=req.tools)
         cleaned, reasoning = parse_reasoning(
-            text,
-            thinking_enabled=_thinking_enabled(req.chat_template_kwargs),
+            cleaned,
+            thinking_enabled=thinking_enabled,
             started_in_thinking=started_in_thinking,
         )
-        msg = {"role": "assistant", "content": cleaned}
+
+        msg: dict = {"role": "assistant"}
+        finish_reason = "stop"
         if reasoning:
             msg["reasoning_content"] = reasoning
+        if tool_calls:
+            msg["content"] = cleaned if cleaned else None
+            msg["tool_calls"] = tool_calls
+            finish_reason = "tool_calls"
+        else:
+            msg["content"] = cleaned
+
         return JSONResponse({
             "id": completion_id,
             "object": "chat.completion",
@@ -752,7 +1100,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             "choices": [{
                 "index": 0,
                 "message": msg,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }],
             "usage": {"prompt_tokens": prompt_len,
                       "completion_tokens": len(tokens),
@@ -980,6 +1328,483 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             "usage": {"input_tokens": prompt_len,
                       "output_tokens": len(tokens)},
         })
+
+    # ── Responses API (Codex wire protocol) ───────────────────────────
+
+    def _map_responses_input(req: ResponsesCreateRequest
+                             ) -> tuple[list[ChatMessage], list[ToolDef] | None]:
+        """Map Responses API input → ChatMessage list + ToolDef list."""
+        messages: list[ChatMessage] = []
+
+        # instructions → system message
+        if req.instructions:
+            messages.append(ChatMessage(role="system", content=req.instructions))
+
+        # Parse input items
+        input_items = req.input
+        if isinstance(input_items, str):
+            messages.append(ChatMessage(role="user", content=input_items))
+        elif isinstance(input_items, list):
+            for item in input_items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "message")
+
+                if item_type == "message":
+                    role = item.get("role", "user")
+                    if role == "developer":
+                        role = "system"
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        # Extract text from content parts
+                        text_parts = []
+                        for part in content:
+                            if isinstance(part, dict):
+                                if part.get("type") in ("output_text", "text", "input_text"):
+                                    text_parts.append(part.get("text", ""))
+                        content = "".join(text_parts)
+                    messages.append(ChatMessage(role=role, content=content))
+
+                elif item_type == "function_call":
+                    tc = ToolCall(
+                        id=item.get("call_id", "call_" + uuid.uuid4().hex[:12]),
+                        type="function",
+                        function=ToolCallFunction(
+                            name=item.get("name", ""),
+                            arguments=item.get("arguments", "{}"),
+                        ),
+                    )
+                    messages.append(ChatMessage(
+                        role="assistant", content=None, tool_calls=[tc]))
+
+                elif item_type == "function_call_output":
+                    output = item.get("output", "")
+                    if not isinstance(output, str):
+                        output = json.dumps(output)
+                    messages.append(ChatMessage(
+                        role="tool",
+                        tool_call_id=item.get("call_id", ""),
+                        content=output))
+
+                # Ignore reasoning, local_shell_call, etc. — we just
+                # need the message/function_call/output items for the model.
+
+        # Map tools
+        tools: list[ToolDef] | None = None
+        if req.tools:
+            tool_defs = []
+            for t in req.tools:
+                if not isinstance(t, dict):
+                    continue
+                if t.get("type") == "function":
+                    func_def = {
+                        "name": t.get("name", ""),
+                        "description": t.get("description", ""),
+                    }
+                    if "parameters" in t:
+                        func_def["parameters"] = t["parameters"]
+                    tool_defs.append(ToolDef(type="function", function=func_def))
+            if tool_defs:
+                tools = tool_defs
+
+        return messages, tools
+
+    @app.post("/v1/responses")
+    async def responses_create(req: ResponsesCreateRequest):
+        messages, tools = _map_responses_input(req)
+
+        # Build an internal ChatRequest
+        enable_thinking = False
+        if req.reasoning and req.reasoning.effort and req.reasoning.effort != "low":
+            enable_thinking = True
+
+        chat_req = ChatRequest(
+            model=req.model or MODEL_NAME,
+            messages=messages,
+            stream=bool(req.stream),
+            max_tokens=req.max_output_tokens or 4096,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            tools=tools,
+            tool_choice=req.tool_choice,
+            chat_template_kwargs={"enable_thinking": enable_thinking},
+        )
+
+        response_id = "resp_" + uuid.uuid4().hex[:24]
+        msg_item_id = "msg_" + uuid.uuid4().hex[:24]
+        created_at = int(time.time())
+
+        # Tokenize
+        prompt_bin, prompt_ids, raw_msgs, started_in_thinking = _tokenize_prompt(chat_req)
+        prompt_len = len(prompt_ids)
+
+        if req.stream:
+            return await _responses_stream(
+                chat_req, prompt_bin, prompt_ids, raw_msgs,
+                started_in_thinking, response_id, msg_item_id,
+                created_at, prompt_len)
+        else:
+            return await _responses_non_stream(
+                chat_req, prompt_bin, prompt_ids, raw_msgs,
+                response_id, msg_item_id, created_at, prompt_len)
+
+    async def _responses_non_stream(
+            chat_req, prompt_bin, prompt_ids, raw_msgs,
+            response_id, msg_item_id, created_at, prompt_len):
+        """Non-streaming Responses API handler."""
+        async with daemon_lock:
+            full_snap_prep_ref = [None]
+            snap_prep = None
+
+            full_hit = prefix_cache.lookup_full(prompt_ids)
+            if full_hit is not None:
+                slot, cached_cur_bin, cached_cur_ids_len = full_hit
+                cur_bin = Path(cached_cur_bin)
+                cur_ids = None
+                prompt_len = cached_cur_ids_len
+                gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
+                if gen_len <= 0:
+                    try: prompt_bin.unlink()
+                    except Exception: pass
+                    return JSONResponse({
+                        "type": "error",
+                        "error": {"type": "invalid_request_error",
+                                  "message": f"Prompt too long ({prompt_len})"}
+                    }, status_code=400)
+                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(chat_req) + "\n"
+            else:
+                cur_bin, cur_ids = await asyncio.to_thread(
+                    _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
+                    chat_req.chat_template_kwargs)
+                prompt_len = len(cur_ids)
+                gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
+                if gen_len <= 0:
+                    try: cur_bin.unlink()
+                    except Exception: pass
+                    return JSONResponse({
+                        "type": "error",
+                        "error": {"type": "invalid_request_error",
+                                  "message": f"Prompt too long ({prompt_len})"}
+                    }, status_code=400)
+                compression_fired = (cur_bin != prompt_bin)
+                cmd_line, snap_prep = _build_cmd_line(
+                    chat_req, cur_bin, cur_ids, gen_len, prefix_cache,
+                    prompt_ids, full_snap_prep_ref, compression_fired)
+
+            try:
+                _write_cmd(cmd_line)
+            except RuntimeError as e:
+                return JSONResponse({
+                    "type": "error",
+                    "error": {"type": "server_error", "message": str(e)}
+                }, status_code=503)
+
+            tokens = await _collect_tokens_sync(r_pipe, gen_len)
+
+            full_snap_prep = full_snap_prep_ref[0]
+            if full_snap_prep is not None:
+                fslot, _ = full_snap_prep
+                prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
+            elif snap_prep:
+                prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+
+        if full_hit is None:
+            try: cur_bin.unlink()
+            except Exception: pass
+        else:
+            try: prompt_bin.unlink()
+            except Exception: pass
+
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        thinking_enabled = True
+        if chat_req.chat_template_kwargs:
+            thinking_enabled = chat_req.chat_template_kwargs.get("enable_thinking", True)
+        cleaned, tool_calls = parse_tool_calls(text, tools=chat_req.tools)
+        cleaned, reasoning = parse_reasoning(cleaned, thinking_enabled=thinking_enabled)
+
+        # Build output items
+        output: list[dict] = []
+        if tool_calls:
+            for tc in tool_calls:
+                output.append({
+                    "type": "function_call",
+                    "id": tc["id"],
+                    "status": "completed",
+                    "call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"],
+                })
+        else:
+            output.append({
+                "type": "message",
+                "id": msg_item_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": cleaned, "annotations": []}],
+            })
+
+        return JSONResponse({
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "completed",
+            "model": chat_req.model or MODEL_NAME,
+            "output": output,
+            "output_text": cleaned,
+            "usage": {
+                "input_tokens": prompt_len,
+                "output_tokens": len(tokens),
+                "total_tokens": prompt_len + len(tokens),
+            },
+        })
+
+    async def _responses_stream(
+            chat_req, prompt_bin, prompt_ids, raw_msgs,
+            started_in_thinking, response_id, msg_item_id,
+            created_at, prompt_len):
+        """Streaming Responses API handler — emits Responses SSE events."""
+
+        async def sse() -> AsyncIterator[str]:
+            nonlocal prompt_len, started_in_thinking
+
+            async with daemon_lock:
+                full_snap_prep_ref = [None]
+                snap_prep = None
+
+                full_hit = prefix_cache.lookup_full(prompt_ids)
+                if full_hit is not None:
+                    slot, cached_cur_bin, cached_cur_ids_len = full_hit
+                    cur_bin = Path(cached_cur_bin)
+                    prompt_len = cached_cur_ids_len
+                    started_in_thinking = False
+                    gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
+                    if gen_len <= 0:
+                        try: prompt_bin.unlink()
+                        except Exception: pass
+                        yield _resp_sse("response.failed", {
+                            "response": _resp_shell(response_id, chat_req.model, created_at,
+                                                     "failed")})
+                        return
+                    cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(chat_req) + "\n"
+                else:
+                    cur_bin, cur_ids = await asyncio.to_thread(
+                        _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
+                        chat_req.chat_template_kwargs)
+                    prompt_len = len(cur_ids)
+                    gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
+                    if gen_len <= 0:
+                        try: cur_bin.unlink()
+                        except Exception: pass
+                        yield _resp_sse("response.failed", {
+                            "response": _resp_shell(response_id, chat_req.model, created_at,
+                                                     "failed")})
+                        return
+                    compression_fired = (cur_bin != prompt_bin)
+                    cmd_line, snap_prep = _build_cmd_line(
+                        chat_req, cur_bin, cur_ids, gen_len, prefix_cache,
+                        prompt_ids, full_snap_prep_ref, compression_fired)
+
+                try:
+                    _write_cmd(cmd_line)
+                except RuntimeError as e:
+                    yield _resp_sse("error", {
+                        "error": {"type": "server_error", "message": str(e)}})
+                    return
+
+                # Lifecycle: response.created
+                yield _resp_sse("response.created", {
+                    "response": _resp_shell(response_id, chat_req.model, created_at,
+                                             "in_progress")})
+
+                # Announce output item
+                yield _resp_sse("response.output_item.added", {
+                    "output_index": 0,
+                    "item": {"type": "message", "id": msg_item_id,
+                             "status": "in_progress", "role": "assistant",
+                             "content": []}})
+
+                # Announce content part
+                yield _resp_sse("response.content_part.added", {
+                    "item_id": msg_item_id, "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []}})
+
+                # Stream tokens with state machine
+                mode = "reasoning" if started_in_thinking else "content"
+                window = ""
+                tool_buffer = ""
+                accumulated_text = ""
+                tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
+                HOLDBACK = tag_holdback
+                completion_tokens = 0
+                tool_call_active = False
+
+                try:
+                    async for tok_id in _astream_tokens(r_pipe, gen_len):
+                        completion_tokens += 1
+                        piece = tokenizer.decode([tok_id])
+                        window += piece
+
+                        while True:
+                            if mode == "tool_buffer":
+                                tool_buffer += window
+                                window = ""
+                                break
+
+                            if mode == "reasoning":
+                                idx = window.find(THINK_CLOSE_TAG)
+                                if idx != -1:
+                                    window = window[idx + len(THINK_CLOSE_TAG):]
+                                    mode = "content"
+                                    continue
+                                if len(window) > HOLDBACK:
+                                    window = window[-HOLDBACK:]
+                                break
+
+                            else:  # content
+                                think_idx = window.find(THINK_OPEN_TAG)
+                                tool_idx = window.find(TOOL_OPEN_TAG)
+                                hits = [(i, t) for i, t in
+                                        ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
+                                if hits:
+                                    hits.sort()
+                                    idx, which = hits[0]
+                                    pre = window[:idx]
+                                    if pre:
+                                        accumulated_text += pre
+                                        yield _resp_sse("response.output_text.delta", {
+                                            "item_id": msg_item_id, "output_index": 0,
+                                            "content_index": 0, "delta": pre})
+                                    if which == "think":
+                                        window = window[idx + len(THINK_OPEN_TAG):]
+                                        mode = "reasoning"
+                                    else:
+                                        tool_buffer = window[idx:]
+                                        window = ""
+                                        mode = "tool_buffer"
+                                    continue
+                                if len(window) > HOLDBACK:
+                                    safe = window[:-HOLDBACK]
+                                    accumulated_text += safe
+                                    yield _resp_sse("response.output_text.delta", {
+                                        "item_id": msg_item_id, "output_index": 0,
+                                        "content_index": 0, "delta": safe})
+                                    window = window[-HOLDBACK:]
+                                break
+
+                    # Flush remaining window
+                    if mode == "content" and window:
+                        accumulated_text += window
+                        yield _resp_sse("response.output_text.delta", {
+                            "item_id": msg_item_id, "output_index": 0,
+                            "content_index": 0, "delta": window})
+                    elif mode == "tool_buffer":
+                        tool_buffer += window
+                    window = ""
+
+                finally:
+                    if full_hit is None:
+                        try: cur_bin.unlink()
+                        except Exception: pass
+                    else:
+                        try: prompt_bin.unlink()
+                        except Exception: pass
+
+                full_snap_prep = full_snap_prep_ref[0]
+                if full_snap_prep is not None:
+                    fslot, _ = full_snap_prep
+                    prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
+                elif snap_prep:
+                    prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+
+                # Build final output items
+                final_output: list[dict] = []
+                if mode == "tool_buffer" and tool_buffer:
+                    cleaned_after, tool_calls = parse_tool_calls(tool_buffer, tools=chat_req.tools)
+                    if tool_calls:
+                        if cleaned_after:
+                            accumulated_text += cleaned_after
+                        for tc in tool_calls:
+                            tool_call_active = True
+                            tc_item_id = tc["id"]
+                            # Emit function_call_arguments.delta for each tool call
+                            yield _resp_sse("response.function_call_arguments.delta", {
+                                "item_id": tc_item_id, "output_index": 0,
+                                "delta": tc["function"]["arguments"]})
+                            yield _resp_sse("response.function_call_arguments.done", {
+                                "item_id": tc_item_id, "output_index": 0,
+                                "arguments": tc["function"]["arguments"],
+                                "name": tc["function"]["name"]})
+                            final_output.append({
+                                "type": "function_call",
+                                "id": tc_item_id,
+                                "status": "completed",
+                                "call_id": tc_item_id,
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            })
+                    else:
+                        accumulated_text += tool_buffer
+                        yield _resp_sse("response.output_text.delta", {
+                            "item_id": msg_item_id, "output_index": 0,
+                            "content_index": 0, "delta": tool_buffer})
+
+                # Finalize text output
+                yield _resp_sse("response.output_text.done", {
+                    "item_id": msg_item_id, "output_index": 0,
+                    "content_index": 0, "text": accumulated_text})
+                yield _resp_sse("response.content_part.done", {
+                    "item_id": msg_item_id, "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": accumulated_text,
+                             "annotations": []}})
+
+                if not tool_call_active:
+                    final_output.append({
+                        "type": "message",
+                        "id": msg_item_id,
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": accumulated_text,
+                                     "annotations": []}],
+                    })
+
+                yield _resp_sse("response.output_item.done", {
+                    "output_index": 0,
+                    "item": final_output[0] if final_output else {
+                        "type": "message", "id": msg_item_id,
+                        "status": "completed", "role": "assistant",
+                        "content": []}})
+
+                # response.completed
+                shell = _resp_shell(response_id, chat_req.model, created_at,
+                                     "completed")
+                shell["output"] = final_output
+                shell["output_text"] = accumulated_text
+                shell["usage"] = {
+                    "input_tokens": prompt_len,
+                    "output_tokens": completion_tokens,
+                    "total_tokens": prompt_len + completion_tokens,
+                }
+                yield _resp_sse("response.completed", {"response": shell})
+
+        return StreamingResponse(sse(), media_type="text/event-stream")
+
+    def _resp_sse(event_type: str, data: dict) -> str:
+        """Format a Responses API SSE event."""
+        data["type"] = event_type
+        return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+    def _resp_shell(resp_id: str, model: str, created_at: int,
+                    status: str) -> dict:
+        """Minimal response shell for SSE lifecycle events."""
+        return {
+            "id": resp_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": status,
+            "model": model or MODEL_NAME,
+        }
 
     return app
 

@@ -8,10 +8,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from server import (
-    build_app, MODEL_NAME, parse_reasoning,
-    consume_stream_piece, flush_stream_deltas,
-)
+from server import build_app, MODEL_NAME, parse_tool_calls, parse_reasoning
 
 
 @pytest.fixture
@@ -215,6 +212,228 @@ def test_chat_completions_streaming(mock_os_read, mock_popen, mock_pipe, mock_to
     })
     
     assert response.status_code == 200
-    assert '"reasoning_content"' in response.text
-    assert "</think>" not in response.text
-    assert "data: [DONE]" in response.text
+    lines = response.text.strip().split("\n\n")
+    assert len(lines) >= 3
+    assert lines[-1] == "data: [DONE]"
+
+
+def test_codex_models_endpoint(mock_tokenizer):
+    """Codex sends ?client_version= and expects {"models":[...]} format."""
+    with patch("server.subprocess.Popen"):
+        app = build_app(
+            target=Path("target.gguf"),
+            draft=Path("draft.safetensors"),
+            bin_path=Path("test_dflash"),
+            budget=22,
+            max_ctx=131072,
+            tokenizer=mock_tokenizer,
+            stop_ids={2}
+        )
+    client = TestClient(app)
+    response = client.get("/v1/models?client_version=0.1.0")
+    assert response.status_code == 200
+    data = response.json()
+    assert "models" in data
+    m = data["models"][0]
+    assert m["slug"] == MODEL_NAME
+    assert "context_window" in m
+    assert "supported_reasoning_levels" in m
+    assert m["shell_type"] == "shell_command"
+
+
+@patch("server.os.pipe")
+@patch("server.subprocess.Popen")
+@patch("server.os.read")
+def test_responses_non_streaming(mock_os_read, mock_popen, mock_pipe, mock_tokenizer):
+    """POST /v1/responses non-streaming returns ResponsesObject."""
+    mock_pipe.return_value = (1, 2)
+
+    app = build_app(
+        target=Path("target.gguf"),
+        draft=Path("draft.safetensors"),
+        bin_path=Path("test_dflash"),
+        budget=22,
+        max_ctx=131072,
+        tokenizer=mock_tokenizer,
+        stop_ids={2}
+    )
+
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10),
+        struct.pack("<i", -1)
+    ]
+
+    client = TestClient(app)
+    response = client.post("/v1/responses", json={
+        "model": MODEL_NAME,
+        "input": [{"type": "message", "role": "user", "content": "hello"}],
+    })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "response"
+    assert data["status"] == "completed"
+    assert data["id"].startswith("resp_")
+    assert data["output"][0]["type"] == "message"
+    assert data["output"][0]["content"][0]["type"] == "output_text"
+    assert "usage" in data
+
+
+@patch("server.os.pipe")
+@patch("server.subprocess.Popen")
+@patch("server.os.read")
+def test_responses_streaming(mock_os_read, mock_popen, mock_pipe, mock_tokenizer):
+    """POST /v1/responses streaming emits proper SSE events."""
+    mock_pipe.return_value = (1, 2)
+
+    app = build_app(
+        target=Path("target.gguf"),
+        draft=Path("draft.safetensors"),
+        bin_path=Path("test_dflash"),
+        budget=22,
+        max_ctx=131072,
+        tokenizer=mock_tokenizer,
+        stop_ids={2}
+    )
+
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10),
+        struct.pack("<i", -1)
+    ]
+
+    client = TestClient(app)
+    response = client.post("/v1/responses", json={
+        "model": MODEL_NAME,
+        "input": "say hello",
+        "stream": True,
+    })
+
+    assert response.status_code == 200
+    text = response.text
+    # Must contain key SSE event types
+    assert "event: response.created" in text
+    assert "event: response.output_item.added" in text
+    assert "event: response.content_part.added" in text
+    assert "event: response.completed" in text
+
+
+@patch("server.os.pipe")
+@patch("server.subprocess.Popen")
+@patch("server.os.read")
+def test_responses_with_tools(mock_os_read, mock_popen, mock_pipe, mock_tokenizer):
+    """POST /v1/responses with function tools maps correctly."""
+    mock_pipe.return_value = (1, 2)
+
+    app = build_app(
+        target=Path("target.gguf"),
+        draft=Path("draft.safetensors"),
+        bin_path=Path("test_dflash"),
+        budget=22,
+        max_ctx=131072,
+        tokenizer=mock_tokenizer,
+        stop_ids={2}
+    )
+
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10),
+        struct.pack("<i", -1)
+    ]
+
+    client = TestClient(app)
+    response = client.post("/v1/responses", json={
+        "model": MODEL_NAME,
+        "input": [
+            {"type": "message", "role": "user", "content": "read file.txt"},
+        ],
+        "tools": [
+            {"type": "function", "name": "read_file",
+             "description": "Read a file",
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        ],
+        "instructions": "You are a coding assistant.",
+    })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "response"
+    assert data["status"] == "completed"
+
+
+@patch("server.os.pipe")
+@patch("server.subprocess.Popen")
+@patch("server.os.read")
+def test_responses_function_call_output(mock_os_read, mock_popen, mock_pipe, mock_tokenizer):
+    """Responses API maps function_call + function_call_output items correctly."""
+    mock_pipe.return_value = (1, 2)
+
+    app = build_app(
+        target=Path("target.gguf"),
+        draft=Path("draft.safetensors"),
+        bin_path=Path("test_dflash"),
+        budget=22,
+        max_ctx=131072,
+        tokenizer=mock_tokenizer,
+        stop_ids={2}
+    )
+
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10),
+        struct.pack("<i", -1)
+    ]
+
+    client = TestClient(app)
+    response = client.post("/v1/responses", json={
+        "model": MODEL_NAME,
+        "input": [
+            {"type": "message", "role": "user", "content": "read file.txt"},
+            {"type": "function_call", "call_id": "call_abc123",
+             "name": "read_file", "arguments": '{"path":"file.txt"}'},
+            {"type": "function_call_output", "call_id": "call_abc123",
+             "output": "file content here"},
+        ],
+    })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "response"
+
+
+# ─── Unit tests for parsers ────────────────────────────────────────
+
+def test_parse_tool_calls_basic():
+    """parse_tool_calls extracts Qwen XML tool calls."""
+    text = (
+        'Sure!\n<tool_call>'
+        '<function=read_file><parameter=path>test.py</parameter></function>'
+        '</tool_call>'
+    )
+    cleaned, calls = parse_tool_calls(text, tools=None)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "read_file"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["path"] == "test.py"
+    assert cleaned.strip() == "Sure!"
+
+
+def test_parse_tool_calls_no_tools():
+    """parse_tool_calls returns empty list when no tool tags present."""
+    text = "Just a plain answer."
+    cleaned, calls = parse_tool_calls(text, tools=None)
+    assert calls == []
+    assert cleaned == text
+
+
+def test_parse_reasoning_with_think():
+    """parse_reasoning extracts <think> content."""
+    text = "<think>Let me think...</think>Here is the answer."
+    cleaned, reasoning = parse_reasoning(text, thinking_enabled=True)
+    assert cleaned == "Here is the answer."
+    assert reasoning == "Let me think..."
+
+
+def test_parse_reasoning_no_think():
+    """parse_reasoning with thinking disabled returns text as content."""
+    text = "Just an answer."
+    cleaned, reasoning = parse_reasoning(text, thinking_enabled=False)
+    assert cleaned == "Just an answer."
+    assert reasoning is None
