@@ -163,6 +163,71 @@ class TestParseToolCalls:
         assert "Before" in cleaned
         assert "After" in cleaned
 
+    def test_function_signature_tool_call(self):
+        text = '<function=web_search(query="Open Claw docs documentation")</function>'
+        cleaned, calls = parse_tool_calls(text, tools=[{
+            "type": "function",
+            "function": {"name": "web_search", "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            }},
+        }])
+        assert cleaned == ""
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "web_search"
+        assert json.loads(calls[0]["function"]["arguments"]) == {
+            "query": "Open Claw docs documentation"
+        }
+
+    @pytest.mark.parametrize("text", [
+        '{"name":"web_search","arguments":{"query":"OpenAI docs"}}',
+        '<tool_code>{"name":"web_search","arguments":{"query":"OpenAI docs"}}</tool_code>',
+    ])
+    def test_json_tool_call_shapes(self, text):
+        cleaned, calls = parse_tool_calls(text, tools=[{
+            "type": "function",
+            "function": {"name": "web_search", "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            }},
+        }])
+        assert cleaned == ""
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "web_search"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"query": "OpenAI docs"}
+
+    def test_multiple_mixed_tool_call_shapes(self):
+        text = (
+            '<function=web_search(query="OpenAI docs")</function>'
+            '{"name":"read_file","arguments":{"path":"README.md"}}'
+        )
+        cleaned, calls = parse_tool_calls(text, tools=[
+            {"type": "function", "function": {"name": "web_search"}},
+            {"type": "function", "function": {"name": "read_file"}},
+        ])
+        assert cleaned == ""
+        assert [c["function"]["name"] for c in calls] == ["web_search", "read_file"]
+        assert json.loads(calls[0]["function"]["arguments"]) == {"query": "OpenAI docs"}
+        assert json.loads(calls[1]["function"]["arguments"]) == {"path": "README.md"}
+
+    def test_unknown_tool_name_preserved_when_tools_are_known(self):
+        text = '{"name":"unknown_tool","arguments":{"query":"OpenAI docs"}}'
+        cleaned, calls = parse_tool_calls(text, tools=[{
+            "type": "function",
+            "function": {"name": "web_search"},
+        }])
+        assert calls == []
+        assert cleaned == text
+
+    def test_malformed_function_signature_is_preserved(self):
+        text = '<function=web_search(query="unterminated"</function>'
+        cleaned, calls = parse_tool_calls(text, tools=[{
+            "type": "function",
+            "function": {"name": "web_search"},
+        }])
+        assert calls == []
+        assert cleaned == text
+
 
 # ─── normalize_stop / first_stop_match ──────────────────────────────
 
