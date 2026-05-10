@@ -72,10 +72,17 @@ extern "C" int launch_bsa_sparse_flash_forward_bf16(
     // Ensure persistent transpose buffers are large enough.
     const size_t kv_bytes = (size_t)B * Hk * S * D * 2;  // sizeof(bfloat16)=2
     if (kv_bytes > kv_buf_cap) {
-        if (kv_buf_K) hipFree(kv_buf_K);
-        if (kv_buf_V) hipFree(kv_buf_V);
-        hipMalloc(&kv_buf_K, kv_bytes);
-        hipMalloc(&kv_buf_V, kv_bytes);
+        if (kv_buf_K) { hipFree(kv_buf_K); kv_buf_K = nullptr; }
+        if (kv_buf_V) { hipFree(kv_buf_V); kv_buf_V = nullptr; }
+        hipError_t err_k = hipMalloc(&kv_buf_K, kv_bytes);
+        hipError_t err_v = hipMalloc(&kv_buf_V, kv_bytes);
+        if (err_k != hipSuccess || err_v != hipSuccess) {
+            // Roll back: free any partial allocation and reset state.
+            if (kv_buf_K) { hipFree(kv_buf_K); kv_buf_K = nullptr; }
+            if (kv_buf_V) { hipFree(kv_buf_V); kv_buf_V = nullptr; }
+            kv_buf_cap = 0;
+            return -1;
+        }
         kv_buf_cap = kv_bytes;
     }
 

@@ -305,16 +305,59 @@ bool load_target_gguf_partial(const std::string & path,
         return false;
     }
 
+    // Structural invariants required by the graph builder.
+    if (kl != vl) {
+        set_last_error("key_length != value_length not supported");
+        gguf_free(gctx); return false;
+    }
+    if (n_layer % fai != 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
+        set_last_error(buf);
+        gguf_free(gctx); return false;
+    }
+
     // rope dimension_sections (array of 4 uint32)
     int rope_sections[4] = {0, 0, 0, 0};
     {
         int64_t rid = gguf_find_key(gctx, "qwen35.rope.dimension_sections");
-        if (rid >= 0) {
-            size_t n = gguf_get_arr_n(gctx, rid);
-            if (n >= 4) {
-                const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
-                for (int k = 0; k < 4; k++) rope_sections[k] = arr[k];
+        if (rid < 0) {
+            set_last_error("missing qwen35.rope.dimension_sections");
+            gguf_free(gctx); return false;
+        }
+        size_t n = gguf_get_arr_n(gctx, rid);
+        if (n < 4) {
+            set_last_error("qwen35.rope.dimension_sections has < 4 entries");
+            gguf_free(gctx); return false;
+        }
+        const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
+        for (int k = 0; k < 4; k++) rope_sections[k] = arr[k];
+    }
+
+    // Validate rope_sections against head_dim. n_rot = 2 * sum(sections) is
+    // the number of dims rotated by ggml_rope_multi; it must be even, > 0,
+    // and ≤ head_dim, otherwise rope reads/writes out of bounds.
+    {
+        long sum = 0;
+        for (int k = 0; k < 4; k++) {
+            if (rope_sections[k] < 0) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                    "rope_sections[%d]=%d is negative", k, rope_sections[k]);
+                set_last_error(buf);
+                gguf_free(gctx); return false;
             }
+            sum += rope_sections[k];
+        }
+        const long n_rot = 2 * sum;
+        if (n_rot <= 0 || n_rot > (long)kl) {
+            char buf[200];
+            std::snprintf(buf, sizeof(buf),
+                "rope_sections {%d,%d,%d,%d} → n_rot=%ld invalid for head_dim=%u",
+                rope_sections[0], rope_sections[1], rope_sections[2], rope_sections[3],
+                n_rot, kl);
+            set_last_error(buf);
+            gguf_free(gctx); return false;
         }
     }
 
@@ -351,6 +394,28 @@ bool load_target_gguf_partial(const std::string & path,
     out.rope_dimension_count = (int)get_u32_or(gctx, "qwen35.rope.dimension_count", 64);
     out.rope_theta = get_f32_or(gctx, "qwen35.rope.freq_base", 10000000.0f);
     out.rms_eps = get_f32_or(gctx, "qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
+
+    // EOS token ids from GGUF tokenizer metadata (stored as UINT32 by the
+    // GGUF spec; we use the u32 helper and cast). UINT32_MAX is the
+    // missing-key sentinel and maps to int32_t -1, which the runtime EOS
+    // check rejects via the `>= 0` guard.
+    {
+        const uint32_t kEosKeyMissing = 0xFFFFFFFFu;
+        const uint32_t raw_eos      = get_u32_or(gctx, "tokenizer.ggml.eos_token_id", kEosKeyMissing);
+        const uint32_t raw_eos_chat = get_u32_or(gctx, "tokenizer.ggml.eot_token_id", kEosKeyMissing);
+        out.eos_id      = (raw_eos      == kEosKeyMissing) ? -1 : (int32_t)raw_eos;
+        out.eos_chat_id = (raw_eos_chat == kEosKeyMissing) ? -1 : (int32_t)raw_eos_chat;
+        std::printf("[loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
+    }
+
+    // Compute capture layer IDs: evenly spaced through the target layers.
+    // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
+    {
+        const int N = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        const int step = ((int)n_layer - 2) / (N - 1);
+        for (int k = 0; k < N; k++) out.capture_layer_ids[k] = 1 + k * step;
+    }
+
     out.layers.assign((size_t)n_layer, TargetLayer{});
 
     // ── 2. Wire our layer pointers to tensors inside meta_ctx ─────────
@@ -360,8 +425,8 @@ bool load_target_gguf_partial(const std::string & path,
     out.tok_embd = g("token_embd.weight");
     out.out_norm = g("output_norm.weight");
     out.output   = g("output.weight");
-    if (!out.tok_embd || !out.out_norm) {
-        set_last_error("missing top-level tensors (token_embd/output_norm)");
+    if (!out.tok_embd || !out.out_norm || !out.output) {
+        set_last_error("missing top-level tensors (token_embd/output_norm/output)");
         gguf_free(gctx);
         return false;
     }
