@@ -843,6 +843,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 break
             tok_id = struct.unpack("<i", b)[0]
             if tok_id == -1:
+                if timing is not None:
+                    timing["daemon_done"] = True
                 break
             if timing and timing.get("t_first_tok") is None:
                 timing["t_first_tok"] = time.monotonic()
@@ -878,6 +880,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 break
             tok_id = struct.unpack("<i", b)[0]
             if tok_id == -1:
+                if timing is not None:
+                    timing["daemon_done"] = True
                 break
             if timing and timing.get("t_first_tok") is None:
                 timing["t_first_tok"] = time.monotonic()
@@ -1200,7 +1204,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                                           "total_tokens": prompt_len + completion_tokens}}
                                 yield f"data: {json.dumps(usage_chunk)}\n\n"
                             yield "data: [DONE]\n\n"
-                            if full_hit is None:
+                            if timing.get("daemon_done") and full_hit is None:
                                 try: cur_bin.unlink()
                                 except Exception: pass
                             _park_draft_if_lazy(timing)
@@ -1235,12 +1239,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 out = emit_delta(tool_buffer, "content")
                                 if out: yield out
                     finally:
-                        if full_hit is None:
-                            try: cur_bin.unlink()
-                            except Exception: pass
+                        if timing.get("daemon_done"):
+                            if full_hit is None:
+                                try: cur_bin.unlink()
+                                except Exception: pass
+                            else:
+                                try: prompt_bin.unlink()
+                                except Exception: pass
                         else:
-                            try: prompt_bin.unlink()
-                            except Exception: pass
+                            log.warning(
+                                "stream ended before daemon sentinel; "
+                                "retaining prompt .bin for in-flight daemon read")
 
                     _confirm_or_abort_snap(
                         completion_tokens, full_snap_prep_ref[0], snap_prep,
@@ -1500,12 +1509,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             delta_key = "thinking" if target_kind == "thinking" else "text"
                             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
                     finally:
-                        if full_hit is None:
-                            try: cur_bin.unlink()
-                            except Exception: pass
+                        if timing.get("daemon_done"):
+                            if full_hit is None:
+                                try: cur_bin.unlink()
+                                except Exception: pass
+                            else:
+                                try: prompt_bin.unlink()
+                                except Exception: pass
                         else:
-                            try: prompt_bin.unlink()
-                            except Exception: pass
+                            log.warning(
+                                "stream ended before daemon sentinel; "
+                                "retaining prompt .bin for in-flight daemon read")
 
                     _confirm_or_abort_snap(
                         out_tokens, full_snap_prep_ref[0], snap_prep,
@@ -2038,12 +2052,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     window = ""
 
                 finally:
-                    if full_hit is None:
-                        try: cur_bin.unlink()
-                        except Exception: pass
+                    if timing.get("daemon_done"):
+                        if full_hit is None:
+                            try: cur_bin.unlink()
+                            except Exception: pass
+                        else:
+                            try: prompt_bin.unlink()
+                            except Exception: pass
                     else:
-                        try: prompt_bin.unlink()
-                        except Exception: pass
+                        log.warning(
+                            "stream ended before daemon sentinel; "
+                            "retaining prompt .bin for in-flight daemon read")
 
                 _confirm_or_abort_snap(
                     completion_tokens, full_snap_prep_ref[0], snap_prep,
