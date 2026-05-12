@@ -1262,12 +1262,14 @@ def _feed_shared_stream_piece(
             break
 
         think_idx = state.window.find(THINK_OPEN_TAG)
+        think_close_idx = state.window.find(THINK_CLOSE_TAG)
         tool_idx = state.window.find(TOOL_OPEN_TAG) if state.allow_tools else -1
         bare_fn_idx = state.window.find(FUNCTION_OPEN_TAG) if state.allow_tools else -1
         tool_code_idx = state.window.find(TOOL_CODE_OPEN_TAG) if state.allow_tools else -1
         json_tool_idx = _find_toolish_json_start(state.window) if state.allow_tools else -1
         hits = [(i, t) for i, t in (
             (think_idx, "think"),
+            (think_close_idx, "think_close"),
             (tool_idx, "tool"),
             (bare_fn_idx, "tool"),
             (tool_code_idx, "tool"),
@@ -1283,6 +1285,8 @@ def _feed_shared_stream_piece(
             if which == "think":
                 state.window = state.window[idx + len(THINK_OPEN_TAG):]
                 state.mode = "reasoning"
+            elif which == "think_close":
+                state.window = state.window[idx + len(THINK_CLOSE_TAG):]
             else:
                 state.tool_buffer += state.window[idx:]
                 state.window = ""
