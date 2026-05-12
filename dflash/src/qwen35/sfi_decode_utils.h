@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
+#include <numeric>
 #include <vector>
 
 namespace dflash27b::sfi {
@@ -74,6 +76,74 @@ inline std::vector<int> merge_sparse_index_sets(
     std::sort(merged.begin(), merged.end());
     merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
     return merged;
+}
+
+// ── SFI Selector Helpers ─────────────────────────────────────────────
+
+// Update selector scores with EMA of new attention weights.
+// `attn_weights` has `kv_len` entries (sum of attention across heads for the
+// current decode step). `alpha` controls EMA decay (paper uses ~0.9).
+inline void update_selector_scores(
+    std::vector<float> & scores,
+    const float * attn_weights,
+    int kv_len,
+    float alpha = 0.9f
+) {
+    for (int i = 0; i < kv_len && i < (int)scores.size(); ++i) {
+        scores[i] = alpha * scores[i] + (1.0f - alpha) * attn_weights[i];
+    }
+}
+
+// Extract Top-K indices from selector scores (excluding sink/recent which are
+// always included). Returns sorted indices in ascending order.
+inline std::vector<int> topk_from_scores(
+    const std::vector<float> & scores,
+    int kv_len,
+    int k,
+    int sink_tokens,
+    int recent_tokens
+) {
+    if (k <= 0 || kv_len <= 0) return {};
+
+    const int sink_end = std::clamp(sink_tokens, 0, kv_len);
+    const int recent_start = std::max(0, kv_len - std::max(recent_tokens, 0));
+
+    // Collect candidate indices (middle region only)
+    std::vector<int> candidates;
+    candidates.reserve(std::max(0, recent_start - sink_end));
+    for (int i = sink_end; i < recent_start; ++i) {
+        candidates.push_back(i);
+    }
+
+    if ((int)candidates.size() <= k) {
+        return candidates;  // all middle tokens fit in budget
+    }
+
+    // Partial sort to get top-k by score (descending)
+    std::partial_sort(candidates.begin(), candidates.begin() + k, candidates.end(),
+                      [&scores](int a, int b) { return scores[a] > scores[b]; });
+    candidates.resize(k);
+    std::sort(candidates.begin(), candidates.end());  // restore position order
+    return candidates;
+}
+
+// Full SFI selection: compute merged sparse indices from selector state.
+inline std::vector<int> compute_sfi_indices(
+    const std::vector<float> & scores,
+    int kv_len,
+    int budget,
+    int sink_tokens = 4,
+    int recent_tokens = 256
+) {
+    // Budget covers total tokens; subtract sink and recent to get selected budget
+    const int sink_end = std::clamp(sink_tokens, 0, kv_len);
+    const int recent_count = std::min(std::max(recent_tokens, 0), kv_len);
+    const int selected_budget = std::max(0, budget - sink_end - recent_count);
+
+    std::vector<int> selected = topk_from_scores(
+        scores, kv_len, selected_budget, sink_tokens, recent_tokens);
+
+    return merge_sparse_index_sets(kv_len, sink_tokens, recent_tokens, selected);
 }
 
 } // namespace dflash27b::sfi

@@ -174,6 +174,76 @@ int test_window_multiple_refresh_points() {
     return rc;
 }
 
+// ── Selector helpers tests ───────────────────────────────────────────
+
+int test_update_selector_scores() {
+    std::vector<float> scores(10, 0.0f);
+    float weights[10] = {0, 0, 0, 0, 0, 1.0f, 0, 0, 0, 0};  // only pos 5
+    dflash27b::sfi::update_selector_scores(scores, weights, 10, 0.9f);
+    int rc = 0;
+    rc |= check(scores[5] > 0.09f && scores[5] < 0.11f, "first update: pos 5 ~ 0.1");
+    rc |= check(scores[0] == 0.0f, "first update: pos 0 stays 0");
+
+    // Second update accumulates
+    dflash27b::sfi::update_selector_scores(scores, weights, 10, 0.9f);
+    rc |= check(scores[5] > 0.18f && scores[5] < 0.20f, "second update: pos 5 ~ 0.19");
+    return rc;
+}
+
+int test_topk_from_scores() {
+    std::vector<float> scores = {0, 0, 0, 0, 0.5f, 0.8f, 0.3f, 0.9f, 0, 0};
+    // kv_len=10, sink=2, recent=2 → middle is [2,8)
+    auto top = dflash27b::sfi::topk_from_scores(scores, 10, 2, 2, 2);
+    int rc = 0;
+    rc |= check((int)top.size() == 2, "topk returns 2 indices");
+    // Highest scores in middle: pos 7 (0.9), pos 5 (0.8)
+    rc |= check(top[0] == 5, "topk first is pos 5 (sorted)");
+    rc |= check(top[1] == 7, "topk second is pos 7 (sorted)");
+    return rc;
+}
+
+int test_topk_budget_exceeds_candidates() {
+    std::vector<float> scores = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f};
+    // kv_len=5, sink=2, recent=1 → middle is [2,4) = {2,3}
+    auto top = dflash27b::sfi::topk_from_scores(scores, 5, 100, 2, 1);
+    int rc = 0;
+    rc |= check((int)top.size() == 2, "budget > candidates returns all middle");
+    rc |= check(top[0] == 2 && top[1] == 3, "returns {2,3}");
+    return rc;
+}
+
+int test_compute_sfi_indices() {
+    std::vector<float> scores(1000, 0.0f);
+    // Make positions 500-509 very high scoring
+    for (int i = 500; i < 510; ++i) scores[i] = 1.0f;
+
+    auto indices = dflash27b::sfi::compute_sfi_indices(
+        scores, /*kv_len=*/1000, /*budget=*/280,
+        /*sink_tokens=*/4, /*recent_tokens=*/256);
+    int rc = 0;
+    // Should contain: sink[0-3] + selected from [4,744) + recent[744-999]
+    rc |= check(indices[0] == 0, "sfi indices start with sink");
+    rc |= check(indices[3] == 3, "sfi includes sink end");
+    // All 10 high-score positions should be in the result
+    for (int i = 500; i < 510; ++i) {
+        bool found = std::binary_search(indices.begin(), indices.end(), i);
+        if (!found) { rc |= check(false, "high-score pos missing"); break; }
+    }
+    // Budget is 280: 4 sink + 256 recent + 20 selected = 280
+    rc |= check((int)indices.size() <= 280, "total within budget");
+    return rc;
+}
+
+int test_compute_sfi_indices_small_ctx() {
+    // When kv_len < budget, should return full range
+    std::vector<float> scores(50, 0.5f);
+    auto indices = dflash27b::sfi::compute_sfi_indices(
+        scores, 50, 2048, 4, 256);
+    int rc = 0;
+    rc |= check((int)indices.size() == 50, "small ctx returns all positions");
+    return rc;
+}
+
 // ── Performance micro-benchmark ─────────────────────────────────────
 
 void bench_merge_sparse() {
@@ -236,6 +306,23 @@ void bench_merge_sparse() {
                 (double)kv_len / sparse_sz);
     std::printf("  window_slice : %7.3f µs/call (amortized over %d steps)\n",
                 slice_us, N);
+
+    // Full SFI selection pipeline (scores → topk → merge)
+    std::vector<float> scores(kv_len, 0.0f);
+    std::uniform_real_distribution<float> score_dist(0.0f, 1.0f);
+    for (auto & s : scores) s = score_dist(rng);
+
+    auto t6 = std::chrono::high_resolution_clock::now();
+    size_t sfi_sz = 0;
+    for (int i = 0; i < N; ++i) {
+        auto idx = dflash27b::sfi::compute_sfi_indices(scores, kv_len, 2048, 4, 256);
+        sfi_sz = idx.size();
+    }
+    auto t7 = std::chrono::high_resolution_clock::now();
+    double sfi_us = std::chrono::duration<double, std::micro>(t7 - t6).count() / N;
+
+    std::printf("  sfi_select   : %7.1f µs → %zu indices (budget=2048, %.1f%% of full)\n",
+                sfi_us, sfi_sz, 100.0 * sfi_sz / kv_len);
 }
 
 } // namespace
@@ -265,6 +352,13 @@ int main(int argc, char ** argv) {
     rc |= test_window_kv_start_zero();
     rc |= test_window_non_aligned_no_refresh();
     rc |= test_window_multiple_refresh_points();
+
+    // Selector helper tests
+    rc |= test_update_selector_scores();
+    rc |= test_topk_from_scores();
+    rc |= test_topk_budget_exceeds_candidates();
+    rc |= test_compute_sfi_indices();
+    rc |= test_compute_sfi_indices_small_ctx();
 
     std::printf("%d passed, %d failed\n", n_pass, n_fail);
 

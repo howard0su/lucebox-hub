@@ -324,6 +324,14 @@ struct TargetCache {
     // cast (ggml_get_to_fp32_cuda).
     ggml_tensor * target_feat = nullptr;
     int target_feat_cap = 0;
+
+    // ── SFI (Slow-Fast Inference) selector state ─────────────────────
+    // Per full-attn layer importance scores, updated on slow-refresh steps.
+    // Shape: [max_ctx] f32 per layer. Used to select Top-K indices for
+    // sparse fast-step attention.
+    std::vector<std::vector<float>> sfi_selector;  // size = n_full_attn (16)
+    std::vector<std::vector<int>>   sfi_selected;  // cached merged indices
+    int sfi_budget = 0;   // 0 = disabled; >0 = sparse token budget
 };
 
 // Snapshot the current SSM+conv state into TargetCache::*_snap tensors.

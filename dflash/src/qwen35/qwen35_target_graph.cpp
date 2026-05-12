@@ -118,6 +118,14 @@ bool create_target_cache_partial(const TargetWeights & w,
     out.ssm_intermediate.assign(n_delta, nullptr);
     out.conv_input_cache.assign(n_delta, nullptr);
 
+    // SFI selector state: per-layer importance scores (host-side, zero-initialized).
+    {
+        const char * sfi_env = std::getenv("DFLASH27B_SFI_BUDGET");
+        out.sfi_budget = (sfi_env && *sfi_env) ? std::max(0, std::atoi(sfi_env)) : 0;
+    }
+    out.sfi_selector.assign(n_full_attn, std::vector<float>(max_ctx, 0.0f));
+    out.sfi_selected.assign(n_full_attn, std::vector<int>{});
+
     // KV cache element types (resolved from env; aborts on unsupported pair).
     ggml_type kv_k_type = GGML_TYPE_Q8_0;
     ggml_type kv_v_type = GGML_TYPE_Q8_0;
@@ -465,7 +473,9 @@ static ggml_tensor * build_full_attn_block(
     bool kv_k_rotated = false,
     int fa_window = 0,
     ggml_tensor * q_tail_capture = nullptr,
-    int q_tail_start = 0
+    int q_tail_start = 0,
+    ggml_tensor * sfi_gather_idx = nullptr,  // [n_sparse] i32 indices for sparse gather
+    int sfi_gather_len = 0                   // number of sparse indices
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -596,13 +606,22 @@ static ggml_tensor * build_full_attn_block(
         Qfa = ggml_cont(ctx, Qfa);
     }
 
-    // K and V from cache: a windowed view starting at win_start.
-    ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
-        head_dim, ws.win_len_padded, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * ws.win_start);
-    ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
-        head_dim, ws.win_len_padded, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * ws.win_start);
+    // K and V from cache: either sparse gather (SFI fast step) or windowed view.
+    ggml_tensor * Kfa;
+    ggml_tensor * Vfa;
+    if (sfi_gather_idx && sfi_gather_len > 0 && !ws.used_slow_refresh) {
+        // SFI fast step: gather only the selected sparse positions.
+        Kfa = ggml_get_rows(ctx, cache_k, sfi_gather_idx);
+        Vfa = ggml_get_rows(ctx, cache_v, sfi_gather_idx);
+    } else {
+        // Standard windowed view.
+        Kfa = ggml_view_3d(ctx, cache_k,
+            head_dim, ws.win_len_padded, n_head_kv,
+            cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * ws.win_start);
+        Vfa = ggml_view_3d(ctx, cache_v,
+            head_dim, ws.win_len_padded, n_head_kv,
+            cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * ws.win_start);
+    }
 
     // Causal mask: for n_tokens==1 we don't need one (a single query attending
     // to all keys is trivially causal). For n_tokens>1 the caller must provide
@@ -925,7 +944,9 @@ static ggml_tensor * build_single_layer(
     bool                  capture,
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
-    int                   q_tail_start = 0)
+    int                   q_tail_start = 0,
+    ggml_tensor *         sfi_gather_idx = nullptr,
+    int                   sfi_gather_len = 0)
 {
     const int hidden = w.n_embd;
     const float eps   = w.rms_eps;
@@ -949,7 +970,8 @@ static ggml_tensor * build_single_layer(
                                     cache.kv_k_type, cache.kv_v_type,
                                     cache.kv_k_rotated,
                                     fa_window,
-                                    q_tail_capture, q_tail_start);
+                                    q_tail_capture, q_tail_start,
+                                    sfi_gather_idx, sfi_gather_len);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {
@@ -1173,11 +1195,14 @@ ggml_tensor * build_qwen35_layer(
     bool                  capture,
     int                   fa_window,
     ggml_tensor *         q_tail_capture,
-    int                   q_tail_start)
+    int                   q_tail_start,
+    ggml_tensor *         sfi_gather_idx,
+    int                   sfi_gather_len)
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
-                              q_tail_capture, q_tail_start);
+                              q_tail_capture, q_tail_start,
+                              sfi_gather_idx, sfi_gather_len);
 }
 
 // ─── Cross-request prefix snapshot (Phase A) ─────────────────────────
