@@ -885,7 +885,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             return prompt_bin, prompt_ids
         decision = prefill_cfg.build_policy().decide(
             prompt_token_count=len(prompt_ids),
-            was_compressing=False,
         )
         prefill_policy_stats["total"] += 1
         prefill_policy_stats["reasons"][decision.reason] = (
@@ -2484,10 +2483,7 @@ def main():
     if args.verbose_daemon:
         print("  verbose_daemon = ON")
     if prefill_cfg.enabled:
-        threshold_s = str(prefill_cfg.threshold)
-        if prefill_cfg.threshold_exit is not None:
-            threshold_s += f"/exit={prefill_cfg.threshold_exit}"
-        print(f"  pflash    = {prefill_cfg.mode} · threshold={threshold_s} "
+        print(f"  pflash    = {prefill_cfg.mode} · threshold={prefill_cfg.threshold} "
               f"keep={prefill_cfg.keep_ratio} drafter={prefill_cfg.drafter_gguf}")
     else:
         print("  pflash    = off")

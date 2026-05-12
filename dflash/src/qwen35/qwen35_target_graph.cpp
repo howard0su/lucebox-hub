@@ -449,13 +449,17 @@ static int parse_fa_refresh_interval() {
 static AttnWindowSlice resolve_attn_window_slice(
     int kv_start,
     int n_tokens,
+    bool allow_slow_refresh,
     int fa_window,
     ggml_type kv_k_type,
     ggml_type kv_v_type
 ) {
     const int refresh_interval = parse_fa_refresh_interval();
     const bool do_slow_refresh =
-        refresh_interval > 0 && kv_start > 0 && (kv_start % refresh_interval) == 0;
+        allow_slow_refresh &&
+        refresh_interval > 0 &&
+        kv_start > 0 &&
+        (kv_start % refresh_interval) == 0;
     const int effective_window = do_slow_refresh ? 0 : fa_window;
 
     const int win_start = (effective_window > 0 && kv_start > effective_window)
@@ -606,7 +610,9 @@ static ggml_tensor * build_full_attn_block(
     // fa_window positions. This dramatically reduces FA cost during speculative
     // decode verify/replay at long contexts (60K+ kv entries).
     const AttnWindowSlice ws = resolve_attn_window_slice(
-        kv_start, n_tokens, fa_window, kv_k_type, kv_v_type);
+        kv_start, n_tokens,
+        /*allow_slow_refresh=*/attn_mask == nullptr,
+        fa_window, kv_k_type, kv_v_type);
 
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
     // When K is rotated (TQ3_0 or explicit FWHT), Q needs forward rotation too.

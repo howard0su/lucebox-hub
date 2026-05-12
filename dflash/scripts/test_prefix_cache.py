@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from _prefill_hook import PrefillConfig, config_from_args
+from _prefill_hook import PrefillConfig
 from prefix_cache import FullCacheEntry, PrefixCache, hash_prefix
 from server import build_app
 
@@ -29,7 +29,6 @@ def _prefill_cfg(**overrides) -> PrefillConfig:
         drafter_gguf=Path("drafter.gguf"),
         drafter_tokenizer_id="Qwen/Qwen3-0.6B",
         skip_park=False,
-        threshold_exit=None,
     )
     cfg.update(overrides)
     return PrefillConfig(**cfg)
@@ -44,36 +43,6 @@ def test_prefill_policy_modes_and_threshold():
     assert always_cfg.build_policy().decide(0).compress is True
     assert auto_cfg.build_policy().decide(99).compress is False
     assert auto_cfg.build_policy().decide(100).compress is True
-
-
-def test_prefill_policy_hysteresis_with_exit_threshold():
-    cfg = _prefill_cfg(mode="auto", threshold=100, threshold_exit=80)
-    policy = cfg.build_policy()
-
-    # Enter at/above threshold when we were previously not compressing.
-    assert policy.decide(100, was_compressing=False).compress is True
-    # Keep compressing above exit threshold even if below enter threshold.
-    assert policy.decide(90, was_compressing=True).compress is True
-    # Release once below exit threshold.
-    assert policy.decide(79, was_compressing=True).compress is False
-
-
-def test_config_from_args_rejects_invalid_exit_threshold():
-    args = SimpleNamespace(
-        prefill_compression="auto",
-        prefill_threshold=100,
-        prefill_threshold_exit=101,
-        prefill_keep_ratio=0.05,
-        prefill_drafter=Path("drafter.gguf"),
-        prefill_drafter_tokenizer="Qwen/Qwen3-0.6B",
-        prefill_skip_park=False,
-    )
-    try:
-        config_from_args(args)
-    except SystemExit as exc:
-        assert "--prefill-threshold-exit must be <= --prefill-threshold" in str(exc)
-    else:
-        raise AssertionError("expected SystemExit for invalid threshold_exit")
 
 
 def make_cache(tmp_path: Path, *, cap: int = 2, full_cap: int = 2,

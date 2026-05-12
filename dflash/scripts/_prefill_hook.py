@@ -93,29 +93,16 @@ class PrefillConfig:
     drafter_gguf: Optional[Path]                       # drafter weights (Qwen3-0.6B BF16 GGUF)
     drafter_tokenizer_id: str                          # HF repo ID for drafter vocab
     skip_park: bool = False                            # skip park/unpark on >=32 GB GPUs
-    threshold_exit: Optional[int] = None               # optional lower bound for exiting compress mode
 
     @property
     def enabled(self) -> bool:
         return self.mode != "off"
 
-    @property
-    def normalized_threshold_exit(self) -> int:
-        """Exit threshold used by the policy.
-
-        If not provided, we fall back to `threshold`, which preserves prior
-        single-threshold behavior.
-        """
-        return self.threshold if self.threshold_exit is None else self.threshold_exit
-
     def build_policy(self) -> "PrefillPolicy":
         return PrefillPolicy(self)
 
     def should_compress(self, prompt_token_count: int) -> bool:
-        return self.build_policy().decide(
-            prompt_token_count=prompt_token_count,
-            was_compressing=False,
-        ).compress
+        return self.build_policy().decide(prompt_token_count=prompt_token_count).compress
 
 
 @dataclass(frozen=True)
@@ -125,7 +112,6 @@ class PrefillDecision:
     mode: str
     prompt_token_count: int
     threshold_enter: int
-    threshold_exit: int
 
 
 class PrefillPolicy:
@@ -134,26 +120,18 @@ class PrefillPolicy:
     def __init__(self, cfg: PrefillConfig):
         self.cfg = cfg
 
-    def decide(self, prompt_token_count: int, *, was_compressing: bool = False) -> PrefillDecision:
+    def decide(self, prompt_token_count: int) -> PrefillDecision:
         mode = self.cfg.mode
         enter = self.cfg.threshold
-        exit_ = self.cfg.normalized_threshold_exit
 
         if mode == "always":
-            return PrefillDecision(True, "mode_always", mode, prompt_token_count, enter, exit_)
+            return PrefillDecision(True, "mode_always", mode, prompt_token_count, enter)
         if mode != "auto":
-            return PrefillDecision(False, "mode_off", mode, prompt_token_count, enter, exit_)
+            return PrefillDecision(False, "mode_off", mode, prompt_token_count, enter)
 
-        # In auto mode, optional hysteresis can avoid threshold flapping.
-        # With default `threshold_exit=None`, enter==exit and behavior matches
-        # previous single-threshold logic.
-        if was_compressing:
-            compress = prompt_token_count >= exit_
-            reason = "auto_hysteresis_keep" if compress else "auto_hysteresis_release"
-        else:
-            compress = prompt_token_count >= enter
-            reason = "auto_enter" if compress else "auto_below_enter"
-        return PrefillDecision(compress, reason, mode, prompt_token_count, enter, exit_)
+        compress = prompt_token_count >= enter
+        reason = "auto_enter" if compress else "auto_below_enter"
+        return PrefillDecision(compress, reason, mode, prompt_token_count, enter)
 
 
 def add_cli_flags(ap) -> None:
@@ -166,13 +144,9 @@ def add_cli_flags(ap) -> None:
     ap.add_argument("--prefill-threshold", type=int, default=32000,
                     help="Token threshold above which 'auto' mode triggers "
                           "compression (default 32000).")
-    ap.add_argument("--prefill-threshold-exit", type=int, default=None,
-                    help="Optional lower token threshold for exiting compression "
-                         "when already in compress mode. Defaults to "
-                         "--prefill-threshold (no hysteresis).")
     ap.add_argument("--prefill-keep-ratio", type=float, default=0.05,
                     help="Fraction of source tokens to keep after compression "
-                         "(default 0.05; bench setting).")
+                          "(default 0.05; bench setting).")
     ap.add_argument("--prefill-drafter", type=Path, default=None,
                     help="Path to the drafter Qwen3-0.6B BF16 GGUF used by "
                          "the daemon's compress command. Required when "
@@ -189,15 +163,8 @@ def add_cli_flags(ap) -> None:
 
 def config_from_args(args) -> PrefillConfig:
     threshold = int(args.prefill_threshold)
-    threshold_exit = getattr(args, "prefill_threshold_exit", None)
     if threshold < 0:
         raise SystemExit("--prefill-threshold must be >= 0")
-    if threshold_exit is not None:
-        threshold_exit = int(threshold_exit)
-        if threshold_exit < 0:
-            raise SystemExit("--prefill-threshold-exit must be >= 0")
-        if threshold_exit > threshold:
-            raise SystemExit("--prefill-threshold-exit must be <= --prefill-threshold")
 
     if args.prefill_compression != "off" and args.prefill_drafter is None:
         raise SystemExit(
@@ -210,7 +177,6 @@ def config_from_args(args) -> PrefillConfig:
     return PrefillConfig(
         mode=args.prefill_compression,
         threshold=threshold,
-        threshold_exit=threshold_exit,
         keep_ratio=args.prefill_keep_ratio,
         drafter_gguf=args.prefill_drafter,
         drafter_tokenizer_id=args.prefill_drafter_tokenizer,

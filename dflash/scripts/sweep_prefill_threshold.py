@@ -94,7 +94,6 @@ def _start_server(
     *,
     port: int,
     threshold: int,
-    threshold_exit: int | None,
     cfg: SweepConfig,
     target: Path,
     draft: Path,
@@ -134,9 +133,6 @@ def _start_server(
         "--prefill-drafter",
         str(drafter),
     ]
-    if threshold_exit is not None:
-        cmd.extend(["--prefill-threshold-exit", str(threshold_exit)])
-
     env = os.environ.copy()
     env["DFLASH_FP_USE_BSA"] = str(cfg.bsa_enabled)
     env["DFLASH_FP_ALPHA"] = str(cfg.alpha)
@@ -162,7 +158,6 @@ def _stop_server(proc: subprocess.Popen) -> None:
 def _run_threshold(
     *,
     threshold: int,
-    threshold_exit: int | None,
     port: int,
     prompts_by_bucket: dict[str, list[str]],
     cfg: SweepConfig,
@@ -176,7 +171,6 @@ def _run_threshold(
     proc = _start_server(
         port=port,
         threshold=threshold,
-        threshold_exit=threshold_exit,
         cfg=cfg,
         target=target,
         draft=draft,
@@ -240,7 +234,6 @@ def _run_threshold(
 
     return {
         "threshold": threshold,
-        "threshold_exit": threshold_exit,
         "policy": policy,
         "bucket_summary": bucket_summary,
         "overall_non_empty_rate": _mean([1.0 if r["non_empty"] else 0.0 for r in all_rows]),
@@ -268,8 +261,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Sweep prefill threshold sweet spot")
     ap.add_argument("--thresholds", type=int, nargs="+",
                     default=[8000, 16000, 24000, 32000, 40000, 48000, 64000])
-    ap.add_argument("--threshold-exit", type=int, default=None,
-                    help="Optional fixed exit threshold for hysteresis during sweep.")
     ap.add_argument("--target", type=Path, default=DEFAULT_TARGET)
     ap.add_argument("--draft", type=Path, default=DEFAULT_DRAFT)
     ap.add_argument("--bin", type=Path, default=DEFAULT_BIN)
@@ -326,7 +317,6 @@ def main() -> int:
         print(f"[sweep] threshold={threshold} port={port}", flush=True)
         res = _run_threshold(
             threshold=threshold,
-            threshold_exit=args.threshold_exit,
             port=port,
             prompts_by_bucket=prompts_by_bucket,
             cfg=cfg,
@@ -350,7 +340,6 @@ def main() -> int:
     output = {
         "config": asdict(cfg),
         "thresholds": args.thresholds,
-        "threshold_exit": args.threshold_exit,
         "winner_threshold": winner["threshold"] if winner else None,
         "winner": winner,
         "results": results,
@@ -370,4 +359,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
