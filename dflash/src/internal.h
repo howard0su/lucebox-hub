@@ -535,7 +535,9 @@ ggml_tensor * build_qwen35_layer(
     bool                  capture,
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
-    int                   q_tail_start = 0);
+    int                   q_tail_start = 0,
+    ggml_tensor *         sfi_gather_idx = nullptr,
+    int                   sfi_gather_len = 0);
 
 } // namespace dflash27b
 

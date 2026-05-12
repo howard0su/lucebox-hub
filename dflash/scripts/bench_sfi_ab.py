@@ -47,10 +47,12 @@ def generate_cases(ctx: int, n: int, tokenizer: str) -> str:
     return path
 
 
-def run_bench(label: str, cases_path: str, args, refresh_interval: int) -> dict:
+def run_bench(label: str, cases_path: str, args, refresh_interval: int,
+              sfi_budget: int = 0) -> dict:
     """Run bench_niah_cpp.py with the given refresh interval and parse output."""
     env = os.environ.copy()
     env["DFLASH27B_FA_REFRESH_INTERVAL"] = str(refresh_interval)
+    env["DFLASH27B_SFI_BUDGET"] = str(sfi_budget)
     env.pop("DFLASH_FP_USE_BSA", None)  # BSA off for 2080 Ti
 
     cmd = [
@@ -158,6 +160,8 @@ def main():
     ap.add_argument("--n", type=int, default=1, help="Number of NIAH cases")
     ap.add_argument("--refresh-interval", type=int, default=4096,
                     help="SFI refresh interval (baseline always uses 0)")
+    ap.add_argument("--sfi-budget", type=int, default=2048,
+                    help="SFI sparse budget (0=disabled for baseline/refresh-only runs)")
     ap.add_argument("--fa-window", type=int, default=4096)
     ap.add_argument("--kv-tq3", type=int, choices=[0, 1], default=1)
     ap.add_argument("--auto-max-ctx", action="store_true", default=True)
@@ -180,14 +184,22 @@ def main():
     print(f"[cases] {cases_path}", flush=True)
 
     try:
-        # Run baseline (no refresh)
-        baseline = run_bench("baseline", cases_path, args, refresh_interval=0)
+        # Run baseline (no refresh, no SFI)
+        baseline = run_bench("baseline", cases_path, args,
+                             refresh_interval=0, sfi_budget=0)
 
-        # Run SFI (with refresh)
-        sfi_result = run_bench("sfi", cases_path, args,
-                               refresh_interval=args.refresh_interval)
+        # Run refresh-only (periodic full attention, no sparse gather)
+        refresh_only = run_bench("refresh-only", cases_path, args,
+                                 refresh_interval=args.refresh_interval,
+                                 sfi_budget=0)
 
-        # Print comparison
+        # Run full SFI (refresh + sparse gather)
+        sfi_result = run_bench("sfi-full", cases_path, args,
+                               refresh_interval=args.refresh_interval,
+                               sfi_budget=args.sfi_budget)
+
+        # Print comparisons
+        print_comparison(baseline, refresh_only, args.ctx)
         print_comparison(baseline, sfi_result, args.ctx)
 
         # Save JSON if requested
@@ -196,9 +208,11 @@ def main():
                 "ctx": args.ctx,
                 "n": args.n,
                 "refresh_interval": args.refresh_interval,
+                "sfi_budget": args.sfi_budget,
                 "fa_window": args.fa_window,
                 "baseline": baseline,
-                "sfi": sfi_result,
+                "refresh_only": refresh_only,
+                "sfi_full": sfi_result,
             }
             with open(args.out_json, "w") as f:
                 json.dump(results, f, indent=2)
