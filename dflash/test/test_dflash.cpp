@@ -4259,7 +4259,13 @@ int main(int argc, char ** argv) {
     // Prefill only needs last-token logits to seed decode. Skip computing
     // the full [vocab, ubatch] lm_head matmul — saves ~233MB scratch at
     // ubatch=384 and eliminates a large matmul per prefill step.
-    int prefill_ubatch_env = (prompt_len_auto > 2048) ? 384 : 16;
+    // Daemon target_prefill batch. The previous (>2048 ? 384 : 16) default was
+    // tuned for raw long prompts; the PFlash compress path hands us 200-2000
+    // already-compressed tokens where ubatch=16 leaves a 2-3x wall-clock win on
+    // the table (measured 12.4s -> 5.2s at 1205 tokens on gfx1151). Bumping
+    // both branches: large prompts already amortise launch overhead, small
+    // prompts (compressed) need a meaningful tile to keep the GPU busy.
+    int prefill_ubatch_env = (prompt_len_auto > 2048) ? 512 : 256;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         prefill_ubatch_env = std::max(1, std::atoi(s));
     }
