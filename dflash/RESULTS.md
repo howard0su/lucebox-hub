@@ -661,3 +661,22 @@ usage at 117K, that trade isn't worth taking. Users on 4090 or 3090
 (24 GB) at this context length should likely keep `--kv-tq3=1`. To go
 further than Q8_0 in either direction set the K/V types explicitly via
 `DFLASH27B_KV_K=<type> DFLASH27B_KV_V=<type>`.
+
+## Threshold sweep runner (auto fast/slow prefill switching)
+
+To tune `--prefill-threshold` after the algorithm refactor, use:
+
+```bash
+python3 dflash/scripts/sweep_prefill_threshold.py \
+  --target /path/to/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft /path/to/draft \
+  --bin /path/to/test_dflash \
+  --prefill-drafter /path/to/Qwen3-0.6B-BF16.gguf \
+  --thresholds 8000 16000 24000 32000 40000 48000 64000 \
+  --out /tmp/sweep_prefill_threshold.json
+```
+
+Winner selection policy:
+1. Pass quality gate (`overall_non_empty_rate >= min_non_empty_rate`).
+2. Minimize long-context mean latency.
+3. Tie-break by long-context throughput (`mean_tokens_per_s`).
