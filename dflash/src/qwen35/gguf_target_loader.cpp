@@ -229,6 +229,11 @@ struct TargetTensorAlloc {
     size_t buffer_offset = 0;
 };
 
+float get_f32_or(const gguf_context * g, const char * key, float fallback) {
+    int64_t id = gguf_find_key(g, key);
+    if (id < 0) return fallback;
+    return gguf_get_val_f32(g, id);
+}
 } // namespace
 
 bool load_target_gguf(const std::string & path,
@@ -288,10 +293,10 @@ bool load_target_gguf_partial(const std::string & path,
     if (n_embd == 0 || n_layer == 0 || n_head == 0 || n_headkv == 0 ||
         kl == 0 || vl == 0 || n_ff == 0 || fai == 0 ||
         ssm_conv == 0 || ssm_inner == 0 || ssm_state == 0 ||
-        ssm_dt == 0 || ssm_grp == 0) {
+        ssm_dt == 0 || ssm_grp == 0 || ssm_inner % ssm_dt != 0) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "missing or zero hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "invalid qwen35 hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
             "kl=%u vl=%u n_ff=%u fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
             n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff, fai,
             ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
@@ -303,12 +308,6 @@ bool load_target_gguf_partial(const std::string & path,
     // Structural invariants required by the graph builder.
     if (kl != vl) {
         set_last_error("key_length != value_length not supported");
-        gguf_free(gctx); return false;
-    }
-    if (ssm_inner % ssm_dt != 0) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "ssm.inner_size=%u not divisible by ssm.time_step_rank=%u", ssm_inner, ssm_dt);
-        set_last_error(buf);
         gguf_free(gctx); return false;
     }
     if (n_layer % fai != 0) {
@@ -392,6 +391,9 @@ bool load_target_gguf_partial(const std::string & path,
     out.ssm_d_state= (int)ssm_state;
     out.ssm_dt_rank= (int)ssm_dt;
     out.ssm_n_group= (int)ssm_grp;
+    out.rope_dimension_count = (int)get_u32_or(gctx, "qwen35.rope.dimension_count", 64);
+    out.rope_theta = get_f32_or(gctx, "qwen35.rope.freq_base", 10000000.0f);
+    out.rms_eps = get_f32_or(gctx, "qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
 
     // EOS token ids from GGUF tokenizer metadata (stored as UINT32 by the
     // GGUF spec; we use the u32 helper and cast). UINT32_MAX is the
@@ -428,6 +430,7 @@ bool load_target_gguf_partial(const std::string & path,
         gguf_free(gctx);
         return false;
     }
+    out.n_vocab = (int)out.tok_embd->ne[1];
 
     for (int il = 0; il < (int)n_layer; il++) {
         char name[128];
@@ -589,11 +592,15 @@ bool load_target_gguf_partial(const std::string & path,
 #else
     out.embedder.mmap_fd        = mm.fd;
 #endif
+    if (out.n_vocab <= 0) {
+        set_last_error("invalid n_vocab in GGUF metadata (token embedder cannot be sized)");
+        return false;
+    }
     out.embedder.tok_embd_bytes = (const uint8_t *)mm.addr + tok_embd_off;
     out.embedder.tok_embd_type  = tok_embd_type;
     out.embedder.n_embd         = out.n_embd;
-    out.embedder.n_vocab        = DFLASH27B_TARGET_VOCAB;
-    out.embedder.row_bytes      = tok_embd_sz / DFLASH27B_TARGET_VOCAB;
+    out.embedder.n_vocab        = out.n_vocab;
+    out.embedder.row_bytes      = tok_embd_sz / (size_t)out.n_vocab;
     mm.release();  // don't munmap on Mmap dtor — now owned by the embedder
 
     // Stash the total for callers that want to print it

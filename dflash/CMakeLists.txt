@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.21)  # 3.21 adds first-class HIP language support (project(LANGUAGES ... HIP))
 set(DFLASH27B_GPU_BACKEND "cuda" CACHE STRING "GPU backend to build: cuda or hip")
 set_property(CACHE DFLASH27B_GPU_BACKEND PROPERTY STRINGS cuda hip)
 string(TOLOWER "${DFLASH27B_GPU_BACKEND}" DFLASH27B_GPU_BACKEND)
@@ -6,7 +6,7 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     set(DFLASH27B_USER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     project(dflash27b LANGUAGES C CXX CUDA)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-    project(dflash27b LANGUAGES C CXX)
+    project(dflash27b LANGUAGES C CXX HIP)
 else()
     message(FATAL_ERROR "DFLASH27B_GPU_BACKEND must be 'cuda' or 'hip', got '${DFLASH27B_GPU_BACKEND}'")
 endif()
@@ -17,9 +17,25 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # If we do not set this, ggml will output to bin and DLLs will not load
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+# ROCm root for HIP builds (rpath + rocwmma header discovery).
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    if(DEFINED ROCM_PATH)
+        set(_dflash27b_rocm_root "${ROCM_PATH}")
+    elseif(DEFINED ENV{ROCM_PATH})
+        set(_dflash27b_rocm_root "$ENV{ROCM_PATH}")
+    elseif(EXISTS "/opt/rocm")
+        set(_dflash27b_rocm_root "/opt/rocm")
+    else()
+        set(_dflash27b_rocm_root "")
+    endif()
+endif()
 # Bake portable rpath into all executables so bundled ggml backend libs / libggml-base
 # are found regardless of LD_LIBRARY_PATH or stale /usr/local/lib (closes #31).
 set(CMAKE_INSTALL_RPATH "$ORIGIN/deps/llama.cpp/ggml/src;$ORIGIN/deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/deps/llama.cpp/ggml/src/ggml-hip;$ORIGIN/../deps/llama.cpp/ggml/src;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-hip")
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND _dflash27b_rocm_root)
+    list(APPEND CMAKE_BUILD_RPATH "${_dflash27b_rocm_root}/lib" "${_dflash27b_rocm_root}/lib64")
+    set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${_dflash27b_rocm_root}/lib;${_dflash27b_rocm_root}/lib64")
+endif()
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -68,10 +84,19 @@ endif()
 option(DFLASH27B_FA_ALL_QUANTS "Compile ggml-cuda fattn kernels for all KV-quant pairs" ON)
 set(GGML_CUDA_FA_ALL_QUANTS ${DFLASH27B_FA_ALL_QUANTS} CACHE BOOL "" FORCE)
 
+# HIP Phase 2 — opt-in rocWMMA flashprefill kernels (Strix Halo / gfx1151).
+# Default OFF (Phase 1 = ggml q8 fallback). Set ON for the 1.7-2.7× compress
+# speedup at 8K-32K context. Requires rocwmma headers installed under
+# ${ROCM_PATH}/include (e.g. `sudo apt install rocwmma`).
+option(DFLASH27B_HIP_SM80_EQUIV
+    "HIP: build the rocWMMA flashprefill kernels (Phase 2). Requires rocwmma."
+    OFF)
+
 # Resolve the CUDA architecture list up-front so downstream logic (notably
 # the consumer-Blackwell ggml workaround below) can inspect the actual arches
-# nvcc will compile for. HIP builds use the portable ggml flash_attn_ext path
-# for the PFlash drafter and set the local CUDA-kernel feature level to 0.
+# nvcc will compile for. HIP builds resolve their own GPU architecture list
+# (defaulting to gfx1151 / Strix Halo) and pass it through to the HIP
+# toolchain and ggml backend.
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     # Turing (75) and Ampere (86) always; Blackwell consumer (120) and Thor
     # (110 on CUDA 13+) added when nvcc supports them. DGX Spark /
@@ -90,6 +115,18 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _dflash27b_archs "121")
         endif()
     endif()
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    # User override precedence: -DDFLASH27B_HIP_ARCHITECTURES → -DAMDGPU_TARGETS
+    # → gfx1151 default (Strix Halo).
+    if(DFLASH27B_HIP_ARCHITECTURES)
+        set(_dflash27b_archs "${DFLASH27B_HIP_ARCHITECTURES}")
+    elseif(AMDGPU_TARGETS)
+        set(_dflash27b_archs "${AMDGPU_TARGETS}")
+    else()
+        set(_dflash27b_archs "gfx1151")
+    endif()
+    # Make sure the HIP language picks up the resolved arch list.
+    set(CMAKE_HIP_ARCHITECTURES "${_dflash27b_archs}" CACHE STRING "" FORCE)
 else()
     set(_dflash27b_archs "")
 endif()
@@ -178,8 +215,6 @@ add_library(dflash27b STATIC
     src/laguna/laguna_daemon.cpp
     src/common/sampler.cpp
 )
-# FlashPrefill custom CUDA kernels need CUDA BF16 WMMA (sm_80+). Other CUDA
-# arches and HIP use ggml's flash_attn_ext instead.
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
 # run the spec-prefill stack or are building without CUDA BF16 WMMA support
@@ -188,10 +223,15 @@ add_library(dflash27b STATIC
 if(NOT DEFINED DFLASH27B_ENABLE_BSA)
     set(DFLASH27B_ENABLE_BSA ON)
 endif()
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA AND NOT DFLASH27B_HIP_SM80_EQUIV)
+    message(STATUS
+        "BSA on HIP is backed by the rocWMMA sparse-FA kernel (Phase 2). "
+        "Build with -DDFLASH27B_HIP_SM80_EQUIV=ON to enable; disabling BSA for this Phase 1 HIP build.")
+    set(DFLASH27B_ENABLE_BSA OFF)
+endif()
 
-# Apply the CUDA arch list to local CUDA sources. HIP builds do not have a CUDA
-# SM level; they use the backend-portable ggml flash_attn_ext path and pass
-# CMAKE_HIP_ARCHITECTURES through to the HIP toolchain/ggml backend.
+# Apply the arch list to local sources. HIP builds pass CMAKE_HIP_ARCHITECTURES
+# through to the HIP toolchain/ggml backend and optionally build rocWMMA kernels.
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_sources(dflash27b PRIVATE src/cuda_cross_device_copy.cpp)
     set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
@@ -201,13 +241,45 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_compile_definitions(dflash27b PRIVATE
         DFLASH27B_BACKEND_CUDA=1
         DFLASH27B_CUDA_MIN_SM=${_dflash27b_cuda_min_sm})
-else()
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    set_target_properties(dflash27b PROPERTIES HIP_ARCHITECTURES "${_dflash27b_archs}")
     target_compile_definitions(dflash27b PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
 endif()
 
-# FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). Other CUDA arches
-# and all HIP builds fall back to ggml's flash_attn_ext (see qwen3_graph.cpp).
-if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80)
+# FlashPrefill custom kernels.
+#   CUDA: BF16 WMMA needs sm_80+; on sm_75 we fall back to ggml flash_attn_ext.
+#   HIP Phase 1 (default): ggml q8 fallback, no custom kernels.
+#   HIP Phase 2 (DFLASH27B_HIP_SM80_EQUIV=ON): rocWMMA-native kernels for the
+#                                              1.7-2.7× compress speedup.
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    if(DFLASH27B_HIP_SM80_EQUIV)
+        find_path(DFLASH27B_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
+            HINTS "${_dflash27b_rocm_root}/include" /opt/rocm/include
+            NO_DEFAULT_PATH)
+        if(NOT DFLASH27B_ROCWMMA_INCLUDE_DIR)
+            message(FATAL_ERROR
+                "DFLASH27B_HIP_SM80_EQUIV=ON but rocwmma/rocwmma.hpp not found. "
+                "Install rocwmma (e.g. `sudo apt install rocwmma` on Debian/Ubuntu, "
+                "or fetch headers from https://github.com/ROCm/rocWMMA), or rebuild "
+                "with -DDFLASH27B_HIP_SM80_EQUIV=OFF (uses the slower q8 fallback).")
+        endif()
+        target_sources(dflash27b PRIVATE
+            src/flashprefill_kernels.hip.cu
+            src/flashprefill_select.cpp
+            src/flashprefill.cpp)
+        set_source_files_properties(src/flashprefill_kernels.hip.cu
+            PROPERTIES LANGUAGE HIP)
+        target_include_directories(dflash27b PRIVATE
+            ${DFLASH27B_ROCWMMA_INCLUDE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+        target_compile_definitions(dflash27b PRIVATE
+            DFLASH27B_HAVE_FLASHPREFILL=1
+            DFLASH27B_CUDA_MIN_SM=80)
+        message(STATUS "dflash: HIP Phase 2 - rocWMMA flashprefill kernels enabled")
+    else()
+        message(STATUS "dflash: HIP Phase 1 - ggml q8 fallback for flashprefill")
+    endif()
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80)
     target_sources(dflash27b PRIVATE
         src/flashprefill_kernels.cu
         src/flashprefill_select.cpp
@@ -234,10 +306,10 @@ if(DFLASH27B_ENABLE_BSA)
         endif()
     endforeach()
 endif()
-# BSA also requires the Block-Sparse-Attention submodule (with bundled cutlass).
+# BSA on CUDA also requires the Block-Sparse-Attention submodule (with bundled cutlass).
 # Existing users who `git pull` without `--recurse-submodules` would otherwise
 # hit a missing-header compile error — auto-disable here with a clear message.
-if(DFLASH27B_ENABLE_BSA AND NOT EXISTS
+if(DFLASH27B_ENABLE_BSA AND DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND NOT EXISTS
    "${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/cutlass/include/cutlass/numeric_types.h")
     message(WARNING
         "DFLASH27B_ENABLE_BSA=ON requested but the Block-Sparse-Attention submodule "
@@ -247,7 +319,13 @@ if(DFLASH27B_ENABLE_BSA AND NOT EXISTS
     set(DFLASH27B_ENABLE_BSA OFF)
 endif()
 if(DFLASH27B_ENABLE_BSA)
-    target_sources(dflash27b PRIVATE src/bsa_fwd_inst.cu src/bsa_launcher.cu)
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+        # HIP BSA: backed by our rocWMMA sparse-FA kernel; no CUTLASS needed.
+        target_sources(dflash27b PRIVATE src/bsa_launcher_hip.cu)
+        set_source_files_properties(src/bsa_launcher_hip.cu PROPERTIES LANGUAGE HIP)
+    else()
+        target_sources(dflash27b PRIVATE src/bsa_fwd_inst.cu src/bsa_launcher.cu)
+    endif()
 endif()
 
 target_include_directories(dflash27b
@@ -261,17 +339,23 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_include_directories(dflash27b PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 if(DFLASH27B_ENABLE_BSA)
-    target_include_directories(dflash27b PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/deps/bsa_stubs
-        ${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/cutlass/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/block_sparse_attn/src)
-    target_compile_options(dflash27b PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-    target_compile_definitions(dflash27b PRIVATE FLASHATTENTION_DISABLE_DROPOUT FLASH_NAMESPACE=flash DFLASH27B_HAVE_BSA=1)
-    # MSVC's <cmath> hides POSIX M_* macros (M_LOG2E etc.) unless _USE_MATH_DEFINES
-    # is set before any cmath include. BSA's softmax.h relies on M_LOG2E; define
-    # globally on the target so it precedes every TU's first <cmath> include.
-    if(WIN32)
-        target_compile_definitions(dflash27b PRIVATE _USE_MATH_DEFINES)
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+        # HIP path: bsa_launcher_hip.cu only needs DFLASH27B_HAVE_BSA + the
+        # hip_compat shim (which the Phase 2 block above already adds).
+        target_compile_definitions(dflash27b PRIVATE DFLASH27B_HAVE_BSA=1)
+    else()
+        target_include_directories(dflash27b PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/bsa_stubs
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/cutlass/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/block_sparse_attn/src)
+        target_compile_options(dflash27b PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+        target_compile_definitions(dflash27b PRIVATE FLASHATTENTION_DISABLE_DROPOUT FLASH_NAMESPACE=flash DFLASH27B_HAVE_BSA=1)
+        # MSVC's <cmath> hides POSIX M_* macros (M_LOG2E etc.) unless _USE_MATH_DEFINES
+        # is set before any cmath include. BSA's softmax.h relies on M_LOG2E; define
+        # globally on the target so it precedes every TU's first <cmath> include.
+        if(WIN32)
+            target_compile_definitions(dflash27b PRIVATE _USE_MATH_DEFINES)
+        endif()
     endif()
 endif()
 
@@ -310,6 +394,7 @@ if(DFLASH27B_TESTS)
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
+        target_include_directories(test_flashprefill_kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash27b CUDA::cudart)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kv_quant.cpp")
