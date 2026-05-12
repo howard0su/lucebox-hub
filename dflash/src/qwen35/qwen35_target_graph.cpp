@@ -33,6 +33,7 @@
 #include "internal.h"
 #include "delta_net_chunked.h"
 #include "kv_quant.h"
+#include "sfi_decode_utils.h"
 
 #include <cmath>
 #include <cstdio>
@@ -433,44 +434,11 @@ static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
     return apply_scale2(ctx, ggml_mul_mat(ctx, L.w_down, gu), L.w_down_s);                  // [hidden, n_tokens]
 }
 
-struct AttnWindowSlice {
-    int win_start;
-    int win_len;
-    int win_len_padded;
-};
-
 static int parse_fa_refresh_interval() {
     const char * raw = std::getenv("DFLASH27B_FA_REFRESH_INTERVAL");
     if (!raw || !*raw) return 0;
     int v = std::atoi(raw);
     return v > 0 ? v : 0;
-}
-
-static AttnWindowSlice resolve_attn_window_slice(
-    int kv_start,
-    int n_tokens,
-    bool allow_slow_refresh,
-    int fa_window,
-    ggml_type kv_k_type,
-    ggml_type kv_v_type
-) {
-    const int refresh_interval = parse_fa_refresh_interval();
-    const bool do_slow_refresh =
-        allow_slow_refresh &&
-        refresh_interval > 0 &&
-        kv_start > 0 &&
-        (kv_start % refresh_interval) == 0;
-    const int effective_window = do_slow_refresh ? 0 : fa_window;
-
-    const int win_start = (effective_window > 0 && kv_start > effective_window)
-                              ? (kv_start - effective_window) : 0;
-    const int kv_len = kv_start + n_tokens;
-    const int win_len = kv_len - win_start;
-
-    const int fattn_stride =
-        (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0) ? 256 : 1;
-    const int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
-    return AttnWindowSlice{win_start, win_len, win_len_padded};
 }
 
 // Full-attention block (matches llama.cpp's build_layer_attn for qwen35)
@@ -609,10 +577,12 @@ static ggml_tensor * build_full_attn_block(
     // When fa_window > 0 and kv_start >= fa_window, only attend to the last
     // fa_window positions. This dramatically reduces FA cost during speculative
     // decode verify/replay at long contexts (60K+ kv entries).
-    const AttnWindowSlice ws = resolve_attn_window_slice(
+    const sfi::AttnWindowSlice ws = sfi::resolve_attn_window_slice(
         kv_start, n_tokens,
         /*allow_slow_refresh=*/attn_mask == nullptr,
-        fa_window, kv_k_type, kv_v_type);
+        fa_window,
+        parse_fa_refresh_interval(),
+        /*uses_256_stride=*/kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0);
 
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
     // When K is rotated (TQ3_0 or explicit FWHT), Q needs forward rotation too.
