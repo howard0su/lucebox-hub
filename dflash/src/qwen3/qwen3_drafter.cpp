@@ -83,7 +83,7 @@ bool prewarm_drafter_once(const Qwen3DrafterWeights & w) {
     std::vector<float> running_max;
 
     auto t0 = std::chrono::steady_clock::now();
-    bool ok = forward_qwen3_0p6b_drafter(w, ids, n_lookahead, running_max);
+    bool ok = forward_qwen3_drafter_model(w, ids, n_lookahead, running_max);
     auto t1 = std::chrono::steady_clock::now();
     if (!ok) {
         return false;
