@@ -360,6 +360,28 @@ int main(int argc, char ** argv) {
     rc |= test_compute_sfi_indices();
     rc |= test_compute_sfi_indices_small_ctx();
 
+    // Test refresh_selector_heuristic
+    {
+        using namespace dflash27b::sfi;
+        std::vector<float> scores;
+        refresh_selector_heuristic(scores, 32768);
+        rc |= check((int)scores.size() == 32768, "heuristic scores size");
+        // All scores should be positive
+        bool all_positive = true;
+        for (float s : scores) { if (s <= 0.0f) { all_positive = false; break; } }
+        rc |= check(all_positive, "heuristic scores all positive");
+        // compute_sfi_indices should work with heuristic scores
+        auto idx = compute_sfi_indices(scores, 32768, 2048);
+        rc |= check((int)idx.size() == 2048, "heuristic → sfi indices == budget");
+        // indices should be sorted
+        bool sorted = std::is_sorted(idx.begin(), idx.end());
+        rc |= check(sorted, "heuristic sfi indices sorted");
+        // All indices in range
+        bool in_range = true;
+        for (int i : idx) { if (i < 0 || i >= 32768) { in_range = false; break; } }
+        rc |= check(in_range, "heuristic sfi indices in range");
+    }
+
     std::printf("%d passed, %d failed\n", n_pass, n_fail);
 
     if (rc != 0) {

@@ -1061,6 +1061,10 @@ QwenGraphOutputs build_qwen35_graph(
     const int hidden = w.n_embd;
     const float eps  = w.rms_eps;
 
+    // SFI sparse gather: use caller-provided index tensor for fast decode steps.
+    ggml_tensor * sfi_idx_tensor = in.sfi_gather_idx;
+    int sfi_gather_len = in.sfi_gather_len;
+
     for (int il = 0; il < w.n_layer; il++) {
         const TargetLayer & L = w.layers[il];
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
@@ -1076,7 +1080,9 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.attn_mask, in.kv_start, n_tokens,
                                         cache.kv_k_type, cache.kv_v_type,
                                         cache.kv_k_rotated,
-                                        in.fa_window);
+                                        in.fa_window,
+                                        nullptr, 0,
+                                        sfi_idx_tensor, sfi_gather_len);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;

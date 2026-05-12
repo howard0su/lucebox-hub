@@ -2,10 +2,18 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
 #include <vector>
 
 namespace dflash27b::sfi {
+
+// Helper: parse an integer environment variable with a default.
+inline int parse_env_int(const char * name, int default_val) {
+    const char * raw = std::getenv(name);
+    if (!raw || !raw[0]) return default_val;
+    return std::atoi(raw);
+}
 
 struct AttnWindowSlice {
     int  win_start;
@@ -144,6 +152,32 @@ inline std::vector<int> compute_sfi_indices(
         scores, kv_len, selected_budget, sink_tokens, recent_tokens);
 
     return merge_sparse_index_sets(kv_len, sink_tokens, recent_tokens, selected);
+}
+
+// Initialize/refresh selector scores with a heuristic (position-based decay).
+// Used as a bootstrap before real attention weights are available.
+// Assigns higher scores to positions that are "landmarks" (evenly spaced)
+// with a slight recency bias, simulating the attention pattern observed in
+// long-context transformers.
+inline void refresh_selector_heuristic(
+    std::vector<float> & scores,
+    int kv_len
+) {
+    scores.resize(kv_len, 0.0f);
+    if (kv_len == 0) return;
+    // Strategy: uniform spacing (every N-th token gets a boost) + recency decay.
+    // This ensures the selected set covers the full context evenly.
+    const float base_score = 0.1f;
+    const float spacing_boost = 0.5f;
+    const int stride = std::max(1, kv_len / 512);  // ~512 landmark positions
+    for (int i = 0; i < kv_len; i++) {
+        float s = base_score;
+        // Spacing landmarks
+        if (i % stride == 0) s += spacing_boost;
+        // Gentle recency bias (linear decay from newest to oldest)
+        s += 0.3f * (float)i / (float)kv_len;
+        scores[i] = s;
+    }
 }
 
 } // namespace dflash27b::sfi

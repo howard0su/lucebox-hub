@@ -43,6 +43,8 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
+#include "qwen35/sfi_decode_utils.h"   // SFI selection helpers
+
 // ggml-cuda dequantize: Q8_0/F16/BF16 → F32. Replaces the custom
 // f16_convert.cu kernels with ggml's built-in converter dispatch.
 // On HIP, device_runtime.h aliases cudaStream_t → hipStream_t, and ggml-hip
@@ -225,6 +227,23 @@ static bool parse_float_list(const char * text, std::vector<double> & out) {
         p = end + 1;
     }
     return !out.empty();
+}
+
+static bool sfi_fill_indices(StepGraph & sg, TargetCache & cache, int kv_start) {
+    if (!sg.sfi_gather_idx || cache.sfi_budget <= 0) return false;
+    if (cache.sfi_selected.empty() || cache.sfi_selected[0].empty()) {
+        if (cache.sfi_selector.empty() || cache.sfi_selector[0].empty()) return false;
+        cache.sfi_selected[0] = sfi::compute_sfi_indices(
+            cache.sfi_selector[0], kv_start, cache.sfi_budget);
+    }
+    const auto & idx = cache.sfi_selected[0];
+    if (idx.empty()) return false;
+    std::vector<int32_t> idx_buf(cache.sfi_budget, (int32_t)idx.back());
+    const int n = std::min((int)idx.size(), cache.sfi_budget);
+    for (int i = 0; i < n; i++) idx_buf[i] = idx[i];
+    ggml_backend_tensor_set(sg.sfi_gather_idx, idx_buf.data(), 0,
+                            sizeof(int32_t) * cache.sfi_budget);
+    return true;
 }
 
 // ─── Draft IPC — extracted to src/qwen35/draft_ipc.{h,cpp} ──
@@ -2331,6 +2350,16 @@ int main(int argc, char ** argv) {
     }
 
     // ── DFlash decode loop
+    if (cache.sfi_budget > 0 && committed > 0) {
+        for (auto & scores : cache.sfi_selector) {
+            sfi::refresh_selector_heuristic(scores, committed);
+        }
+        cache.sfi_selected[0] = sfi::compute_sfi_indices(
+            cache.sfi_selector[0], committed, cache.sfi_budget);
+        std::printf("[sfi] init budget=%d indices=%d committed=%d\n",
+                    cache.sfi_budget, (int)cache.sfi_selected[0].size(), committed);
+    }
+
     int n_draft_steps = 0, n_accept_sum = 0, n_generated = 0;
     std::vector<float>   noise_embed_buf(hidden * q_len);
     std::vector<int32_t> noise_ids(q_len);
@@ -3037,6 +3066,7 @@ int main(int argc, char ** argv) {
                 int p = committed + i;
                 p4_single[0] = p; p4_single[1] = p; p4_single[2] = p; p4_single[3] = 0;
                 ggml_backend_tensor_set(sg.positions, p4_single, 0, sizeof(int32_t) * 4);
+                sfi_fill_indices(sg, cache, committed + i);
 
                 st = ggml_backend_graph_compute(backend, sg.gf);
                 if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "seq verify compute %d at %d\n", (int)st, i); return 1; }
@@ -3289,6 +3319,28 @@ int main(int argc, char ** argv) {
         n_generated  += commit_n;
         n_accept_sum += accept_n;
         n_draft_steps++;
+
+        if (cache.sfi_budget > 0 && committed > 0) {
+            const int refresh_interval = sfi::parse_env_int("DFLASH27B_FA_REFRESH_INTERVAL", 0);
+            const int prev_committed = committed - commit_n;
+            bool crossed = false;
+            if (refresh_interval > 0) {
+                for (int i = 0; i < commit_n; i++) {
+                    const int pos = prev_committed + i;
+                    if (pos > 0 && (pos % refresh_interval) == 0) {
+                        crossed = true;
+                        break;
+                    }
+                }
+            }
+            if (crossed || cache.sfi_selected[0].empty()) {
+                for (auto & scores : cache.sfi_selector) {
+                    sfi::refresh_selector_heuristic(scores, committed);
+                }
+                cache.sfi_selected[0] = sfi::compute_sfi_indices(
+                    cache.sfi_selector[0], committed, cache.sfi_budget);
+            }
+        }
     }
 
     auto t_gen1 = std::chrono::steady_clock::now();
