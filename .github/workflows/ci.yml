@@ -37,12 +37,16 @@ jobs:
         run: pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Build megakernel (sm_75)
+        env:
+          CUDA_HOME: ${{ env.CUDA_PATH }}
         run: |
           cd megakernel
           MEGAKERNEL_CUDA_ARCH=sm_75 python3 setup.py build_ext --inplace
           rm -rf build
 
       - name: Build megakernel (sm_86)
+        env:
+          CUDA_HOME: ${{ env.CUDA_PATH }}
         run: |
           cd megakernel
           MEGAKERNEL_CUDA_ARCH=sm_86 python3 setup.py build_ext --inplace
