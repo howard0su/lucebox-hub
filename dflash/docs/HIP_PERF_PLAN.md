@@ -618,8 +618,22 @@ Vulkan covers RDNA1 → RDNA4 + Intel discrete + Apple integrated in
 **one backend**. Eliminates the entire ROCm version-compatibility
 matrix that PR #156's predecessor work documented. Community data
 on gfx1100 cites **Vulkan +25-30% over ROCm** for Q4_0 decode
-(ggml-org discussion #20934, #21526). For 7900 XTX 27B Q4_K_M AR
-projected: HIP 31 → Vulkan ~39 (+25%) before any DFlash work.
+(ggml-org discussion #20934, #21526).
+
+**Measured 2026-05-11 (post-cycles): vanilla upstream llama.cpp
+Vulkan AR on the same 7900 XTX + Qwen3.6-27B Q4_K_M:**
+
+| Backend | HE 0 tok/s | HE 3 tok/s | Mean tok/s | VRAM used |
+|---|---|---|---|---|
+| HIP (ROCm 7.2.2 + cycle 9 tile) | 30.8 | 31.0 | 30.9 | 23.0 GiB |
+| **Vulkan (RADV NAVI31)** | **37.5** | **39.5** | **38.5** | **16.2 GiB** |
+| **Delta** | **+21.8%** | **+27.4%** | **+24.6%** | **-29.7%** |
+
+Two surprising findings: (a) Vulkan beats HIP **at Q4_K_M too**
+(community had only reported on Q4_0); (b) Vulkan uses **7 GiB less
+VRAM** for the same model (16.2 vs 23.0 GiB) — context and compute
+buffers are dramatically smaller on the Vulkan path, giving real
+headroom for larger context or MTP setups that HIP can't fit.
 
 **Trade-off the user named**: Vulkan loses hipfire-style per-arch
 kernel tuning. Cycle 9's tile override (mmq.cuh edits) is
