@@ -18,7 +18,7 @@ jobs:
         with:
           cuda: '12.8.0'
           method: network
-          sub-packages: '["nvcc", "thrust", "cuda_cudart"]'
+          sub-packages: '["nvcc", "thrust", "cuda-cudart"]'
 
       - name: Configure & build
         run: |
@@ -41,7 +41,7 @@ jobs:
         with:
           cuda: '12.8.0'
           method: network
-          sub-packages: '["nvcc", "thrust", "cuda_cudart"]'
+          sub-packages: '["nvcc", "thrust", "cuda-cudart"]'
           log-file-suffix: '${{ matrix.arch }}.txt'
 
       - uses: actions/setup-python@v5
