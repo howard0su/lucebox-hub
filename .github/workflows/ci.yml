@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-dflash:
+    name: Build dflash (CUDA)
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake g++ git
+
+      - name: Configure & build
+        run: |
+          cd dflash
+          cmake -B build \
+            -DCMAKE_CUDA_ARCHITECTURES="75;86" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+  build-megakernel:
+    name: Build megakernel (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [sm_75, sm_86]
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python & build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 python3-pip g++
+          pip3 install --break-system-packages torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build extension
+        env:
+          MEGAKERNEL_CUDA_ARCH: ${{ matrix.arch }}
+        run: |
+          cd megakernel
+          python3 setup.py build_ext --inplace
