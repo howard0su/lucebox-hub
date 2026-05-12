@@ -17,8 +17,9 @@ jobs:
           apt-get install -y --no-install-recommends cmake g++ git
 
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Init submodules
+        run: git submodule update --init --recursive
 
       - name: Configure & build
         run: |
