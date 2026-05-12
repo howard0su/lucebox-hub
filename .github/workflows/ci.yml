@@ -8,24 +8,28 @@ jobs:
   build-dflash:
     name: Build dflash (CUDA)
     runs-on: ubuntu-latest
-    container:
-      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
-      options: --user root
     steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends cmake g++ git
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Start CUDA container
+        run: |
+          docker run -d --name builder \
+            -v ${{ github.workspace }}:${{ github.workspace }} \
+            -w ${{ github.workspace }} \
+            nvidia/cuda:12.8.0-devel-ubuntu22.04 sleep infinity
+          docker exec builder apt-get update
+          docker exec builder apt-get install -y --no-install-recommends cmake g++
+
       - name: Configure & build
         run: |
-          cd dflash
-          cmake -B build \
-            -DCMAKE_CUDA_ARCHITECTURES="75;86" \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j$(nproc)
+          docker exec builder bash -c "\
+            cd dflash && \
+            cmake -B build \
+              -DCMAKE_CUDA_ARCHITECTURES='75;86' \
+              -DCMAKE_BUILD_TYPE=Release && \
+            cmake --build build -j\$(nproc)"
 
   build-megakernel:
     name: Build megakernel (${{ matrix.arch }})
@@ -33,19 +37,21 @@ jobs:
     strategy:
       matrix:
         arch: [sm_75, sm_86]
-    container:
-      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
-      options: --user root
     steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends python3 python3-pip g++ git
-          pip3 install --break-system-packages torch --extra-index-url https://download.pytorch.org/whl/cpu
       - uses: actions/checkout@v4
-      - name: Build extension
-        env:
-          MEGAKERNEL_CUDA_ARCH: ${{ matrix.arch }}
+
+      - name: Start CUDA container
         run: |
-          cd megakernel
-          python3 setup.py build_ext --inplace
+          docker run -d --name builder \
+            -v ${{ github.workspace }}:${{ github.workspace }} \
+            -w ${{ github.workspace }} \
+            nvidia/cuda:12.8.0-devel-ubuntu22.04 sleep infinity
+          docker exec builder apt-get update
+          docker exec builder apt-get install -y --no-install-recommends python3 python3-pip g++
+          docker exec builder pip3 install --break-system-packages torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build extension
+        run: |
+          docker exec -e MEGAKERNEL_CUDA_ARCH=${{ matrix.arch }} builder bash -c "\
+            cd megakernel && \
+            python3 setup.py build_ext --inplace"
