@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -41,6 +42,7 @@ from _prefill_hook import (
     compress_text_via_daemon, _drain_until_sentinel,
 )
 from prefix_cache import DaemonStdoutBus, PrefixCache
+from tool_memory import ToolMemory
 
 
 class OpenAICompatError(Exception):
@@ -179,6 +181,8 @@ FUNCTION_SIGNATURE_RE = re.compile(
     r"<function=([A-Za-z_][\w.-]*)\((.*?)\)</function>", re.DOTALL)
 TOOL_CODE_RE = re.compile(r"<tool_code>(.*?)</tool_code>", re.DOTALL)
 TOOL_OPEN_TAG = "<tool_call>"
+FUNCTION_OPEN_TAG = "<function="
+TOOL_CODE_OPEN_TAG = "<tool_code>"
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 
@@ -344,13 +348,13 @@ def parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
         if not _tool_allowed(tools, function_name):
             return
         tool_calls.append({
-            "id": "call_" + uuid.uuid4().hex[:24],
-            "type": "function",
-            "function": {
-                "name": function_name,
-                "arguments": json.dumps(args, ensure_ascii=False),
-            },
-        })
+                "id": "call_" + uuid.uuid4().hex[:24],
+                "type": "function",
+                "function": {
+                    "name": function_name,
+                    "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":")),
+                },
+            })
         removals.append((start, end))
 
     def parse_xml_function(function_name: str, params_region: str) -> dict:
@@ -572,6 +576,850 @@ class ResponsesCreateRequest(BaseModel):
     previous_response_id: str | None = None
 
 
+@dataclass(frozen=True)
+class ToolPolicy:
+    prompt_tools: list[Any] | None
+    parse_tools: list[Any] | None
+    choice_kind: str
+    choice_name: str | None = None
+    render_tools: bool = False
+    parse_tool_calls: bool = False
+    bypass_compression: bool = False
+
+
+@dataclass
+class _PartialToolCallSnapshot:
+    name: str
+    arguments: str
+    complete: bool = False
+
+
+@dataclass
+class _TrackedToolCallState:
+    index: int
+    id: str
+    name: str | None = None
+    emitted_arguments: str = ""
+    announced: bool = False
+    done: bool = False
+
+
+@dataclass
+class _SharedStreamState:
+    mode: str
+    holdback: int
+    allow_tools: bool
+    window: str = ""
+    tool_buffer: str = ""
+    raw_text: str = ""
+    visible_text: str = ""
+    stop_hit: bool = False
+    tool_states: list[_TrackedToolCallState] = field(default_factory=list)
+    final_tool_calls: list[dict] = field(default_factory=list)
+
+
+def _trim_stream_raw_suffix(raw_text: str, suffix_len: int, keep_len: int) -> str:
+    trim_len = max(0, suffix_len - keep_len)
+    if trim_len <= 0:
+        return raw_text
+    return raw_text[:-trim_len] if trim_len < len(raw_text) else ""
+
+
+def _tool_name(tool: Any) -> str | None:
+    fn = None
+    if hasattr(tool, "function"):
+        fn = tool.function
+    elif isinstance(tool, dict):
+        fn = tool.get("function")
+    if hasattr(fn, "model_dump"):
+        fn = fn.model_dump()
+    if isinstance(fn, dict):
+        name = fn.get("name")
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _normalize_tool_choice(tool_choice: Any) -> tuple[str, str | None]:
+    if tool_choice is None:
+        return "auto", None
+    if isinstance(tool_choice, str):
+        choice = tool_choice.strip().lower()
+        if choice in {"auto", "none", "required"}:
+            return choice, None
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        if isinstance(choice_type, str):
+            choice_type = choice_type.lower()
+            if choice_type in {"auto", "none", "required"}:
+                return choice_type, None
+        name = tool_choice.get("name")
+        if not isinstance(name, str):
+            fn = tool_choice.get("function")
+            if isinstance(fn, dict):
+                name = fn.get("name")
+        if (choice_type == "function" or "function" in tool_choice or "name" in tool_choice) and isinstance(name, str) and name:
+            return "function", name
+    raise OpenAICompatError(
+        "Unsupported tool_choice value",
+        param="tool_choice",
+    )
+
+
+def _resolve_tool_policy(tools: list[Any] | None, tool_choice: Any) -> ToolPolicy:
+    requested_tools = list(tools or [])
+    has_tools = bool(requested_tools)
+    choice_kind, choice_name = _normalize_tool_choice(tool_choice)
+
+    if choice_kind == "function":
+        if not has_tools:
+            raise OpenAICompatError(
+                "tool_choice=function requires tools",
+                param="tool_choice",
+            )
+        selected = next((t for t in requested_tools if _tool_name(t) == choice_name), None)
+        if selected is None:
+            raise OpenAICompatError(
+                f"tool_choice function '{choice_name}' was not provided in tools",
+                param="tool_choice",
+            )
+        return ToolPolicy(
+            prompt_tools=[selected],
+            parse_tools=requested_tools,
+            choice_kind=choice_kind,
+            choice_name=choice_name,
+            render_tools=True,
+            parse_tool_calls=True,
+            bypass_compression=True,
+        )
+
+    if choice_kind == "required" and not has_tools:
+        raise OpenAICompatError(
+            "tool_choice='required' requires tools",
+            param="tool_choice",
+        )
+
+    if choice_kind == "none":
+        return ToolPolicy(
+            prompt_tools=None,
+            parse_tools=None,
+            choice_kind=choice_kind,
+            render_tools=False,
+            parse_tool_calls=False,
+            bypass_compression=has_tools,
+        )
+
+    if has_tools:
+        return ToolPolicy(
+            prompt_tools=requested_tools,
+            parse_tools=requested_tools,
+            choice_kind=choice_kind,
+            render_tools=True,
+            parse_tool_calls=True,
+            bypass_compression=True,
+        )
+
+    return ToolPolicy(
+        prompt_tools=None,
+        parse_tools=None,
+        choice_kind=choice_kind,
+        render_tools=False,
+        parse_tool_calls=True,
+        bypass_compression=False,
+    )
+
+
+def _parse_generated_tool_calls(text: str, tool_policy: ToolPolicy) -> tuple[str, list[dict]]:
+    if not tool_policy.parse_tool_calls:
+        return text, []
+    return parse_tool_calls(text, tools=tool_policy.parse_tools)
+
+
+def _tool_choice_violation(tool_policy: ToolPolicy, tool_calls: list[dict]) -> OpenAICompatError | None:
+    if tool_policy.choice_kind in {"auto", "none"}:
+        return None
+    if tool_policy.choice_kind == "required":
+        if tool_calls:
+            return None
+        return OpenAICompatError(
+            "tool_choice='required' requires the model to emit a tool call",
+            param="tool_choice",
+        )
+    if tool_policy.choice_kind == "function":
+        disallowed = [
+            tc.get("function", {}).get("name")
+            for tc in tool_calls
+            if tc.get("function", {}).get("name") != tool_policy.choice_name
+        ]
+        disallowed = [name for name in disallowed if isinstance(name, str) and name]
+        if disallowed:
+            leaked = ", ".join(sorted(set(disallowed)))
+            return OpenAICompatError(
+                f"tool_choice function '{tool_policy.choice_name}' does not allow other tool calls ({leaked})",
+                param="tool_choice",
+            )
+        if any(tc.get("function", {}).get("name") == tool_policy.choice_name for tc in tool_calls):
+            return None
+        return OpenAICompatError(
+            f"tool_choice function '{tool_policy.choice_name}' was not satisfied by model output",
+            param="tool_choice",
+        )
+    return None
+
+
+def _tool_param_type(tools, function_name: str, param_name: str) -> str:
+    params = _find_tool_properties(tools, function_name)
+    cfg = params.get(param_name, {}) if isinstance(params, dict) else {}
+    if isinstance(cfg, dict):
+        if isinstance(cfg.get("type"), str):
+            return cfg["type"].strip().lower()
+        if "anyOf" in cfg:
+            return "object"
+    return "string"
+
+
+def _json_string_fragment(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _find_toolish_json_start(text: str, start: int = 0) -> int:
+    """Return the earliest `{` that could begin a supported JSON tool call."""
+    keys = ("name", "function", "arguments")
+    cursor = start
+    while cursor < len(text):
+        brace = text.find("{", cursor)
+        if brace == -1:
+            return -1
+        key_cursor = brace + 1
+        while key_cursor < len(text) and text[key_cursor].isspace():
+            key_cursor += 1
+        if key_cursor >= len(text):
+            return brace
+        if text[key_cursor] != '"':
+            cursor = brace + 1
+            continue
+        key_start = key_cursor + 1
+        key_end = key_start
+        while key_end < len(text) and text[key_end] not in {'"', '\\'}:
+            key_end += 1
+        if key_end >= len(text):
+            fragment = text[key_start:]
+            if any(k.startswith(fragment) for k in keys):
+                return brace
+            cursor = brace + 1
+            continue
+        if text[key_end] == "\\":
+            cursor = brace + 1
+            continue
+        key = text[key_start:key_end]
+        if not any(k.startswith(key) for k in keys):
+            cursor = brace + 1
+            continue
+        colon_cursor = key_end + 1
+        while colon_cursor < len(text) and text[colon_cursor].isspace():
+            colon_cursor += 1
+        if colon_cursor >= len(text) or text[colon_cursor] == ":":
+            return brace
+        cursor = brace + 1
+    return -1
+
+
+def _json_tool_call_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while cursor < len(text):
+        start = text.find("{", cursor)
+        if start == -1:
+            break
+        try:
+            obj, consumed = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            cursor = start + 1
+            continue
+        if _parse_json_tool_call(obj) is not None:
+            spans.append((start, start + consumed))
+        cursor = start + max(consumed, 1)
+    return spans
+
+
+def _build_partial_xml_arguments(text: str, cursor: int, function_name: str, tools) -> tuple[str, bool, int]:
+    param_config = _find_tool_properties(tools, function_name)
+    fragments: list[str] = []
+    complete = False
+
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if text.startswith("</function>", cursor):
+            cursor += len("</function>")
+            complete = True
+            break
+        if text.startswith("</tool_call>", cursor):
+            cursor += len("</tool_call>")
+            continue
+        if not text.startswith("<parameter=", cursor):
+            break
+
+        prefix_len = len(fragments)
+        cursor += len("<parameter=")
+        name_end = text.find(">", cursor)
+        if name_end == -1:
+            break
+        param_name = text[cursor:name_end].strip()
+        cursor = name_end + 1
+
+        end_tag = text.find("</parameter>", cursor)
+        next_param = text.find("<parameter=", cursor)
+        close_fn = text.find("</function>", cursor)
+        candidates = [(pos, kind) for pos, kind in (
+            (end_tag, "parameter"),
+            (next_param, "next_param"),
+            (close_fn, "function"),
+        ) if pos != -1]
+        if candidates:
+            value_end, end_kind = min(candidates, key=lambda item: item[0])
+        else:
+            value_end, end_kind = len(text), "eof"
+        raw_value = text[cursor:value_end]
+        if raw_value.startswith("\n"):
+            raw_value = raw_value[1:]
+        if end_kind == "parameter" and raw_value.endswith("\n"):
+            raw_value = raw_value[:-1]
+
+        if fragments:
+            fragments.append(",")
+        else:
+            fragments.append("{")
+        fragments.append(json.dumps(param_name, ensure_ascii=False))
+        fragments.append(":")
+
+        if _tool_param_type(tools, function_name, param_name) == "string":
+            fragments.append('"')
+            fragments.append(_json_string_fragment(raw_value))
+            if end_kind == "parameter":
+                fragments.append('"')
+                cursor = value_end + len("</parameter>")
+                continue
+            break
+
+        if end_kind == "parameter":
+            value_obj = _convert_param_value(raw_value, param_name, param_config, function_name)
+            fragments.append(json.dumps(value_obj, ensure_ascii=False, separators=(",", ":")))
+            cursor = value_end + len("</parameter>")
+            continue
+
+        del fragments[prefix_len:]
+        break
+
+    if complete:
+        if not fragments:
+            return "{}", True, cursor
+        fragments.append("}")
+    return "".join(fragments), complete, cursor
+
+
+def _partial_tool_call_snapshots(text: str, tools=None) -> list[_PartialToolCallSnapshot]:
+    snapshots: list[_PartialToolCallSnapshot] = []
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while cursor < len(text):
+        hits = [(i, kind) for i, kind in (
+            (text.find(TOOL_OPEN_TAG, cursor), "tool"),
+            (text.find(FUNCTION_OPEN_TAG, cursor), "function"),
+            (text.find(TOOL_CODE_OPEN_TAG, cursor), "tool_code"),
+            (_find_toolish_json_start(text, cursor), "json"),
+        ) if i != -1]
+        if not hits:
+            break
+        start, kind = min(hits, key=lambda item: item[0])
+        cursor = start
+        if kind == "tool_code":
+            close = text.find("</tool_code>", cursor + len(TOOL_CODE_OPEN_TAG))
+            if close == -1:
+                break
+            try:
+                obj = json.loads(text[cursor + len(TOOL_CODE_OPEN_TAG):close].strip())
+            except json.JSONDecodeError:
+                cursor = close + len("</tool_code>")
+                continue
+            parsed = _parse_json_tool_call(obj)
+            if parsed is not None and _tool_allowed(tools, parsed[0]):
+                snapshots.append(_PartialToolCallSnapshot(
+                    name=parsed[0],
+                    arguments=json.dumps(parsed[1], ensure_ascii=False, separators=(",", ":")),
+                    complete=True,
+                ))
+            cursor = close + len("</tool_code>")
+            continue
+        if kind == "json":
+            try:
+                obj, consumed = decoder.raw_decode(text[cursor:])
+            except json.JSONDecodeError:
+                break
+            parsed = _parse_json_tool_call(obj)
+            if parsed is not None and _tool_allowed(tools, parsed[0]):
+                snapshots.append(_PartialToolCallSnapshot(
+                    name=parsed[0],
+                    arguments=json.dumps(parsed[1], ensure_ascii=False, separators=(",", ":")),
+                    complete=True,
+                ))
+            cursor += max(consumed, 1)
+            continue
+        if text.startswith(TOOL_OPEN_TAG, cursor):
+            cursor += len(TOOL_OPEN_TAG)
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+        if not text.startswith("<function=", cursor):
+            cursor = start + 1
+            continue
+
+        fn_cursor = cursor + len("<function=")
+        header_end = text.find(">", fn_cursor)
+        signature_end = text.find("(", fn_cursor)
+        if signature_end != -1 and (header_end == -1 or signature_end < header_end):
+            close = text.find("</function>", signature_end)
+            if close == -1:
+                break
+            _, calls = parse_tool_calls(text[start:close + len("</function>")], tools=tools)
+            if calls:
+                snapshots.append(_PartialToolCallSnapshot(
+                    name=calls[0]["function"]["name"],
+                    arguments=calls[0]["function"]["arguments"],
+                    complete=True,
+                ))
+            cursor = close + len("</function>")
+            continue
+        if header_end == -1:
+            break
+
+        function_name = text[fn_cursor:header_end].strip()
+        if not function_name:
+            cursor = start + 1
+            continue
+        if not _tool_allowed(tools, function_name):
+            close = text.find("</function>", header_end + 1)
+            cursor = close + len("</function>") if close != -1 else header_end + 1
+            continue
+
+        arguments, complete, body_end = _build_partial_xml_arguments(
+            text, header_end + 1, function_name, tools)
+        snapshots.append(_PartialToolCallSnapshot(
+            name=function_name,
+            arguments=arguments,
+            complete=complete,
+        ))
+        cursor = max(body_end, header_end + 1)
+        if not complete:
+            break
+        tool_close = text.find("</tool_call>", cursor)
+        if tool_close != -1:
+            cursor = max(cursor, tool_close + len("</tool_call>"))
+    return snapshots
+
+
+def _complete_tool_buffer_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for match in TOOL_CALL_COMPLETE_RE.finditer(text):
+        spans.append((match.start(), match.end()))
+    for pattern in (BARE_FUNCTION_XML_RE, FUNCTION_SIGNATURE_RE):
+        for match in pattern.finditer(text):
+            if any(lo <= match.start() < hi for lo, hi in spans):
+                continue
+            spans.append((match.start(), match.end()))
+    for match in TOOL_CODE_RE.finditer(text):
+        try:
+            obj = json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            continue
+        if _parse_json_tool_call(obj) is None:
+            continue
+        if any(lo <= match.start() < hi for lo, hi in spans):
+            continue
+        spans.append((match.start(), match.end()))
+    for start, end in _json_tool_call_spans(text):
+        if any(lo <= start < hi for lo, hi in spans):
+            continue
+        spans.append((start, end))
+    spans.sort()
+    return spans
+
+
+def _first_tool_buffer_stop_match(text: str, stops: list[str]) -> int:
+    spans = _complete_tool_buffer_spans(text)
+    if not spans:
+        return -1
+
+    def stop_in_gap(start: int, end: int) -> int:
+        json_open = _find_toolish_json_start(text[start:end])
+        if json_open != -1:
+            json_open += start
+        next_open = min(
+            (pos for pos in (
+                text.find(TOOL_OPEN_TAG, start, end),
+                text.find(FUNCTION_OPEN_TAG, start, end),
+                text.find(TOOL_CODE_OPEN_TAG, start, end),
+                json_open,
+            ) if pos != -1),
+            default=-1,
+        )
+        if next_open != -1:
+            end = next_open
+        if start >= end:
+            return -1
+        gap_index = first_stop_match(text[start:end], stops)
+        return start + gap_index if gap_index != -1 else -1
+
+    cursor = 0
+    for start, end in spans:
+        stop_index = stop_in_gap(cursor, start)
+        if stop_index != -1:
+            return stop_index
+        cursor = max(cursor, end)
+    return stop_in_gap(cursor, len(text))
+
+
+def _sync_partial_tool_stream(tool_buffer: str, tools, states: list[_TrackedToolCallState]) -> list[dict]:
+    events: list[dict] = []
+    for index, snapshot in enumerate(_partial_tool_call_snapshots(tool_buffer, tools=tools)):
+        while len(states) <= index:
+            states.append(_TrackedToolCallState(
+                index=len(states),
+                id="call_" + uuid.uuid4().hex[:24],
+            ))
+        state = states[index]
+        if snapshot.name and state.name is None:
+            state.name = snapshot.name
+        if state.name and not state.announced:
+            state.announced = True
+            events.append({
+                "kind": "tool_start",
+                "index": index,
+                "id": state.id,
+                "name": state.name,
+            })
+        if snapshot.arguments:
+            fragment = snapshot.arguments
+            if snapshot.arguments.startswith(state.emitted_arguments):
+                fragment = snapshot.arguments[len(state.emitted_arguments):]
+            if fragment:
+                state.emitted_arguments = snapshot.arguments
+                events.append({
+                    "kind": "tool_args",
+                    "index": index,
+                    "id": state.id,
+                    "name": state.name,
+                    "arguments": fragment,
+                })
+        if snapshot.complete and not state.done:
+            state.done = True
+            events.append({
+                "kind": "tool_done",
+                "index": index,
+                "id": state.id,
+                "name": state.name,
+                "arguments": snapshot.arguments or "{}",
+            })
+    return events
+
+
+def _reconcile_final_tool_events(tool_calls: list[dict], states: list[_TrackedToolCallState]) -> list[dict]:
+    events: list[dict] = []
+    for index, tc in enumerate(tool_calls):
+        while len(states) <= index:
+            states.append(_TrackedToolCallState(
+                index=len(states),
+                id="call_" + uuid.uuid4().hex[:24],
+            ))
+        state = states[index]
+        state.name = tc["function"]["name"]
+        tc["id"] = state.id
+        if not state.announced:
+            state.announced = True
+            events.append({
+                "kind": "tool_start",
+                "index": index,
+                "id": state.id,
+                "name": state.name,
+            })
+        final_args = tc["function"]["arguments"]
+        fragment = final_args
+        if final_args.startswith(state.emitted_arguments):
+            fragment = final_args[len(state.emitted_arguments):]
+        if fragment:
+            state.emitted_arguments = final_args
+            events.append({
+                "kind": "tool_args",
+                "index": index,
+                "id": state.id,
+                "name": state.name,
+                "arguments": fragment,
+            })
+        if not state.done:
+            state.done = True
+            events.append({
+                "kind": "tool_done",
+                "index": index,
+                "id": state.id,
+                "name": state.name,
+                "arguments": final_args,
+            })
+    return events
+
+
+def _finalize_tool_buffer_stream(
+    state: _SharedStreamState,
+    tool_policy: ToolPolicy,
+) -> tuple[list[dict], list[dict]]:
+    events: list[dict] = []
+    tool_calls: list[dict] = []
+    cleaned_after, tool_calls = _parse_generated_tool_calls(state.tool_buffer, tool_policy)
+    if tool_calls:
+        events.extend(_reconcile_final_tool_events(tool_calls, state.tool_states))
+        if cleaned_after:
+            state.visible_text += cleaned_after
+            events.append({"kind": "content", "text": cleaned_after})
+    elif state.tool_buffer:
+        state.visible_text += state.tool_buffer
+        events.append({"kind": "content", "text": state.tool_buffer})
+    state.final_tool_calls = tool_calls
+    state.tool_buffer = ""
+    state.mode = "content"
+    return events, tool_calls
+
+
+def _make_shared_stream_state(started_in_thinking: bool, stops: list[str], tool_policy: ToolPolicy) -> _SharedStreamState:
+    tag_holdback = max(
+        len(THINK_OPEN_TAG),
+        len(THINK_CLOSE_TAG),
+        len(TOOL_OPEN_TAG) if tool_policy.parse_tool_calls else 0,
+        len(FUNCTION_OPEN_TAG) if tool_policy.parse_tool_calls else 0,
+        len(TOOL_CODE_OPEN_TAG) if tool_policy.parse_tool_calls else 0,
+    )
+    stop_holdback = max((len(s) for s in stops), default=0)
+    return _SharedStreamState(
+        mode="reasoning" if started_in_thinking else "content",
+        holdback=max(tag_holdback, stop_holdback),
+        allow_tools=tool_policy.parse_tool_calls,
+    )
+
+
+def _feed_shared_stream_piece(
+    state: _SharedStreamState,
+    piece: str,
+    *,
+    stops: list[str],
+    tool_policy: ToolPolicy,
+) -> list[dict]:
+    events: list[dict] = []
+    state.raw_text += piece
+    state.window += piece
+
+    if stops:
+        if state.mode == "tool_buffer":
+            combined = state.tool_buffer + state.window
+            stop_index = _first_tool_buffer_stop_match(combined, stops)
+            if stop_index != -1:
+                state.raw_text = _trim_stream_raw_suffix(
+                    state.raw_text, len(combined), stop_index)
+                state.tool_buffer = combined[:stop_index]
+                state.window = ""
+                state.stop_hit = True
+        else:
+            window_len = len(state.window)
+            stop_index = first_stop_match(state.window, stops)
+            if stop_index != -1:
+                state.raw_text = _trim_stream_raw_suffix(
+                    state.raw_text, window_len, stop_index)
+                state.window = state.window[:stop_index]
+                state.stop_hit = True
+
+    while True:
+        if state.mode == "tool_buffer":
+            state.tool_buffer += state.window
+            state.window = ""
+            events.extend(_sync_partial_tool_stream(
+                state.tool_buffer, tool_policy.parse_tools, state.tool_states))
+            if state.stop_hit:
+                finalized_events, _ = _finalize_tool_buffer_stream(state, tool_policy)
+                events.extend(finalized_events)
+            break
+
+        if state.mode == "reasoning":
+            idx = state.window.find(THINK_CLOSE_TAG)
+            if idx != -1:
+                pre = state.window[:idx]
+                if pre:
+                    events.append({"kind": "reasoning", "text": pre})
+                state.window = state.window[idx + len(THINK_CLOSE_TAG):]
+                state.mode = "content"
+                continue
+            if len(state.window) > state.holdback or (state.stop_hit and state.window):
+                safe = state.window if state.stop_hit else state.window[:-state.holdback]
+                if safe:
+                    events.append({"kind": "reasoning", "text": safe})
+                state.window = "" if state.stop_hit else state.window[-state.holdback:]
+            break
+
+        think_idx = state.window.find(THINK_OPEN_TAG)
+        think_close_idx = state.window.find(THINK_CLOSE_TAG)
+        tool_idx = state.window.find(TOOL_OPEN_TAG) if state.allow_tools else -1
+        bare_fn_idx = state.window.find(FUNCTION_OPEN_TAG) if state.allow_tools else -1
+        tool_code_idx = state.window.find(TOOL_CODE_OPEN_TAG) if state.allow_tools else -1
+        json_tool_idx = _find_toolish_json_start(state.window) if state.allow_tools else -1
+        hits = [(i, t) for i, t in (
+            (think_idx, "think"),
+            (think_close_idx, "think_close"),
+            (tool_idx, "tool"),
+            (bare_fn_idx, "tool"),
+            (tool_code_idx, "tool"),
+            (json_tool_idx, "tool"),
+        ) if i != -1]
+        if hits:
+            hits.sort()
+            idx, which = hits[0]
+            pre = state.window[:idx]
+            if pre:
+                state.visible_text += pre
+                events.append({"kind": "content", "text": pre})
+            if which == "think":
+                state.window = state.window[idx + len(THINK_OPEN_TAG):]
+                state.mode = "reasoning"
+            elif which == "think_close":
+                state.window = state.window[idx + len(THINK_CLOSE_TAG):]
+            else:
+                state.tool_buffer += state.window[idx:]
+                state.window = ""
+                state.mode = "tool_buffer"
+                events.extend(_sync_partial_tool_stream(
+                    state.tool_buffer, tool_policy.parse_tools, state.tool_states))
+                if state.stop_hit:
+                    finalized_events, _ = _finalize_tool_buffer_stream(state, tool_policy)
+                    events.extend(finalized_events)
+            continue
+        if len(state.window) > state.holdback or (state.stop_hit and state.window):
+            safe = state.window if state.stop_hit else state.window[:-state.holdback]
+            if safe:
+                state.visible_text += safe
+                events.append({"kind": "content", "text": safe})
+            state.window = "" if state.stop_hit else state.window[-state.holdback:]
+        break
+    return events
+
+
+def _flush_shared_stream(
+    state: _SharedStreamState,
+    *,
+    tool_policy: ToolPolicy,
+) -> tuple[list[dict], list[dict]]:
+    events: list[dict] = []
+    tool_calls: list[dict] = []
+
+    if state.mode == "reasoning" and state.window:
+        events.append({"kind": "reasoning", "text": state.window})
+    elif state.mode == "content" and state.window:
+        state.visible_text += state.window
+        events.append({"kind": "content", "text": state.window})
+    elif state.mode == "tool_buffer":
+        state.tool_buffer += state.window
+        events.extend(_sync_partial_tool_stream(
+            state.tool_buffer, tool_policy.parse_tools, state.tool_states))
+    state.window = ""
+
+    if state.mode == "tool_buffer":
+        finalized_events, tool_calls = _finalize_tool_buffer_stream(state, tool_policy)
+        events.extend(finalized_events)
+
+    return events, tool_calls
+
+
+def _parse_responses_non_stream_output(
+    text: str,
+    tool_policy: ToolPolicy,
+    msg_item_id: str,
+    *,
+    started_in_thinking: bool,
+) -> tuple[str, list[dict], list[tuple[str, str]]]:
+    state = _make_shared_stream_state(started_in_thinking, [], tool_policy)
+    output_order: list[tuple[str, str]] = []
+    message_announced = False
+
+    def record_output_order(events: list[dict]) -> None:
+        nonlocal message_announced
+        for event in events:
+            if event["kind"] == "content":
+                if not message_announced:
+                    output_order.append(("message", msg_item_id))
+                    message_announced = True
+                continue
+            if event["kind"] == "tool_start":
+                output_order.append(("function_call", event["id"]))
+
+    stream_events = _feed_shared_stream_piece(
+        state, text, stops=[], tool_policy=tool_policy)
+    record_output_order(stream_events)
+    flush_events, tool_calls = _flush_shared_stream(state, tool_policy=tool_policy)
+    record_output_order(flush_events)
+    return state.visible_text.strip(), tool_calls, output_order
+
+
+def _responses_message_item(msg_item_id: str, text: str, *, status: str = "completed") -> dict:
+    return {
+        "type": "message",
+        "id": msg_item_id,
+        "status": status,
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+
+
+def _responses_function_call_item(tc: dict, *, status: str = "completed") -> dict:
+    return {
+        "type": "function_call",
+        "id": tc["id"],
+        "status": status,
+        "call_id": tc["id"],
+        "name": tc["function"]["name"],
+        "arguments": tc["function"]["arguments"],
+    }
+
+
+def _build_responses_output(
+    cleaned_text: str,
+    tool_calls: list[dict],
+    msg_item_id: str,
+    *,
+    output_order: list[tuple[str, str]] | None = None,
+) -> list[dict]:
+    items: dict[tuple[str, str], dict] = {}
+    if cleaned_text or not tool_calls:
+        items[("message", msg_item_id)] = _responses_message_item(msg_item_id, cleaned_text)
+    for tc in tool_calls:
+        items[("function_call", tc["id"])] = _responses_function_call_item(tc)
+
+    if not output_order:
+        output: list[dict] = []
+        if ("message", msg_item_id) in items:
+            output.append(items.pop(("message", msg_item_id)))
+        for tc in tool_calls:
+            item = items.pop(("function_call", tc["id"]), None)
+            if item is not None:
+                output.append(item)
+        return output
+
+    output = []
+    seen: set[tuple[str, str]] = set()
+    for key in output_order:
+        item = items.get(key)
+        if item is not None and key not in seen:
+            output.append(item)
+            seen.add(key)
+    for key, item in items.items():
+        if key not in seen:
+            output.append(item)
+    return output
+
+
 def _samp_suffix(req) -> str:
     # Render ` samp=temp,top_p,top_k,rep_pen[,seed]` tail when the request asks for
     # non-greedy decoding. Empty string keeps the daemon protocol greedy-compatible.
@@ -696,7 +1544,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         cap=prefix_cache_slots,
     )
     if prefill_cfg is not None and prefill_cache_slots > 0:
-        prefix_cache.init_full_cache(prefill_cache_slots, budget_bytes=prefill_cache_bytes)
+        prefix_cache.init_full_cache(prefill_cache_slots)
+    tool_memory = ToolMemory(
+        max_entries=int(os.environ.get("DFLASH_TOOL_MEMORY_MAX_ENTRIES", "50000")),
+        max_bytes=int(os.environ.get("DFLASH_TOOL_MEMORY_MAX_BYTES", str(64 * 1024 * 1024))),
+    )
+
+    def _remember_tool_call_text(raw_text: str, tool_calls: list[dict] | None) -> None:
+        if not raw_text or not tool_calls:
+            return
+        call_ids = [
+            tc.get("id")
+            for tc in tool_calls
+            if isinstance(tc, dict) and isinstance(tc.get("id"), str) and tc.get("id")
+        ]
+        if call_ids:
+            tool_memory.remember(call_ids, raw_text)
 
     @app.on_event("startup")
     async def _startup():
@@ -796,18 +1659,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 param="messages")
         return _ids_to_bin(ids), ids, prompt
 
-    def _tokenize_prompt(req: ChatRequest) -> tuple[Path, list[int], list[dict], bool]:
+    def _tokenize_prompt(req: ChatRequest, tool_policy: ToolPolicy) -> tuple[Path, list[int], list[dict], bool]:
         """Returns (bin, ids, raw_msgs, started_in_thinking)."""
         msgs: list[dict] = []
         for m in req.messages:
             d: dict = {"role": m.role}
-            if m.content is not None:
+            replay_raw_text = None
+            if m.role == "assistant" and m.tool_calls is not None:
+                replay_raw_text = tool_memory.lookup_message(m.tool_calls)
+            if replay_raw_text is not None:
+                d["content"] = replay_raw_text
+            elif m.content is not None:
                 d["content"] = _content_to_str(m.content)
             if m.name is not None:
                 d["name"] = m.name
             if m.tool_call_id is not None:
                 d["tool_call_id"] = m.tool_call_id
-            if m.tool_calls is not None:
+            if m.tool_calls is not None and replay_raw_text is None:
                 d["tool_calls"] = []
                 for tc in m.tool_calls:
                     args = tc.function.arguments
@@ -823,16 +1691,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             msgs.append(d)
 
         tools_arg = None
-        if req.tools:
-            tools_arg = [t.model_dump() for t in req.tools]
+        if tool_policy.render_tools and tool_policy.prompt_tools:
+            tools_arg = [
+                t.model_dump() if hasattr(t, "model_dump") else t
+                for t in tool_policy.prompt_tools
+            ]
 
         path, ids, _prompt = _render_messages(msgs, req.chat_template_kwargs, tools_arg)
         started_in_thinking = bool(re.search(r"<think>\s*$", _prompt))
         return path, ids, msgs, started_in_thinking
 
     def _maybe_compress(msgs: list[dict], prompt_bin: Path, prompt_ids: list[int],
-                        template_kwargs: dict | None = None
+                        template_kwargs: dict | None = None,
+                        *,
+                        bypass: bool = False,
                         ) -> tuple[Path, list[int]]:
+        if bypass:
+            return prompt_bin, prompt_ids
         if not prefill_cfg or not prefill_cfg.enabled:
             return prompt_bin, prompt_ids
         if not prefill_cfg.should_compress(len(prompt_ids)):
@@ -900,6 +1775,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: list(_token_stream(r, n_gen, timing)))
 
+    async def _adrain_until_sentinel(r, timing=None) -> None:
+        if timing is not None and timing.get("daemon_done"):
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _drain_until_sentinel, r)
+        if timing is not None:
+            timing["daemon_done"] = True
+            timing["t_last_tok"] = time.monotonic()
+
     async def _astream_tokens(r, n_gen, timing=None):
         generated = 0
         hit_stop = False
@@ -944,16 +1828,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     sz = bin_path.stat().st_size
                     if sz == 0:
                         log.warning("prompt .bin is 0 bytes: %s", bin_path)
-        if lazy_draft:
-            log.debug("lazy-draft: unpark draft before generate")
-            t = time.monotonic()
-            daemon_proc.stdin.write(b"unpark draft\n")
+        try:
+            if lazy_draft:
+                log.debug("lazy-draft: unpark draft before generate")
+                t = time.monotonic()
+                daemon_proc.stdin.write(b"unpark draft\n")
+                daemon_proc.stdin.flush()
+                _drain_until_sentinel(r_pipe)
+                if timing is not None:
+                    timing["unpark"] = time.monotonic() - t
+            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
-            _drain_until_sentinel(r_pipe)
-            if timing is not None:
-                timing["unpark"] = time.monotonic() - t
-        daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-        daemon_proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise RuntimeError(f"failed to send command to dflash daemon: {exc}") from exc
         if timing is not None:
             timing["t_cmd_sent"] = time.monotonic()
 
@@ -1048,8 +1935,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
             return cmd_line + _samp_suffix(req) + "\n", snap_prep
 
+    def _abort_reserved_snap(full_snap_prep, snap_prep):
+        if full_snap_prep is not None:
+            fslot, _ = full_snap_prep
+            prefix_cache.abort_full_snap(fslot)
+        elif snap_prep:
+            prefix_cache.abort_inline_snap(snap_prep[0])
+
     def _confirm_or_abort_snap(n_tokens: int, full_snap_prep, snap_prep,
-                                  prompt_ids, cur_bin, cur_ids):
+                               prompt_ids, cur_bin, cur_ids):
         """Confirm prefix-cache snapshots only when the daemon actually
         generated tokens.  When the daemon returns 0 tokens (e.g. empty
         prompt / file read failure), confirming would register a snapshot
@@ -1063,11 +1957,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
         else:
             # Abort: release the reservation without registering.
-            if full_snap_prep is not None:
-                fslot, _ = full_snap_prep
-                prefix_cache.abort_full_snap(fslot)
-            elif snap_prep:
-                prefix_cache.abort_inline_snap(snap_prep[0])
+            _abort_reserved_snap(full_snap_prep, snap_prep)
             log.warning("0 output tokens — aborted snapshot reservation")
 
     def _gen_len_for(prompt_len: int, max_tokens: int) -> int:
@@ -1077,7 +1967,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
-        prompt_bin, prompt_ids, raw_msgs, started_in_thinking = _tokenize_prompt(req)
+        tool_policy = _resolve_tool_policy(req.tools, req.tool_choice)
+        prompt_bin, prompt_ids, raw_msgs, started_in_thinking = _tokenize_prompt(req, tool_policy)
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         prompt_len = len(prompt_ids)
@@ -1096,18 +1987,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
-                nonlocal started_in_thinking
+                nonlocal started_in_thinking, prompt_len
                 async with daemon_lock:
                     timing = {}
                     full_snap_prep_ref = [None]
                     snap_prep = None
+                    cur_bin = prompt_bin
+                    cur_ids = prompt_ids
 
-                    full_hit = prefix_cache.lookup_full(prompt_ids)
+                    full_hit = None if tool_policy.bypass_compression else prefix_cache.lookup_full(prompt_ids)
                     if full_hit is not None:
                         slot, cached_cur_bin, cached_cur_ids_len = full_hit
                         cur_bin = Path(cached_cur_bin)
                         prompt_len = cached_cur_ids_len
-                        started_in_thinking = False  # cached: no think prefill
                         gen_len = _gen_len_for(prompt_len, req.max_tokens)
                         if gen_len <= 0:
                             try: prompt_bin.unlink()
@@ -1124,7 +2016,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         t_compress = time.monotonic()
                         cur_bin, cur_ids = await asyncio.to_thread(
                             _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
-                            req.chat_template_kwargs)
+                            req.chat_template_kwargs,
+                            bypass=tool_policy.bypass_compression)
                         timing["compress"] = time.monotonic() - t_compress
                         prompt_len = len(cur_ids)
                         gen_len = _gen_len_for(prompt_len, req.max_tokens)
@@ -1147,6 +2040,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     try:
                         _write_cmd(cmd_line, timing)
                     except RuntimeError as e:
+                        _abort_reserved_snap(full_snap_prep_ref[0], snap_prep)
                         yield f"data: {json.dumps({'error': str(e)})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
@@ -1159,8 +2053,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                      "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(head)}\n\n"
-                    window, mode = "", ("reasoning" if started_in_thinking else "content")
-
                     include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
 
                     def chunk(delta_obj, finish=None):
@@ -1169,94 +2061,91 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 "choices": [{"index": 0, "delta": delta_obj,
                                               "finish_reason": finish}]}
 
-                    # State machine: mode ∈ {'reasoning', 'content', 'tool_buffer'}
-                    mode = "reasoning" if started_in_thinking else "content"
-                    window = ""
-                    tool_buffer = ""
-                    stops = normalize_stop(req.stop)
-                    tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
-                    stop_holdback = max((len(s) for s in stops), default=0)
-                    HOLDBACK = max(tag_holdback, stop_holdback)
-                    completion_tokens = 0
-                    stop_hit = False
+                    def tool_chunk(index: int, *, call_id: str | None = None,
+                                   name: str | None = None,
+                                   arguments: str | None = None) -> str:
+                        tc: dict[str, Any] = {"index": index}
+                        if call_id is not None:
+                            tc["id"] = call_id
+                            tc["type"] = "function"
+                        fn: dict[str, Any] = {}
+                        if name is not None:
+                            fn["name"] = name
+                        if arguments is not None:
+                            fn["arguments"] = arguments
+                        if fn:
+                            tc["function"] = fn
+                        return f"data: {json.dumps(chunk({'tool_calls': [tc]}))}\n\n"
 
-                    def emit_delta(text, kind):
-                        if not text:
-                            return None
-                        return f"data: {json.dumps(chunk({kind: text}))}\n\n"
+                    stops = normalize_stop(req.stop)
+                    stream_state = _make_shared_stream_state(started_in_thinking, stops, tool_policy)
+                    completion_tokens = 0
+                    finish_reason = "stop"
+                    tool_calls: list[dict] = []
 
                     try:
                         async for tok_id in _astream_tokens(r_pipe, gen_len, timing):
                             completion_tokens += 1
                             piece = tokenizer.decode([tok_id])
-                            window += piece
+                            for event in _feed_shared_stream_piece(
+                                    stream_state, piece, stops=stops, tool_policy=tool_policy):
+                                if event["kind"] == "content":
+                                    yield f"data: {json.dumps(chunk({'content': event['text']}))}\n\n"
+                                elif event["kind"] == "reasoning":
+                                    yield f"data: {json.dumps(chunk({'reasoning_content': event['text']}))}\n\n"
+                                elif event["kind"] == "tool_start":
+                                    yield tool_chunk(
+                                        event["index"],
+                                        call_id=event["id"],
+                                        name=event["name"],
+                                    )
+                                elif event["kind"] == "tool_args":
+                                    yield tool_chunk(
+                                        event["index"],
+                                        arguments=event["arguments"],
+                                    )
+                            if stream_state.stop_hit:
+                                break
 
-                            if stops and mode != "tool_buffer":
-                                si = first_stop_match(window, stops)
-                                if si != -1:
-                                    window = window[:si]
-                                    stop_hit = True
-                                    kind = "reasoning_content" if mode == "reasoning" else "content"
-                                    out = emit_delta(window, kind)
-                                    if out: yield out
-                                    window = ""
-                                    break
-
-                            while True:
-                                if mode == "tool_buffer":
-                                    tool_buffer += window
-                                    window = ""
-                                    break
-
-                                if mode == "reasoning":
-                                    idx = window.find(THINK_CLOSE_TAG)
-                                    if idx != -1:
-                                        pre = window[:idx]
-                                        out = emit_delta(pre, "reasoning_content")
-                                        if out: yield out
-                                        window = window[idx + len(THINK_CLOSE_TAG):]
-                                        mode = "content"
-                                        continue
-                                    if len(window) > HOLDBACK:
-                                        safe = window[:-HOLDBACK]
-                                        out = emit_delta(safe, "reasoning_content")
-                                        if out: yield out
-                                        window = window[-HOLDBACK:]
-                                    break
-
-                                else:  # mode == "content"
-                                    think_idx = window.find(THINK_OPEN_TAG)
-                                    think_close_idx = window.find(THINK_CLOSE_TAG)
-                                    tool_idx  = window.find(TOOL_OPEN_TAG)
-                                    hits = [(i, t) for i, t in
-                                            ((think_idx, "think"),
-                                             (think_close_idx, "think_close"),
-                                             (tool_idx, "tool")) if i != -1]
-                                    if hits:
-                                        hits.sort()
-                                        idx, which = hits[0]
-                                        pre = window[:idx]
-                                        out = emit_delta(pre, "content")
-                                        if out: yield out
-                                        if which == "think":
-                                            window = window[idx + len(THINK_OPEN_TAG):]
-                                            mode = "reasoning"
-                                        elif which == "think_close":
-                                            window = window[idx + len(THINK_CLOSE_TAG):]
-                                        else:
-                                            tool_buffer = window[idx:]
-                                            window = ""
-                                            mode = "tool_buffer"
-                                        continue
-                                    if len(window) > HOLDBACK:
-                                        safe = window[:-HOLDBACK]
-                                        out = emit_delta(safe, "content")
-                                        if out: yield out
-                                        window = window[-HOLDBACK:]
-                                    break
-
-                        if stop_hit:
-                            finish_reason = "stop"
+                        if stream_state.stop_hit:
+                            if not timing.get("daemon_done"):
+                                await _adrain_until_sentinel(r_pipe, timing)
+                            stream_events, tool_calls = _flush_shared_stream(
+                                stream_state, tool_policy=tool_policy)
+                            if not tool_calls and stream_state.final_tool_calls:
+                                tool_calls = list(stream_state.final_tool_calls)
+                            for event in stream_events:
+                                if event["kind"] == "content":
+                                    yield f"data: {json.dumps(chunk({'content': event['text']}))}\n\n"
+                                elif event["kind"] == "reasoning":
+                                    yield f"data: {json.dumps(chunk({'reasoning_content': event['text']}))}\n\n"
+                                elif event["kind"] == "tool_start":
+                                    yield tool_chunk(
+                                        event["index"],
+                                        call_id=event["id"],
+                                        name=event["name"],
+                                    )
+                                elif event["kind"] == "tool_args":
+                                    yield tool_chunk(
+                                        event["index"],
+                                        arguments=event["arguments"],
+                                    )
+                            tool_choice_error = _tool_choice_violation(tool_policy, tool_calls)
+                            if tool_choice_error is not None:
+                                err = {"error": {
+                                    "message": tool_choice_error.message,
+                                    "type": tool_choice_error.error_type,
+                                }}
+                                if tool_choice_error.param is not None:
+                                    err["error"]["param"] = tool_choice_error.param
+                                yield f"data: {json.dumps(err)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+                            if tool_calls:
+                                _remember_tool_call_text(stream_state.raw_text, tool_calls)
+                                finish_reason = "tool_calls"
+                            else:
+                                finish_reason = "stop"
                             yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                             if include_usage:
                                 usage_chunk = {"id": completion_id, "object": "chat.completion.chunk",
@@ -1266,41 +2155,44 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                                           "total_tokens": prompt_len + completion_tokens}}
                                 yield f"data: {json.dumps(usage_chunk)}\n\n"
                             yield "data: [DONE]\n\n"
-                            if timing.get("daemon_done") and full_hit is None:
-                                try: cur_bin.unlink()
-                                except Exception: pass
-                            _park_draft_if_lazy(timing)
                             return
 
-                        # Flush remaining
-                        if mode == "reasoning" and window:
-                            out = emit_delta(window, "reasoning_content")
-                            if out: yield out
-                        elif mode == "content" and window:
-                            out = emit_delta(window, "content")
-                            if out: yield out
-                        elif mode == "tool_buffer":
-                            tool_buffer += window
-                        window = ""
-
-                        finish_reason = "stop"
-                        if mode == "tool_buffer":
-                            cleaned_after, tool_calls = parse_tool_calls(tool_buffer, tools=req.tools)
-                            if tool_calls:
-                                if cleaned_after:
-                                    out = emit_delta(cleaned_after, "content")
-                                    if out: yield out
-                                tc_delta_list = [{
-                                    "index": i, "id": tc["id"], "type": "function",
-                                    "function": {"name": tc["function"]["name"],
-                                                  "arguments": tc["function"]["arguments"]},
-                                } for i, tc in enumerate(tool_calls)]
-                                yield f"data: {json.dumps(chunk({'tool_calls': tc_delta_list}))}\n\n"
-                                finish_reason = "tool_calls"
-                            else:
-                                out = emit_delta(tool_buffer, "content")
-                                if out: yield out
+                        stream_events, tool_calls = _flush_shared_stream(
+                            stream_state, tool_policy=tool_policy)
+                        for event in stream_events:
+                            if event["kind"] == "content":
+                                yield f"data: {json.dumps(chunk({'content': event['text']}))}\n\n"
+                            elif event["kind"] == "reasoning":
+                                yield f"data: {json.dumps(chunk({'reasoning_content': event['text']}))}\n\n"
+                            elif event["kind"] == "tool_start":
+                                yield tool_chunk(
+                                    event["index"],
+                                    call_id=event["id"],
+                                    name=event["name"],
+                                )
+                            elif event["kind"] == "tool_args":
+                                yield tool_chunk(
+                                    event["index"],
+                                    arguments=event["arguments"],
+                                )
+                        tool_choice_error = _tool_choice_violation(tool_policy, tool_calls)
+                        if tool_choice_error is not None:
+                            err = {"error": {
+                                "message": tool_choice_error.message,
+                                "type": tool_choice_error.error_type,
+                            }}
+                            if tool_choice_error.param is not None:
+                                err["error"]["param"] = tool_choice_error.param
+                            yield f"data: {json.dumps(err)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        if tool_calls:
+                            _remember_tool_call_text(stream_state.raw_text, tool_calls)
+                            finish_reason = "tool_calls"
                     finally:
+                        _confirm_or_abort_snap(
+                            completion_tokens, full_snap_prep_ref[0], snap_prep,
+                            prompt_ids, cur_bin, cur_ids)
                         if timing.get("daemon_done"):
                             if full_hit is None:
                                 try: cur_bin.unlink()
@@ -1312,11 +2204,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             log.warning(
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
-
-                    _confirm_or_abort_snap(
-                        completion_tokens, full_snap_prep_ref[0], snap_prep,
-                        prompt_ids, cur_bin, cur_ids)
-                    _park_draft_if_lazy(timing)
+                        _park_draft_if_lazy(timing)
 
                     yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                     if include_usage:
@@ -1347,7 +2235,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             full_snap_prep_ref = [None]
             snap_prep = None
 
-            full_hit = prefix_cache.lookup_full(prompt_ids)
+            full_hit = None if tool_policy.bypass_compression else prefix_cache.lookup_full(prompt_ids)
             if full_hit is not None:
                 slot, cached_cur_bin, cached_cur_ids_len = full_hit
                 cur_bin = Path(cached_cur_bin)
@@ -1365,7 +2253,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 t_compress = time.monotonic()
                 cur_bin, cur_ids = await asyncio.to_thread(
                     _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
-                            req.chat_template_kwargs)
+                    req.chat_template_kwargs,
+                    bypass=tool_policy.bypass_compression)
                 timing["compress"] = time.monotonic() - t_compress
                 prompt_len = len(cur_ids)
                 gen_len = _gen_len_for(prompt_len, req.max_tokens)
@@ -1383,6 +2272,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             try:
                 _write_cmd(cmd_line, timing)
             except RuntimeError as e:
+                _abort_reserved_snap(full_snap_prep_ref[0], snap_prep)
                 return JSONResponse({"detail": str(e)}, status_code=503)
 
             # FIX 6: use run_in_executor instead of list() blocking event loop
@@ -1411,7 +2301,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         thinking_enabled = True
         if req.chat_template_kwargs:
             thinking_enabled = req.chat_template_kwargs.get("enable_thinking", True)
-        cleaned, tool_calls = parse_tool_calls(text, tools=req.tools)
+        cleaned, tool_calls = _parse_generated_tool_calls(text, tool_policy)
+        tool_choice_error = _tool_choice_violation(tool_policy, tool_calls)
+        if tool_choice_error is not None:
+            raise tool_choice_error
+        _remember_tool_call_text(text, tool_calls)
         cleaned, reasoning = parse_reasoning(
             cleaned,
             thinking_enabled=thinking_enabled,
@@ -1530,6 +2424,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     try:
                         _write_cmd(cmd_line, timing)
                     except RuntimeError as e:
+                        _abort_reserved_snap(full_snap_prep_ref[0], snap_prep)
                         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'server_error','message':str(e)}})}\n\n"
                         return
 
@@ -1643,6 +2538,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             try:
                 _write_cmd(cmd_line, timing)
             except RuntimeError as e:
+                _abort_reserved_snap(full_snap_prep_ref[0], snap_prep)
                 return JSONResponse({"type": "error", "error": {"type": "server_error",
                                      "message": str(e)}}, status_code=503)
 
@@ -1688,11 +2584,33 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                              ) -> tuple[list[ChatMessage], list[ToolDef] | None]:
         """Map Responses API input → ChatMessage list + ToolDef list."""
         messages: list[ChatMessage] = []
+        pending_assistant_text: list[str] = []
+        pending_assistant_calls: list[ToolCall] = []
 
         # Collect all system-level content (instructions + developer messages)
         # and merge into a single system message at position 0, since
         # Qwen's chat template requires the system message at the beginning.
         system_parts: list[str] = []
+
+        def _flush_pending_assistant() -> None:
+            if not pending_assistant_text and not pending_assistant_calls:
+                return
+            messages.append(ChatMessage(
+                role="assistant",
+                content="".join(pending_assistant_text) or None,
+                tool_calls=list(pending_assistant_calls) or None,
+            ))
+            pending_assistant_text.clear()
+            pending_assistant_calls.clear()
+
+        def _responses_item_text(content: Any) -> str:
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in ("output_text", "text", "input_text"):
+                        text_parts.append(part.get("text", ""))
+                return "".join(text_parts)
+            return content if isinstance(content, str) else ""
 
         if req.instructions:
             system_parts.append(req.instructions)
@@ -1709,18 +2627,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
                 if item_type == "message":
                     role = item.get("role", "user")
-                    content = item.get("content", "")
-                    if isinstance(content, list):
-                        # Extract text from content parts
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict):
-                                if part.get("type") in ("output_text", "text", "input_text"):
-                                    text_parts.append(part.get("text", ""))
-                        content = "".join(text_parts)
+                    content = _responses_item_text(item.get("content", ""))
                     if role == "developer" or role == "system":
+                        _flush_pending_assistant()
                         system_parts.append(content)
+                    elif role == "assistant":
+                        pending_assistant_text.append(content)
                     else:
+                        _flush_pending_assistant()
                         messages.append(ChatMessage(role=role, content=content))
 
                 elif item_type == "function_call":
@@ -1732,10 +2646,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             arguments=item.get("arguments", "{}"),
                         ),
                     )
-                    messages.append(ChatMessage(
-                        role="assistant", content=None, tool_calls=[tc]))
+                    pending_assistant_calls.append(tc)
 
                 elif item_type == "function_call_output":
+                    _flush_pending_assistant()
                     output = item.get("output", "")
                     if not isinstance(output, str):
                         output = json.dumps(output)
@@ -1746,6 +2660,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
                 # Ignore reasoning, local_shell_call, etc. — we just
                 # need the message/function_call/output items for the model.
+
+        _flush_pending_assistant()
 
         # Prepend merged system message
         if system_parts:
@@ -1792,13 +2708,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             tool_choice=req.tool_choice,
             chat_template_kwargs={"enable_thinking": enable_thinking},
         )
+        tool_policy = _resolve_tool_policy(chat_req.tools, chat_req.tool_choice)
 
         response_id = "resp_" + uuid.uuid4().hex[:24]
         msg_item_id = "msg_" + uuid.uuid4().hex[:24]
         created_at = int(time.time())
 
         # Tokenize
-        prompt_bin, prompt_ids, raw_msgs, started_in_thinking = _tokenize_prompt(chat_req)
+        prompt_bin, prompt_ids, raw_msgs, started_in_thinking = _tokenize_prompt(chat_req, tool_policy)
         prompt_len = len(prompt_ids)
 
         # Summarise roles for the log line
@@ -1817,17 +2734,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
         if req.stream:
             return await _responses_stream(
-                chat_req, prompt_bin, prompt_ids, raw_msgs,
+                chat_req, prompt_bin, prompt_ids, raw_msgs, tool_policy,
                 started_in_thinking, response_id, msg_item_id,
                 created_at, prompt_len, time.monotonic())
         else:
             return await _responses_non_stream(
-                chat_req, prompt_bin, prompt_ids, raw_msgs,
+                chat_req, prompt_bin, prompt_ids, raw_msgs, tool_policy,
                 started_in_thinking, response_id, msg_item_id,
                 created_at, prompt_len, time.monotonic())
 
     async def _responses_non_stream(
-            chat_req, prompt_bin, prompt_ids, raw_msgs,
+            chat_req, prompt_bin, prompt_ids, raw_msgs, tool_policy,
             started_in_thinking, response_id, msg_item_id,
             created_at, prompt_len, t0):
         """Non-streaming Responses API handler."""
@@ -1835,14 +2752,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             timing = {}
             full_snap_prep_ref = [None]
             snap_prep = None
+            cur_ids = None
 
-            full_hit = prefix_cache.lookup_full(prompt_ids)
+            full_hit = None if tool_policy.bypass_compression else prefix_cache.lookup_full(prompt_ids)
             if full_hit is not None:
                 slot, cached_cur_bin, cached_cur_ids_len = full_hit
                 cur_bin = Path(cached_cur_bin)
-                cur_ids = None
                 prompt_len = cached_cur_ids_len
-                started_in_thinking = False  # cached: no think prefill
                 gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
                 if gen_len <= 0:
                     log.warning(
@@ -1861,7 +2777,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 t_compress = time.monotonic()
                 cur_bin, cur_ids = await asyncio.to_thread(
                     _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
-                    chat_req.chat_template_kwargs)
+                    chat_req.chat_template_kwargs,
+                    bypass=tool_policy.bypass_compression)
                 timing["compress"] = time.monotonic() - t_compress
                 prompt_len = len(cur_ids)
                 gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
@@ -1885,6 +2802,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             try:
                 _write_cmd(cmd_line, timing)
             except RuntimeError as e:
+                _abort_reserved_snap(full_snap_prep_ref[0], snap_prep)
                 return JSONResponse({
                     "type": "error",
                     "error": {"type": "server_error", "message": str(e)}
@@ -1908,31 +2826,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         thinking_enabled = True
         if chat_req.chat_template_kwargs:
             thinking_enabled = chat_req.chat_template_kwargs.get("enable_thinking", True)
-        cleaned, tool_calls = parse_tool_calls(text, tools=chat_req.tools)
+        cleaned, tool_calls, output_order = _parse_responses_non_stream_output(
+            text, tool_policy, msg_item_id,
+            started_in_thinking=started_in_thinking)
+        tool_choice_error = _tool_choice_violation(tool_policy, tool_calls)
+        if tool_choice_error is not None:
+            raise tool_choice_error
+        _remember_tool_call_text(text, tool_calls)
         cleaned, reasoning = parse_reasoning(
             cleaned, thinking_enabled=thinking_enabled,
             started_in_thinking=started_in_thinking)
 
-        # Build output items
-        output: list[dict] = []
-        if tool_calls:
-            for tc in tool_calls:
-                output.append({
-                    "type": "function_call",
-                    "id": tc["id"],
-                    "status": "completed",
-                    "call_id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "arguments": tc["function"]["arguments"],
-                })
-        else:
-            output.append({
-                "type": "message",
-                "id": msg_item_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": cleaned, "annotations": []}],
-            })
+        output = _build_responses_output(
+            cleaned, tool_calls, msg_item_id, output_order=output_order)
 
         out_types = [o.get("type") for o in output]
         elapsed = time.monotonic() - t0
@@ -1959,7 +2865,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         })
 
     async def _responses_stream(
-            chat_req, prompt_bin, prompt_ids, raw_msgs,
+            chat_req, prompt_bin, prompt_ids, raw_msgs, tool_policy,
             started_in_thinking, response_id, msg_item_id,
             created_at, prompt_len, t0):
         """Streaming Responses API handler — emits Responses SSE events."""
@@ -1971,13 +2877,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 timing = {}
                 full_snap_prep_ref = [None]
                 snap_prep = None
+                cur_ids = None
 
-                full_hit = prefix_cache.lookup_full(prompt_ids)
+                full_hit = None if tool_policy.bypass_compression else prefix_cache.lookup_full(prompt_ids)
                 if full_hit is not None:
                     slot, cached_cur_bin, cached_cur_ids_len = full_hit
                     cur_bin = Path(cached_cur_bin)
                     prompt_len = cached_cur_ids_len
-                    started_in_thinking = False
                     gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
                     if gen_len <= 0:
                         log.warning(
@@ -1995,7 +2901,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     t_compress = time.monotonic()
                     cur_bin, cur_ids = await asyncio.to_thread(
                         _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
-                        chat_req.chat_template_kwargs)
+                        chat_req.chat_template_kwargs,
+                        bypass=tool_policy.bypass_compression)
                     timing["compress"] = time.monotonic() - t_compress
                     prompt_len = len(cur_ids)
                     gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
@@ -2018,106 +2925,157 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 try:
                     _write_cmd(cmd_line, timing)
                 except RuntimeError as e:
+                    _abort_reserved_snap(full_snap_prep_ref[0], snap_prep)
                     yield _resp_sse("error", {
                         "error": {"type": "server_error", "message": str(e)}})
                     return
 
-                # Lifecycle: response.created
                 yield _resp_sse("response.created", {
                     "response": _resp_shell(response_id, chat_req.model, created_at,
                                              "in_progress")})
 
-                # Announce output item
-                yield _resp_sse("response.output_item.added", {
-                    "output_index": 0,
-                    "item": {"type": "message", "id": msg_item_id,
-                             "status": "in_progress", "role": "assistant",
-                             "content": []}})
-
-                # Announce content part
-                yield _resp_sse("response.content_part.added", {
-                    "item_id": msg_item_id, "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []}})
-
-                # Stream tokens with state machine
-                mode = "reasoning" if started_in_thinking else "content"
-                window = ""
-                tool_buffer = ""
-                accumulated_text = ""
-                tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
-                HOLDBACK = tag_holdback
+                stream_state = _make_shared_stream_state(started_in_thinking, [], tool_policy)
                 completion_tokens = 0
-                tool_call_active = False
+                tool_calls: list[dict] = []
+                next_output_index = 0
+                message_output_index: int | None = None
+                message_announced = False
+                message_done = False
+                tool_output_indices: dict[str, int] = {}
+                output_item_order: list[tuple[str, str]] = []
+
+                def ensure_message_started() -> list[str]:
+                    nonlocal next_output_index, message_output_index, message_announced
+                    if message_announced:
+                        return []
+                    message_output_index = next_output_index
+                    next_output_index += 1
+                    message_announced = True
+                    output_item_order.append(("message", msg_item_id))
+                    return [
+                        _resp_sse("response.output_item.added", {
+                            "output_index": message_output_index,
+                            "item": {
+                                "type": "message",
+                                "id": msg_item_id,
+                                "status": "in_progress",
+                                "role": "assistant",
+                                "content": [],
+                            },
+                        }),
+                        _resp_sse("response.content_part.added", {
+                            "item_id": msg_item_id,
+                            "output_index": message_output_index,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": "", "annotations": []},
+                        }),
+                    ]
+
+                def ensure_tool_started(event: dict) -> list[str]:
+                    nonlocal next_output_index
+                    output_index = tool_output_indices.get(event["id"])
+                    if output_index is not None:
+                        return []
+                    output_index = next_output_index
+                    next_output_index += 1
+                    tool_output_indices[event["id"]] = output_index
+                    output_item_order.append(("function_call", event["id"]))
+                    return [_resp_sse("response.output_item.added", {
+                        "output_index": output_index,
+                        "item": {
+                            "type": "function_call",
+                            "id": event["id"],
+                            "status": "in_progress",
+                            "call_id": event["id"],
+                            "name": event["name"],
+                            "arguments": "",
+                        },
+                    })]
+
+                def finalize_message_item() -> list[str]:
+                    nonlocal message_done
+                    if not message_announced or message_done or message_output_index is None:
+                        return []
+                    message_done = True
+                    return [
+                        _resp_sse("response.output_text.done", {
+                            "item_id": msg_item_id,
+                            "output_index": message_output_index,
+                            "content_index": 0,
+                            "text": stream_state.visible_text,
+                        }),
+                        _resp_sse("response.content_part.done", {
+                            "item_id": msg_item_id,
+                            "output_index": message_output_index,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": stream_state.visible_text,
+                                     "annotations": []},
+                        }),
+                        _resp_sse("response.output_item.done", {
+                            "output_index": message_output_index,
+                            "item": _responses_message_item(msg_item_id, stream_state.visible_text),
+                        }),
+                    ]
+
+                def finalize_tool_items(final_tool_calls: list[dict]) -> list[str]:
+                    messages: list[str] = []
+                    tool_map = {tc["id"]: tc for tc in final_tool_calls}
+                    for kind, item_id in output_item_order:
+                        if kind != "function_call":
+                            continue
+                        tc = tool_map.get(item_id)
+                        output_index = tool_output_indices.get(item_id)
+                        if tc is None or output_index is None:
+                            continue
+                        messages.append(_resp_sse("response.function_call_arguments.done", {
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "arguments": tc["function"]["arguments"],
+                            "name": tc["function"]["name"],
+                        }))
+                        messages.append(_resp_sse("response.output_item.done", {
+                            "output_index": output_index,
+                            "item": _responses_function_call_item(tc),
+                        }))
+                    return messages
+
+                def emit_stream_event(event: dict) -> list[str]:
+                    messages: list[str] = []
+                    if event["kind"] == "content":
+                        messages.extend(ensure_message_started())
+                        assert message_output_index is not None
+                        messages.append(_resp_sse("response.output_text.delta", {
+                            "item_id": msg_item_id,
+                            "output_index": message_output_index,
+                            "content_index": 0,
+                            "delta": event["text"],
+                        }))
+                        return messages
+                    if event["kind"] == "tool_start":
+                        messages.extend(ensure_tool_started(event))
+                        return messages
+                    if event["kind"] == "tool_args":
+                        if event["id"] not in tool_output_indices:
+                            messages.extend(ensure_tool_started(event))
+                        messages.append(_resp_sse("response.function_call_arguments.delta", {
+                            "item_id": event["id"],
+                            "output_index": tool_output_indices[event["id"]],
+                            "delta": event["arguments"],
+                        }))
+                        return messages
+                    if event["kind"] == "tool_done":
+                        if event["id"] not in tool_output_indices:
+                            messages.extend(ensure_tool_started(event))
+                    return messages
 
                 try:
                     async for tok_id in _astream_tokens(r_pipe, gen_len, timing):
                         completion_tokens += 1
                         piece = tokenizer.decode([tok_id])
-                        window += piece
-
-                        while True:
-                            if mode == "tool_buffer":
-                                tool_buffer += window
-                                window = ""
-                                break
-
-                            if mode == "reasoning":
-                                idx = window.find(THINK_CLOSE_TAG)
-                                if idx != -1:
-                                    window = window[idx + len(THINK_CLOSE_TAG):]
-                                    mode = "content"
-                                    continue
-                                if len(window) > HOLDBACK:
-                                    window = window[-HOLDBACK:]
-                                break
-
-                            else:  # content
-                                think_idx = window.find(THINK_OPEN_TAG)
-                                think_close_idx = window.find(THINK_CLOSE_TAG)
-                                tool_idx = window.find(TOOL_OPEN_TAG)
-                                hits = [(i, t) for i, t in
-                                        ((think_idx, "think"),
-                                         (think_close_idx, "think_close"),
-                                         (tool_idx, "tool")) if i != -1]
-                                if hits:
-                                    hits.sort()
-                                    idx, which = hits[0]
-                                    pre = window[:idx]
-                                    if pre:
-                                        accumulated_text += pre
-                                        yield _resp_sse("response.output_text.delta", {
-                                            "item_id": msg_item_id, "output_index": 0,
-                                            "content_index": 0, "delta": pre})
-                                    if which == "think":
-                                        window = window[idx + len(THINK_OPEN_TAG):]
-                                        mode = "reasoning"
-                                    elif which == "think_close":
-                                        window = window[idx + len(THINK_CLOSE_TAG):]
-                                    else:
-                                        tool_buffer = window[idx:]
-                                        window = ""
-                                        mode = "tool_buffer"
-                                    continue
-                                if len(window) > HOLDBACK:
-                                    safe = window[:-HOLDBACK]
-                                    accumulated_text += safe
-                                    yield _resp_sse("response.output_text.delta", {
-                                        "item_id": msg_item_id, "output_index": 0,
-                                        "content_index": 0, "delta": safe})
-                                    window = window[-HOLDBACK:]
-                                break
-
-                    # Flush remaining window
-                    if mode == "content" and window:
-                        accumulated_text += window
-                        yield _resp_sse("response.output_text.delta", {
-                            "item_id": msg_item_id, "output_index": 0,
-                            "content_index": 0, "delta": window})
-                    elif mode == "tool_buffer":
-                        tool_buffer += window
-                    window = ""
-
+                        for event in _feed_shared_stream_piece(
+                                stream_state, piece, stops=[], tool_policy=tool_policy):
+                            for message in emit_stream_event(event):
+                                yield message
                 finally:
                     if timing.get("daemon_done"):
                         if full_hit is None:
@@ -2136,70 +3094,45 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     prompt_ids, cur_bin, cur_ids)
                 _park_draft_if_lazy(timing)
 
-                # Build final output items
-                final_output: list[dict] = []
-                if mode == "tool_buffer" and tool_buffer:
-                    cleaned_after, tool_calls = parse_tool_calls(tool_buffer, tools=chat_req.tools)
-                    if tool_calls:
-                        if cleaned_after:
-                            accumulated_text += cleaned_after
-                        for tc in tool_calls:
-                            tool_call_active = True
-                            tc_item_id = tc["id"]
-                            # Emit function_call_arguments.delta for each tool call
-                            yield _resp_sse("response.function_call_arguments.delta", {
-                                "item_id": tc_item_id, "output_index": 0,
-                                "delta": tc["function"]["arguments"]})
-                            yield _resp_sse("response.function_call_arguments.done", {
-                                "item_id": tc_item_id, "output_index": 0,
-                                "arguments": tc["function"]["arguments"],
-                                "name": tc["function"]["name"]})
-                            final_output.append({
-                                "type": "function_call",
-                                "id": tc_item_id,
-                                "status": "completed",
-                                "call_id": tc_item_id,
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"],
-                            })
-                    else:
-                        accumulated_text += tool_buffer
-                        yield _resp_sse("response.output_text.delta", {
-                            "item_id": msg_item_id, "output_index": 0,
-                            "content_index": 0, "delta": tool_buffer})
+                stream_events, tool_calls = _flush_shared_stream(
+                    stream_state, tool_policy=tool_policy)
+                for event in stream_events:
+                    for message in emit_stream_event(event):
+                        yield message
 
-                # Finalize text output
-                yield _resp_sse("response.output_text.done", {
-                    "item_id": msg_item_id, "output_index": 0,
-                    "content_index": 0, "text": accumulated_text})
-                yield _resp_sse("response.content_part.done", {
-                    "item_id": msg_item_id, "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": accumulated_text,
-                             "annotations": []}})
+                if tool_calls:
+                    _remember_tool_call_text(stream_state.raw_text, tool_calls)
 
-                if not tool_call_active:
-                    final_output.append({
-                        "type": "message",
-                        "id": msg_item_id,
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": accumulated_text,
-                                     "annotations": []}],
-                    })
+                if not message_announced and not tool_calls:
+                    for message in ensure_message_started():
+                        yield message
+                for message in finalize_message_item():
+                    yield message
 
-                yield _resp_sse("response.output_item.done", {
-                    "output_index": 0,
-                    "item": final_output[0] if final_output else {
-                        "type": "message", "id": msg_item_id,
-                        "status": "completed", "role": "assistant",
-                        "content": []}})
+                tool_choice_error = _tool_choice_violation(tool_policy, tool_calls)
+                if tool_choice_error is not None:
+                    yield _resp_sse("response.failed", {
+                        "response": _resp_shell(response_id, chat_req.model, created_at,
+                                                 "failed")})
+                    err = {"error": {
+                        "type": tool_choice_error.error_type,
+                        "message": tool_choice_error.message,
+                    }}
+                    if tool_choice_error.param is not None:
+                        err["error"]["param"] = tool_choice_error.param
+                    yield _resp_sse("error", err)
+                    return
 
-                # response.completed
+                for message in finalize_tool_items(tool_calls):
+                    yield message
+                final_output = _build_responses_output(
+                    stream_state.visible_text, tool_calls, msg_item_id,
+                    output_order=output_item_order)
+
                 shell = _resp_shell(response_id, chat_req.model, created_at,
                                      "completed")
                 shell["output"] = final_output
-                shell["output_text"] = accumulated_text
+                shell["output_text"] = stream_state.visible_text
                 shell["usage"] = {
                     "input_tokens": prompt_len,
                     "output_tokens": completion_tokens,
@@ -2211,7 +3144,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 log.info(
                     "responses DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  output=%s  text_len=%d  %s",
                     response_id, prompt_len, completion_tokens,
-                    elapsed, tok_s, out_types, len(accumulated_text),
+                    elapsed, tok_s, out_types, len(stream_state.visible_text),
                     _timing_summary(timing, completion_tokens),
                 )
                 yield _resp_sse("response.completed", {"response": shell})

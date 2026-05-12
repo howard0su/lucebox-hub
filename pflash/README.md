@@ -95,7 +95,7 @@ python tests/bench_niah_cpp.py \
 
 ## OpenAI server flags
 
-For an OpenAI-compatible server with transparent compression on long prompts, run [`dflash/scripts/server.py`](../dflash/scripts/server.py) (or `server_tools.py` for tool-calling) with these flags:
+For an OpenAI-compatible server with transparent compression on long prompts, run [`dflash/scripts/server.py`](../dflash/scripts/server.py) with these flags:
 
 | Flag | Choices / type | Default | Effect |
 |---|---|:---:|---|
