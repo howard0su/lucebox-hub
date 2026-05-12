@@ -8,16 +8,17 @@ jobs:
   build-dflash:
     name: Build dflash (CUDA)
     runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+      options: --user root
     steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake g++ git
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: '12.8.0'
-          method: network
-
       - name: Configure & build
         run: |
           cd dflash
@@ -32,21 +33,16 @@ jobs:
     strategy:
       matrix:
         arch: [sm_75, sm_86]
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+      options: --user root
     steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 python3-pip g++ git
+          pip3 install --break-system-packages torch --extra-index-url https://download.pytorch.org/whl/cpu
       - uses: actions/checkout@v4
-
-      - uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: '12.8.0'
-          method: network
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Python deps
-        run: pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
-
       - name: Build extension
         env:
           MEGAKERNEL_CUDA_ARCH: ${{ matrix.arch }}
