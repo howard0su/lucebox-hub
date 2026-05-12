@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-dflash:
-    name: Build dflash (CUDA)
+  build:
+    name: Build (CUDA 12.8)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,8 +18,14 @@ jobs:
         with:
           cuda: '12.8.0'
           method: network
+          sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
 
-      - name: Configure & build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build dflash
         run: |
           cd dflash
           cmake -B build \
@@ -27,31 +33,16 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j$(nproc)
 
-  build-megakernel:
-    name: Build megakernel (${{ matrix.arch }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arch: [sm_75, sm_86]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: '12.8.0'
-          method: network
-          log-file-suffix: '${{ matrix.arch }}.txt'
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Python deps
+      - name: Install megakernel Python deps
         run: pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
 
-      - name: Build extension
-        env:
-          MEGAKERNEL_CUDA_ARCH: ${{ matrix.arch }}
+      - name: Build megakernel (sm_75)
         run: |
           cd megakernel
-          python3 setup.py build_ext --inplace
+          MEGAKERNEL_CUDA_ARCH=sm_75 python3 setup.py build_ext --inplace
+          rm -rf build
+
+      - name: Build megakernel (sm_86)
+        run: |
+          cd megakernel
+          MEGAKERNEL_CUDA_ARCH=sm_86 python3 setup.py build_ext --inplace
