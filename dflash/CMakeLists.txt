@@ -193,6 +193,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
 )
 
 add_library(dflash27b STATIC
@@ -207,6 +208,9 @@ add_library(dflash27b STATIC
     src/qwen3/qwen3_graph.cpp
     src/qwen3/qwen3_backend.cpp
     src/qwen3/qwen3_daemon.cpp
+    src/gemma4/gemma4_loader.cpp
+    src/gemma4/gemma4_backend.cpp
+    src/gemma4/gemma4_daemon.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
