@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (CUDA 12.8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build dflash
+        run: |
+          cd dflash
+          cmake -B build \
+            -DCMAKE_CUDA_ARCHITECTURES="75;86" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - name: Install megakernel Python deps
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu126
+
+      - name: Build megakernel (sm_75)
+        env:
+          CUDA_HOME: ${{ env.CUDA_PATH }}
+        run: |
+          cd megakernel
+          MEGAKERNEL_CUDA_ARCH=sm_75 python3 setup.py build_ext --inplace
+          rm -rf build
+
+      - name: Build megakernel (sm_86)
+        env:
+          CUDA_HOME: ${{ env.CUDA_PATH }}
+        run: |
+          cd megakernel
+          MEGAKERNEL_CUDA_ARCH=sm_86 python3 setup.py build_ext --inplace
