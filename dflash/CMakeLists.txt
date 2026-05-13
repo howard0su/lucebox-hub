@@ -230,6 +230,8 @@ add_library(dflash27b STATIC
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
     src/common/daemon_loop.cpp
+    src/common/gguf_inspect.cpp
+    src/common/layer_split_utils.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't

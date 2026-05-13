@@ -564,48 +564,16 @@ private:
     int ring_cap_ = 0;
 };
 
+// ─── GGUF inspection — extracted to src/common/gguf_inspect.{h,cpp} ──
+#include "gguf_inspect.h"
 static int inspect_target_layer_count(const char * target_path) {
-    ggml_context * meta_ctx = nullptr;
-    gguf_init_params gip{};
-    gip.no_alloc = true;
-    gip.ctx = &meta_ctx;
-    gguf_context * gctx = gguf_init_from_file(target_path, gip);
-    if (!gctx) return -1;
-    int64_t id = gguf_find_key(gctx, "qwen35.block_count");
-    int n_layer = id >= 0 ? (int)gguf_get_val_u32(gctx, id) : -1;
-    gguf_free(gctx);
-    if (meta_ctx) ggml_free(meta_ctx);
-    return n_layer;
+    auto info = dflash27b::inspect_gguf_model_info(target_path);
+    return info.n_layer;
 }
 
-static std::vector<std::pair<int, int>> compute_layer_ranges(
-        int n_layer,
-        int n_shards,
-        const std::vector<double> & weights) {
-    std::vector<std::pair<int, int>> ranges;
-    if (n_layer <= 0 || n_shards <= 0 || n_shards > n_layer) return ranges;
-    std::vector<double> w = weights;
-    if (w.empty()) w.assign((size_t)n_shards, 1.0);
-    if ((int)w.size() != n_shards) return ranges;
-    double sum = 0.0;
-    for (double v : w) sum += v;
-    if (sum <= 0.0) return ranges;
-    ranges.reserve((size_t)n_shards);
-    int begin = 0;
-    double accum = 0.0;
-    for (int i = 0; i < n_shards; i++) {
-        accum += w[i];
-        int end = (i == n_shards - 1)
-            ? n_layer
-            : (int)std::llround((accum / sum) * n_layer);
-        const int min_end = begin + 1;
-        const int max_end = n_layer - (n_shards - i - 1);
-        end = std::max(min_end, std::min(max_end, end));
-        ranges.push_back({begin, end});
-        begin = end;
-    }
-    return ranges;
-}
+// ─── Layer ranges — extracted to src/common/layer_split_utils.{h,cpp} ──
+#include "layer_split_utils.h"
+using dflash27b::compute_layer_ranges;
 
 static TargetLayerSplitShard * find_target_shard(
         std::vector<TargetLayerSplitShard> & shards,
@@ -1902,22 +1870,9 @@ int main(int argc, char ** argv) {
     // Read general.architecture from the target GGUF before parsing argv
     // shape so we can route laguna requests to run_laguna_daemon() and
     // accept the no-draft argv layout server.py uses for that arch.
-    auto peek_gguf_arch = [&](const char * path) -> std::string {
-        gguf_init_params gip{};
-        gip.no_alloc = true;
-        gip.ctx = nullptr;
-        gguf_context * gctx = gguf_init_from_file(path, gip);
-        if (!gctx) return std::string();
-        std::string out;
-        const int64_t kid = gguf_find_key(gctx, "general.architecture");
-        if (kid >= 0) {
-            const char * v = gguf_get_val_str(gctx, kid);
-            if (v) out = v;
-        }
-        gguf_free(gctx);
-        return out;
-    };
-    const std::string detected_arch = peek_gguf_arch(target_path);
+    #include "gguf_inspect.h"
+    const auto model_info   = dflash27b::inspect_gguf_model_info(target_path);
+    const std::string detected_arch = model_info.arch;
     const bool is_laguna = (detected_arch == "laguna");
     const bool is_qwen3  = (detected_arch == "qwen3");
     const bool is_gemma4 = (detected_arch == "gemma4");
