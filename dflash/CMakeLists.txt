@@ -209,6 +209,7 @@ add_library(dflash27b STATIC
     src/qwen3/qwen3_backend.cpp
     src/qwen3/qwen3_daemon.cpp
     src/gemma4/gemma4_loader.cpp
+    src/gemma4/gemma4_graph.cpp
     src/gemma4/gemma4_backend.cpp
     src/gemma4/gemma4_daemon.cpp
     src/flashprefill_q8.cpp

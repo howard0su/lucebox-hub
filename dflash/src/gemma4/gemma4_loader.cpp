@@ -367,44 +367,4 @@ void free_gemma4_snapshot(Gemma4Snapshot & s) {
     s.cur_pos = 0;
 }
 
-// ── Forward step (stub) ────────────────────────────────────────────────
-
-bool gemma4_step(
-    ggml_backend_t          backend,
-    const Gemma4Weights &   w,
-    Gemma4Cache &           cache,
-    const float *           embed,
-    int                     n_tokens,
-    int                     kv_start,
-    std::vector<float> &    out_logits)
-{
-    // TODO: Implement full Gemma4 forward pass.
-    // Architecture reference: deps/llama.cpp/src/models/gemma4-iswa.cpp
-    // Pattern reference: src/laguna/laguna_target_graph.cpp (iSWA + MoE)
-    //
-    // Forward pass structure:
-    //   1. Scale input embeddings by sqrt(n_embd)
-    //   2. For each layer:
-    //      a. Pre-attn RMSNorm
-    //      b. Q/K/V projection + Q/K head-dim RMSNorm + RoPE
-    //      c. For KV layers: write K/V to cache. For reuse layers: read from source layer.
-    //      d. Flash attention (SWA or full depending on layer type)
-    //      e. Post-attn norm + residual
-    //      f. FFN: dense (lead layers) or MoE (sparse layers)
-    //         MoE: shared expert SwiGLU + routed experts (softmax gating)
-    //      g. Post-FFN norm + residual
-    //      h. Per-layer embedding injection (if available)
-    //      i. Output scale (if available)
-    //   3. Final RMSNorm
-    //   4. lm_head projection
-    //   5. Logit softcapping: tanh(logits / cap) * cap
-
-    (void)backend; (void)w; (void)cache; (void)embed;
-    (void)n_tokens; (void)kv_start;
-
-    set_last_error("gemma4_step: not yet implemented");
-    out_logits.clear();
-    return false;
-}
-
 }  // namespace dflash27b
