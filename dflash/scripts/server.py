@@ -483,6 +483,7 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     stream: bool = False
     max_tokens: int = 512
+    max_completion_tokens: int | None = None
     temperature: float | None = None   # 0 = greedy, >0 = sample
     seed: int | None = None             # rng seed for sampling
     top_p: float | None = None         # nucleus, applied when temperature > 0
@@ -1100,6 +1101,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     def _gen_len_for(prompt_len: int, max_tokens: int) -> int:
         return min(max_tokens, max_ctx - prompt_len - 20)
 
+    def _max_tokens_for(req) -> int:
+        return getattr(req, "max_completion_tokens", None) or req.max_tokens
+
     # ── /v1/chat/completions ────────────────────────────────────────────────
 
     @app.post("/v1/chat/completions")
@@ -1115,9 +1119,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         n_tools = len(req.tools) if req.tools else 0
         log.info(
             "chat %s  stream=%s  msgs=%d %s  tools=%d  "
-            "prompt_tokens=%d  max_tokens=%d  max_ctx=%d  model=%s",
+            "prompt_tokens=%d  max_tokens=%d  max_completion_tokens=%s  "
+            "effective_max_tokens=%d  max_ctx=%d  model=%s",
             completion_id, req.stream, len(req.messages), dict(role_counts),
-            n_tools, prompt_len, req.max_tokens, max_ctx, req.model,
+            n_tools, prompt_len, req.max_tokens, req.max_completion_tokens,
+            _max_tokens_for(req), max_ctx, req.model,
         )
         t0 = time.monotonic()
 
@@ -1135,7 +1141,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         cur_bin = Path(cached_cur_bin)
                         prompt_len = cached_cur_ids_len
                         started_in_thinking = False  # cached: no think prefill
-                        gen_len = _gen_len_for(prompt_len, req.max_tokens)
+                        gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
                         if gen_len <= 0:
                             try: prompt_bin.unlink()
                             except Exception: pass
@@ -1154,7 +1160,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             req.chat_template_kwargs)
                         timing["compress"] = time.monotonic() - t_compress
                         prompt_len = len(cur_ids)
-                        gen_len = _gen_len_for(prompt_len, req.max_tokens)
+                        gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
                         if gen_len <= 0:
                             try: cur_bin.unlink()
                             except Exception: pass
@@ -1389,7 +1395,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cur_bin = Path(cached_cur_bin)
                 cur_ids = None
                 prompt_len = cached_cur_ids_len
-                gen_len = _gen_len_for(prompt_len, req.max_tokens)
+                gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
                 if gen_len <= 0:
                     try: prompt_bin.unlink()
                     except Exception: pass
@@ -1404,7 +1410,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             req.chat_template_kwargs)
                 timing["compress"] = time.monotonic() - t_compress
                 prompt_len = len(cur_ids)
-                gen_len = _gen_len_for(prompt_len, req.max_tokens)
+                gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
                 if gen_len <= 0:
                     try: cur_bin.unlink()
                     except Exception: pass
@@ -1522,7 +1528,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         cur_bin = Path(cached_cur_bin)
                         cur_ids = None
                         prompt_len = cached_cur_ids_len
-                        gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
+                        gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
                         if gen_len <= 0:
                             try: prompt_bin.unlink()
                             except Exception: pass
@@ -1539,7 +1545,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             req.chat_template_kwargs)
                         timing["compress"] = time.monotonic() - t_compress
                         prompt_len = len(cur_ids)
-                        gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
+                        gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
                         if gen_len <= 0:
                             try: cur_bin.unlink()
                             except Exception: pass
@@ -1648,7 +1654,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cur_bin = Path(cached_cur_bin)
                 cur_ids = None
                 prompt_len = cached_cur_ids_len
-                gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
+                gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
                 if gen_len <= 0:
                     try: prompt_bin.unlink()
                     except Exception: pass
@@ -1664,7 +1670,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             req.chat_template_kwargs)
                 timing["compress"] = time.monotonic() - t_compress
                 prompt_len = len(cur_ids)
-                gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
+                gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
                 if gen_len <= 0:
                     try: cur_bin.unlink()
                     except Exception: pass
