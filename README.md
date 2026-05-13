@@ -105,8 +105,8 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 
 # 3. fetch weights: ~16 GB Q4_K_M target + 3.46 GB bf16 draft
-hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
-hf download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir models/draft/
+huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+huggingface-cli download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir models/draft/
 
 # 4a. one-shot streaming generate
 python3 scripts/run.py --prompt "def fibonacci(n):"
@@ -198,9 +198,9 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
 cmake --build build --target test_dflash test_flashprefill_kernels -j
 
 # 2. fetch weights: 27B Q4_K_M target + 0.6B BF16 drafter (GGUF) + DFlash spec-decode draft
-hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
-hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
-hf download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir models/draft/
+huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+huggingface-cli download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
+huggingface-cli download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir models/draft/
 
 # 3. run the daemon: compress (drafter scoring) + generate (target spec decode)
 DFLASH_FP_USE_BSA=1 DFLASH_FP_ALPHA=0.85 \
