@@ -528,7 +528,11 @@ if(DFLASH27B_TESTS)
         endif()
     endforeach()
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flash_attn_sparse.cpp")
+    # Gated on the same condition as src/pflash_ggml_adapter.cpp (see line ~291):
+    # the adapter is only compiled into dflash27b on CUDA + sm>=80, so the test
+    # that calls pflash_register_ggml_kernel() can only link there too.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flash_attn_sparse.cpp")
         add_executable(test_flash_attn_sparse test/test_flash_attn_sparse.cpp)
         target_link_libraries(test_flash_attn_sparse PRIVATE dflash27b ggml ggml-cuda ggml-base)
         target_include_directories(test_flash_attn_sparse PRIVATE
