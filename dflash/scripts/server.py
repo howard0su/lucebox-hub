@@ -161,7 +161,7 @@ def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
 
 
 # ─── tool-call & reasoning parsers ─────────────────────────────────
-# Ported from server_tools.py which ports from vLLM (Apache-2.0):
+# Ported from vLLM (Apache-2.0):
 #   vllm/reasoning/qwen3_reasoning_parser.py
 #   vllm/tool_parsers/qwen3coder_tool_parser.py
 

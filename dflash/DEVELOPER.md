@@ -227,7 +227,6 @@ dflash/
 │   └── draft/model.safetensors
 ├── scripts/
 │   ├── server.py               # Main OpenAI/Codex server
-│   ├── server_tools.py         # Legacy fork with tool calling (deprecated)
 │   ├── prefix_cache.py         # LRU prefix cache
 │   ├── _prefill_hook.py        # Speculative prefill compression
 │   ├── run.py                  # CLI text generation

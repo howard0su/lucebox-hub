@@ -119,7 +119,7 @@ allows capacity checks where the draft and a target layer range share one GPU
 before serving integration. `--target-split-dflash` runs the same split target
 placement through a chain DFlash decode loop and reports acceptance length.
 
-**Python flags on `scripts/run.py`, `scripts/server.py`, `scripts/server_tools.py`:**
+**Python flags on `scripts/run.py`, `scripts/server.py`:**
 ```bash
 python3 scripts/run.py --ctk q8_0 --ctv q4_0 --prompt "hello"
 python3 scripts/run.py --cache-type-k q8_0 --cache-type-v q4_0 --prompt "hello"
