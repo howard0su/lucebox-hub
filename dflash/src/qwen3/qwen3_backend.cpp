@@ -60,8 +60,8 @@ bool create_qwen3_cache(ggml_backend_t backend, const Qwen3DrafterWeights & w,
     out.k.resize(n_layer);
     out.v.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
-        out.k[il] = ggml_new_tensor_3d(out.ctx, half_type, D, Hk, max_ctx);
-        out.v[il] = ggml_new_tensor_3d(out.ctx, half_type, D, Hk, max_ctx);
+        out.k[il] = ggml_new_tensor_3d(out.ctx, half_type, D, max_ctx, Hk);
+        out.v[il] = ggml_new_tensor_3d(out.ctx, half_type, D, max_ctx, Hk);
     }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
@@ -201,7 +201,7 @@ bool Qwen3Backend::do_step(const float * embed, int n_tokens, int kv_start,
 
     // Allocate graph context
     ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * 256
+    ip.mem_size = ggml_tensor_overhead() * 1536
                   + ggml_graph_overhead_custom(4096, false)
                   + 256 * 1024;
     ip.no_alloc = true;
@@ -211,14 +211,24 @@ bool Qwen3Backend::do_step(const float * embed, int n_tokens, int kv_start,
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
 
     // Input: hidden state [hidden, n_tokens] f32
-    ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_tokens);
-    ggml_set_name(cur, "inp_embed");
-    ggml_set_input(cur);
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_tokens);
+    ggml_set_name(inp, "inp_embed");
+    ggml_set_input(inp);
+    ggml_tensor * cur = inp;
 
     // Positions [n_tokens] i32
     ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
+
+    // Causal attention mask [kv_len, n_tokens] f16
+    // For decode (n_tokens=1), mask is nullptr (single token attends to all cached)
+    ggml_tensor * attn_mask = nullptr;
+    if (n_tokens > 1) {
+        attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_len, n_tokens);
+        ggml_set_name(attn_mask, "attn_mask");
+        ggml_set_input(attn_mask);
+    }
 
     // Per-layer forward
     for (int il = 0; il < w_.n_layer; ++il) {
@@ -258,45 +268,47 @@ bool Qwen3Backend::do_step(const float * embed, int n_tokens, int kv_start,
         ggml_tensor * K_half = ggml_cast(ctx, K, half_type);
         ggml_tensor * V_half = ggml_cast(ctx, V, half_type);
 
+        // Permute K/V from [D, Hk, n_tokens] to [D, n_tokens, Hk] for cache write
+        ggml_tensor * Kt = ggml_permute(ctx, K_half, 0, 2, 1, 3);
+        ggml_tensor * Vt = ggml_permute(ctx, V_half, 0, 2, 1, 3);
+
         // Write K/V into persistent cache at [kv_start, kv_start+n_tokens)
-        // K_cache[il]: [D, Hk, max_ctx], write slice [:, :, kv_start:kv_start+n_tokens]
-        size_t k_offset = (size_t)kv_start * D * Hk * ggml_type_size(half_type);
+        // Cache layout: [D, max_ctx, Hk]
         ggml_tensor * k_dst = ggml_view_3d(ctx, cache_.k[il],
-                                            D, Hk, n_tokens,
+                                            D, n_tokens, Hk,
                                             cache_.k[il]->nb[1], cache_.k[il]->nb[2],
-                                            k_offset);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, K_half, k_dst));
+                                            cache_.k[il]->nb[1] * (size_t)kv_start);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kt, k_dst));
 
-        size_t v_offset = (size_t)kv_start * D * Hk * ggml_type_size(half_type);
         ggml_tensor * v_dst = ggml_view_3d(ctx, cache_.v[il],
-                                            D, Hk, n_tokens,
+                                            D, n_tokens, Hk,
                                             cache_.v[il]->nb[1], cache_.v[il]->nb[2],
-                                            v_offset);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, V_half, v_dst));
+                                            cache_.v[il]->nb[1] * (size_t)kv_start);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vt, v_dst));
 
-        // Attention: Q @ K^T / sqrt(D) → softmax → @ V
-        // Use full K/V range [0, kv_len) from cache
+        // Attention: read full K/V from cache [D, kv_len, Hk]
         ggml_tensor * K_full = ggml_view_3d(ctx, cache_.k[il],
-                                             D, Hk, kv_len,
+                                             D, kv_len, Hk,
                                              cache_.k[il]->nb[1], cache_.k[il]->nb[2], 0);
         ggml_tensor * V_full = ggml_view_3d(ctx, cache_.v[il],
-                                             D, Hk, kv_len,
+                                             D, kv_len, Hk,
                                              cache_.v[il]->nb[1], cache_.v[il]->nb[2], 0);
 
-        // Use ggml flash attention (handles GQA internally)
-        // Q: [D, H, n_tokens], K: [D, Hk, kv_len], V: [D, Hk, kv_len]
-        ggml_tensor * Q_half = ggml_cast(ctx, Q, half_type);
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q_half, K_full, V_full,
-                                                  /*mask=*/nullptr,
+        // Permute Q from [D, H, n_tokens] to [D, n_tokens, H] for flash_attn_ext
+        ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
+        Qfa = ggml_cont(ctx, Qfa);
+
+        // flash_attn_ext: Q[D, n_tokens, H], K[D, kv_len, Hk], V[D, kv_len, Hk]
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, K_full, V_full,
+                                                  attn_mask,
                                                   1.0f / std::sqrt((float)D),
                                                   0.0f, 0.0f);
-        // attn: [D, H, n_tokens] half → cast to f32
-        ggml_tensor * attn_f32 = ggml_cast(ctx, attn, GGML_TYPE_F32);
+        // attn output: [D, H, n_tokens, 1] f32 (permuted internally)
         // Reshape to [H*D, n_tokens] for output projection
-        attn_f32 = ggml_reshape_2d(ctx, attn_f32, H * D, n_tokens);
+        ggml_tensor * attn_2d = ggml_reshape_2d(ctx, attn, H * D, n_tokens);
 
         // Output projection + residual
-        ggml_tensor * attn_out = ggml_mul_mat(ctx, L.wo, attn_f32);
+        ggml_tensor * attn_out = ggml_mul_mat(ctx, L.wo, attn_2d);
         cur = ggml_add(ctx, cur, attn_out);
 
         // FFN: pre-norm → gate·up → down → residual
@@ -331,14 +343,15 @@ bool Qwen3Backend::do_step(const float * embed, int n_tokens, int kv_start,
     ggml_gallocr_t galloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend_));
     if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        std::fprintf(stderr, "[qwen3] graph alloc failed\n");
+        std::fprintf(stderr, "[qwen3] graph alloc failed (n_tokens=%d, kv_start=%d, kv_len=%d)\n",
+                     n_tokens, kv_start, kv_len);
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return false;
     }
 
     // Set inputs
-    ggml_backend_tensor_set(cur, embed, 0,
+    ggml_backend_tensor_set(inp, embed, 0,
                             sizeof(float) * (size_t)hidden * n_tokens);
     {
         std::vector<int32_t> pos(n_tokens);
@@ -347,9 +360,26 @@ bool Qwen3Backend::do_step(const float * embed, int n_tokens, int kv_start,
                                 sizeof(int32_t) * n_tokens);
     }
 
+    // Build causal mask: position i can attend to [0, kv_start+i]
+    if (attn_mask) {
+        std::vector<ggml_fp16_t> mask_data((size_t)kv_len * n_tokens);
+        const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf_h = ggml_fp32_to_fp16(-INFINITY);
+        for (int row = 0; row < n_tokens; ++row) {
+            const int last_visible = kv_start + row;
+            for (int col = 0; col < kv_len; ++col) {
+                mask_data[(size_t)row * kv_len + col] =
+                    (col <= last_visible) ? zero_h : neg_inf_h;
+            }
+        }
+        ggml_backend_tensor_set(attn_mask, mask_data.data(), 0,
+                                sizeof(ggml_fp16_t) * mask_data.size());
+    }
+
     auto st = ggml_backend_graph_compute(backend_, gf);
     if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "[qwen3] graph compute failed\n");
+        std::fprintf(stderr, "[qwen3] graph compute failed (status=%d, n_tokens=%d, kv_start=%d, kv_len=%d)\n",
+                     (int)st, n_tokens, kv_start, kv_len);
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return false;
@@ -419,6 +449,7 @@ int Qwen3Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         committed = start + n;
         cache_.cur_pos = committed;
+        last_logits_ = std::move(logits);
     }
 
     return committed;
@@ -434,53 +465,38 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
     std::vector<float> logits;
     std::vector<float> embed_buf(hidden);
 
-    // First decode: get logits from the last prefill step
-    // (already computed during do_prefill's last chunk)
-    // We need to re-run a 1-token step to get initial logits
-    // Actually, do_prefill's last do_step already gave us logits.
-    // But we discarded them. Let's re-embed the last token and do a step.
-
-    // Get initial logits by re-running last token
-    {
-        int32_t last_tok = 0;  // will be overwritten
-        // Embed last token of the prompt to get first logits
-        // Actually, do_prefill already wrote KV for all tokens.
-        // We need logits from the last position. Re-run single token.
-        // But that would double-write KV. Instead, let's fix do_prefill
-        // to return last logits. For now, use a simpler approach:
-        // the last do_step in do_prefill returned logits — we need to
-        // capture those. Let me restructure.
-    }
-
-    // For simplicity, re-run the last prefill token to get initial logits.
-    // This writes KV at position committed-1 again (idempotent since same data).
-    // TODO: Optimize by caching last prefill logits.
-
     for (int i = 0; i < n_gen; ++i) {
-        int32_t tok;
-
+        // Get logits: first iteration uses prefill logits, rest use step output
         if (i == 0) {
-            // First iteration: we need logits from the prefill.
-            // The prefill already computed them but we didn't save them.
-            // For now, sample from the logits of the last prefill chunk.
-            // We'll restructure do_prefill to return last logits.
-            // HACK: re-embed and re-step the last prompt token.
-            // This works because KV is already written at that position.
-            // Actually we need to be careful — re-stepping overwrites KV.
-            // Since it's the same token at the same position, the result is identical.
-
-            // We don't have the last token ID readily available here.
-            // Let's skip this complexity and just use committed as-is.
-            // The caller should have provided the last token.
-            // For now, return error if n_gen > 0 without prior context.
-            // Actually the generate() method handles this — let's just
-            // have do_prefill return the logits from its last step.
-            return false;  // will be fixed below
+            if (last_logits_.empty()) return false;
+            logits = std::move(last_logits_);
         }
 
-        tok = out_tokens.back();
+        // Sample next token
+        int32_t next;
+        if (sampler_.temp > 0) {
+            next = sample_logits(logits.data(), vocab, sampler_,
+                                 out_tokens, sampler_rng_);
+        } else {
+            next = 0;
+            float best = logits[0];
+            for (int j = 1; j < vocab; ++j) {
+                if (logits[j] > best) { best = logits[j]; next = j; }
+            }
+        }
 
-        // Embed single token
+        out_tokens.push_back(next);
+        io.emit(next);
+        committed++;
+        cache_.cur_pos = committed;
+
+        // Check EOS
+        if (next == 151643 || next == 151645) break;
+
+        // Last iteration — don't need logits for next step
+        if (i == n_gen - 1) break;
+
+        // Embed next token and compute logits for following iteration
         {
             ggml_init_params ip{};
             ip.mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead() + 16 * 1024;
@@ -501,7 +517,7 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
                 ggml_free(ectx);
                 return false;
             }
-            ggml_backend_tensor_set(ids, &tok, 0, sizeof(int32_t));
+            ggml_backend_tensor_set(ids, &next, 0, sizeof(int32_t));
             ggml_backend_graph_compute(backend_, gf);
             ggml_backend_tensor_get(cpy, embed_buf.data(), 0,
                                     sizeof(float) * hidden);
@@ -512,27 +528,6 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
         if (!do_step(embed_buf.data(), 1, committed, logits)) {
             return false;
         }
-
-        // Sample
-        int32_t next;
-        if (sampler_.temp > 0) {
-            next = sample_logits(logits.data(), vocab, sampler_,
-                                 out_tokens, sampler_rng_);
-        } else {
-            next = 0;
-            float best = logits[0];
-            for (int j = 1; j < vocab; ++j) {
-                if (logits[j] > best) { best = logits[j]; next = j; }
-            }
-        }
-
-        out_tokens.push_back(next);
-        io.emit(next);
-        committed++;
-        cache_.cur_pos = committed;
-
-        // Check EOS
-        if (next == 151643 || next == 151645) break;  // Qwen3 EOS tokens
     }
 
     return true;
@@ -620,9 +615,43 @@ GenerateResult Qwen3Backend::generate(const GenerateRequest & req,
             return result;
         }
 
-        // Continue decode
+        // Continue decode — embed the first sampled token to get logits for next step
         int cur_committed = committed;
         if (req.n_gen > 1) {
+            // Embed 'first' token to get logits for the next iteration
+            int32_t ft = first;
+            {
+                ggml_init_params ip2{};
+                ip2.mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead() + 16 * 1024;
+                ip2.no_alloc = true;
+                ggml_context * ectx2 = ggml_init(ip2);
+                ggml_tensor * ids2 = ggml_new_tensor_1d(ectx2, GGML_TYPE_I32, 1);
+                ggml_set_input(ids2);
+                ggml_tensor * emb2 = ggml_get_rows(ectx2, w_.tok_embd, ids2);
+                ggml_tensor * out2 = ggml_new_tensor_2d(ectx2, GGML_TYPE_F32, hidden, 1);
+                ggml_tensor * cpy2 = ggml_cpy(ectx2, emb2, out2);
+                ggml_set_output(cpy2);
+                ggml_cgraph * gf2 = ggml_new_graph(ectx2);
+                ggml_build_forward_expand(gf2, cpy2);
+                ggml_gallocr_t galloc2 = ggml_gallocr_new(
+                    ggml_backend_get_default_buffer_type(backend_));
+                if (!ggml_gallocr_alloc_graph(galloc2, gf2)) {
+                    ggml_gallocr_free(galloc2); ggml_free(ectx2);
+                    result.error = "embed2 alloc"; return result;
+                }
+                ggml_backend_tensor_set(ids2, &ft, 0, sizeof(int32_t));
+                ggml_backend_graph_compute(backend_, gf2);
+                ggml_backend_tensor_get(cpy2, embed_buf.data(), 0, sizeof(float) * hidden);
+                ggml_gallocr_free(galloc2);
+                ggml_free(ectx2);
+            }
+            if (!do_step(embed_buf.data(), 1, cur_committed, last_logits_)) {
+                result.error = "decode logits";
+                return result;
+            }
+            cur_committed++;
+            cache_.cur_pos = cur_committed;
+
             if (!do_decode(cur_committed, req.n_gen - 1, result.tokens, io)) {
                 result.error = "decode";
                 return result;

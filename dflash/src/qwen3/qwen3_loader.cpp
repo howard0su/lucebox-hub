@@ -202,6 +202,12 @@ bool load_qwen3_drafter_model(const std::string & path,
     // Qwen3-0.6B ties lm_head to embed; output.weight is optional.
     if (gguf_find_tensor(gctx, "output.weight") >= 0) {
         ok &= copy_tensor_from_file(gctx, "output.weight", mm, data_off, out.output);
+    } else {
+        // Tied weights: copy tok_embd data into output tensor
+        // Both are [n_embd, n_vocab] BF16, so sizes match
+        std::vector<uint8_t> tmp(ggml_nbytes(out.tok_embd));
+        ggml_backend_tensor_get(out.tok_embd, tmp.data(), 0, tmp.size());
+        ggml_backend_tensor_set(out.output, tmp.data(), 0, tmp.size());
     }
     char nm[128];
     for (int il = 0; il < n_layer; ++il) {

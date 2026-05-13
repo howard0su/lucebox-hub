@@ -126,12 +126,15 @@ private:
                  std::vector<float> & out_logits);
 
     // Prefill prompt tokens in chunks, return committed position.
+    // Saves last-chunk logits in last_logits_.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io);
+
+    std::vector<float> last_logits_;  // logits from last prefill chunk
 };
 
 }  // namespace dflash27b
