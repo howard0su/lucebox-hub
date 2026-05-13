@@ -213,7 +213,9 @@ add_library(dflash27b STATIC
     src/laguna/laguna_target_loader.cpp
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
+    src/laguna/laguna_backend.cpp
     src/common/sampler.cpp
+    src/common/daemon_loop.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
