@@ -1,4 +1,5 @@
 #include "qwen35_backend.h"
+#include "qwen35_dflash_target.h"
 #include "graph_builders.h"
 #include "feature_copy.h"
 #include "peer_access.h"
@@ -282,6 +283,17 @@ bool Qwen35Backend::try_handle_command(const std::string & line, const DaemonIO 
     }
 
     return false;
+}
+
+// ── DFlash spec decode target ────────────────────────────────────────────
+
+DFlashTarget * Qwen35Backend::dflash_target() {
+    if (!dflash_target_) {
+        dflash_target_ = std::make_unique<Qwen35DFlashTarget>(
+            w_, cache_, target_backend_, sg_,
+            cfg_.kq_stride_pad, cfg_.fa_window);
+    }
+    return dflash_target_.get();
 }
 
 // ── Shutdown ────────────────────────────────────────────────────────────

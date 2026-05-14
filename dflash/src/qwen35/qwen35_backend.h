@@ -12,6 +12,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/dflash_target.h"
 #include "common/device_placement.h"
 #include "step_graph.h"
 #include "ddtree.h"
@@ -22,6 +23,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <memory>
 #include <random>
 #include <string>
 
@@ -96,6 +98,9 @@ public:
     bool try_handle_command(const std::string & line,
                             const DaemonIO & io) override;
 
+    bool supports_dflash_spec_decode() const override { return true; }
+    DFlashTarget * dflash_target() override;
+
     void shutdown() override;
 
 private:
@@ -135,6 +140,9 @@ private:
     // ── Sampler state ────────────────────────────────────────────────
     SamplerCfg      sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
+
+    // ── DFlashTarget adapter (lazy-built) ────────────────────────────
+    std::unique_ptr<DFlashTarget> dflash_target_;
 
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.

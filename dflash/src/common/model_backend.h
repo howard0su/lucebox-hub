@@ -99,6 +99,15 @@ struct ModelBackend {
         return false;
     }
 
+    // ── DFlash speculative decode support ────────────────────────────
+    // Returns true if this backend can participate in DFlash spec decode
+    // (i.e. it implements the DFlashTarget interface).
+    virtual bool supports_dflash_spec_decode() const { return false; }
+
+    // Return the DFlashTarget adapter for this backend. Only valid when
+    // supports_dflash_spec_decode() returns true. Default returns nullptr.
+    virtual class DFlashTarget * dflash_target() { return nullptr; }
+
     // ── Cleanup ──────────────────────────────────────────────────────
     // Release all resources (weights, cache, snapshots, drafter).
     // Called by run_daemon() before returning.
