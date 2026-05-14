@@ -13,21 +13,23 @@
 
 #pragma once
 
+#include "device_placement.h"
 #include <string>
 #include "ggml.h"
 
 namespace dflash27b {
 
 struct LagunaDaemonArgs {
-    std::string target_path;       // path to laguna-*.gguf
-    int         max_ctx   = 16384; // K/V cache capacity in tokens
-    int         chunk     = 2048;  // chunked-prefill chunk size
-    ggml_type   kv_type   = GGML_TYPE_Q8_0;
-    int         stream_fd = -1;    // server.py's writable pipe end (int32 LE
-                                   // tokens, terminated by -1 sentinel). -1
-                                   // means the bare-prompt protocol is
-                                   // disabled and only the legacy `generate`
-                                   // file-out command is accepted.
+    std::string     target_path;       // path to laguna-*.gguf
+    DevicePlacement device;            // target GPU placement
+    int             max_ctx   = 16384; // K/V cache capacity in tokens
+    int             chunk     = 2048;  // chunked-prefill chunk size
+    ggml_type       kv_type   = GGML_TYPE_Q8_0;
+    int             stream_fd = -1;    // server.py's writable pipe end (int32 LE
+                                       // tokens, terminated by -1 sentinel). -1
+                                       // means the bare-prompt protocol is
+                                       // disabled and only the legacy `generate`
+                                       // file-out command is accepted.
 };
 
 // Boots the laguna target on a fresh CUDA backend, prints a `[laguna-daemon]

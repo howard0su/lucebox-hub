@@ -159,11 +159,22 @@ struct TargetWeights {
     int32_t eos_id      = -1;
     int32_t eos_chat_id = -1;
 
+    // DFlash noise mask token ID (from target tokenizer, used by draft model).
+    // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
+    int32_t mask_token_id = DFLASH27B_DRAFT_MASK_TOKEN_ID;
+
     // Target layer IDs captured for the DFlash draft model.
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
+    int n_capture_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
     int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
 };
+
+// Check if a token is an end-of-sequence marker for the given target weights.
+inline bool is_eos_tok(int tok, const TargetWeights & w) {
+    return (w.eos_chat_id >= 0 && tok == w.eos_chat_id)
+        || (w.eos_id      >= 0 && tok == w.eos_id);
+}
 
 struct TargetLoadPlan {
     int  layer_begin = 0;     // inclusive
@@ -219,17 +230,26 @@ struct DraftWeights {
     int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
     int swa_window = 0;  // sliding window size (0 = disabled)
+
+    // DFlash draft-specific config (populated by loader or set by caller).
+    int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
+    int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
+    int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
 };
 
 bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t backend,
-                            DraftWeights & out);
+                            DraftWeights & out,
+                            const TargetWeights * target = nullptr);
 
 // Load a Q8_0 (or F16) draft model from a GGUF file on disk.
 // Alternative to load_draft_safetensors for quantized drafts.
+// If `target` is non-null, draft dims (n_embd, mask_token_id, etc.) are
+// cross-checked / populated from the target model.
 bool load_draft_gguf(const std::string & path,
                      ggml_backend_t backend,
-                     DraftWeights & out);
+                     DraftWeights & out,
+                     const TargetWeights * target = nullptr);
 
 void free_draft_weights(DraftWeights & w);
 

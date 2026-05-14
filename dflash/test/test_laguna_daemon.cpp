@@ -38,7 +38,7 @@ int main(int argc, char ** argv) {
         }
     };
     for (int i = 2; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--max-ctx")) { need_arg(i); args.max_ctx = std::atoi(argv[++i]); }
+        if (!std::strcmp(argv[i], "--max-ctx")) { need_arg(i); args.device.max_ctx = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--chunk")) { need_arg(i); args.chunk = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--kv")) {
             need_arg(i);

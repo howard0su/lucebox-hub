@@ -193,6 +193,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
 )
 
 add_library(dflash27b STATIC
@@ -205,6 +206,12 @@ add_library(dflash27b STATIC
     src/qwen3/qwen3_drafter.cpp
     src/qwen3/qwen3_loader.cpp
     src/qwen3/qwen3_graph.cpp
+    src/qwen3/qwen3_backend.cpp
+    src/qwen3/qwen3_daemon.cpp
+    src/gemma4/gemma4_loader.cpp
+    src/gemma4/gemma4_graph.cpp
+    src/gemma4/gemma4_backend.cpp
+    src/gemma4/gemma4_daemon.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -213,7 +220,24 @@ add_library(dflash27b STATIC
     src/laguna/laguna_target_loader.cpp
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
+    src/laguna/laguna_backend.cpp
+    src/qwen35/draft_feature_mirror.cpp
+    src/qwen35/graph_builders.cpp
+    src/qwen35/feature_copy.cpp
+    src/qwen35/draft_ipc.cpp
+    src/qwen35/layer_split_forward.cpp
+    src/qwen35/layer_split_daemon.cpp
+    src/qwen35/spec_decode.cpp
+    src/qwen35/qwen35_backend.cpp
+    src/qwen35/qwen35_dflash_target.cpp
+    src/qwen35/layer_split_daemon_loop.cpp
+    src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
+    src/common/daemon_loop.cpp
+    src/common/gguf_inspect.cpp
+    src/common/layer_split_utils.cpp
+    src/common/ddtree.cpp
+    src/common/peer_access.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
