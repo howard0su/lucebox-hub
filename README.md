@@ -16,8 +16,8 @@
 </p>
 
 <p align="center">
-  <strong>Local LLM inference experiments with custom kernels, speculative decoding, and quantized GGUF paths.</strong><br/>
-  Each subproject is scoped to a specific model family and hardware target.
+  <strong>Local LLM inference server built for speed. Custom kernels, speculative prefill & decoding, quantized GGUF paths.</strong><br/>
+  Each project is a new optimization to our engine for a specific model family and hardware target.
 </p>
 
 ---
