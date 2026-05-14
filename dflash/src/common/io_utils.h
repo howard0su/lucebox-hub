@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -27,13 +28,20 @@ namespace dflash27b {
 static inline std::vector<int32_t> read_int32_file(const std::string & path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return {};
-    auto pos = f.tellg();
-    if (pos < 0) return {};
-    size_t sz = (size_t)pos;
-    f.seekg(0);
-    size_t n = sz / sizeof(int32_t);
+    const std::streampos pos = f.tellg();
+    if (pos == std::streampos(-1)) return {};
+    const std::streamoff bytes_off = pos - std::streampos(0);
+    if (bytes_off < 0 || bytes_off % (std::streamoff)sizeof(int32_t) != 0) return {};
+    const size_t bytes = (size_t)bytes_off;
+    if (bytes > (size_t)std::numeric_limits<std::streamsize>::max()) return {};
+    const size_t n = bytes / sizeof(int32_t);
+    f.seekg(0, std::ios::beg);
+    if (!f) return {};
     std::vector<int32_t> out(n);
-    if (n > 0) f.read((char *)out.data(), n * sizeof(int32_t));
+    if (bytes > 0) {
+        f.read((char *)out.data(), (std::streamsize)bytes);
+        if (!f || f.gcount() != (std::streamsize)bytes) return {};
+    }
     return out;
 }
 
