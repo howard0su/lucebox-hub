@@ -49,13 +49,13 @@ bool draft_feature_mirror_can_view(const DraftFeatureMirror & mirror,
 // Copy and convert BF16→F32 for n_tokens starting at start_pos from the
 // target cache into the mirror ring buffer.
 bool draft_feature_mirror_sync_range(const TargetCache & cache,
-                                     const DraftFeatureMirror & mirror,
+                                     DraftFeatureMirror & mirror,
                                      int start_pos,
                                      int n_tokens);
 
 // Convenience: sync the last `committed` tokens (or mirror.cap, whichever is smaller).
 bool draft_feature_mirror_sync_tail(const TargetCache & cache,
-                                    const DraftFeatureMirror & mirror,
+                                    DraftFeatureMirror & mirror,
                                     int committed);
 
 }  // namespace dflash27b

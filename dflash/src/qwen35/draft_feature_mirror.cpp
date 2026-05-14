@@ -112,7 +112,7 @@ bool draft_feature_mirror_can_view(const DraftFeatureMirror & mirror,
 }
 
 bool draft_feature_mirror_sync_range(const TargetCache & cache,
-                                     const DraftFeatureMirror & mirror,
+                                     DraftFeatureMirror & mirror,
                                      int start_pos,
                                      int n_tokens) {
     if (!cache.target_feat || !mirror.target_feat || mirror.cap <= 0) return false;
@@ -141,9 +141,7 @@ bool draft_feature_mirror_sync_range(const TargetCache & cache,
             cudaSetDevice(mirror.device);
             bf16_to_f32(src, (float *)dst, (int64_t)elems, nullptr);
         } else {
-            DraftFeatureMirror & mutable_mirror =
-                const_cast<DraftFeatureMirror &>(mirror);
-            if (!ensure_bf16_staging(mutable_mirror, elems)) return false;
+            if (!ensure_bf16_staging(mirror, elems)) return false;
             if (!copy_peer_async(mirror.bf16_staging, mirror.device,
                                  src, mirror.target_device,
                                  elems * sizeof(uint16_t))) {
@@ -160,7 +158,7 @@ bool draft_feature_mirror_sync_range(const TargetCache & cache,
 }
 
 bool draft_feature_mirror_sync_tail(const TargetCache & cache,
-                                    const DraftFeatureMirror & mirror,
+                                    DraftFeatureMirror & mirror,
                                     int committed) {
     if (!mirror.target_feat || committed <= 0) return true;
     const int n = std::min(committed, mirror.cap);
