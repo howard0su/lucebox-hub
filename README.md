@@ -103,6 +103,7 @@ git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd luc
 # 3090-only users can add -DCMAKE_CUDA_ARCHITECTURES=86 to skip the other archs and build faster (~3 min).
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
+cmake --build build --target test_generate -j
 
 # 3. fetch weights: ~16 GB Q4_K_M target + 3.46 GB bf16 draft
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
