@@ -139,6 +139,11 @@ bool run_dflash_spec_decode(
         int verify_last_tok = -1;
         if (!target.verify_batch(draft_tok, committed, verify_last_tok, &target_tok)) {
             std::fprintf(stderr, "dflash-spec verify failed\n");
+            // Roll the snapshot back so we don't leak the speculative KV
+            // mutations into the caller's target cache.
+            if (!target.restore_kv()) {
+                std::fprintf(stderr, "dflash-spec restore_kv after verify failure failed\n");
+            }
             return false;
         }
 

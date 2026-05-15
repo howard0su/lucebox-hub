@@ -49,7 +49,7 @@ inline bool activation_pair_init(ActivationPair & p,
                                  int hidden,
                                  int n_tokens) {
     activation_pair_free(p);
-    if (n_tokens <= 0) return false;
+    if (n_tokens <= 0 || hidden <= 0) return false;
     p.backend = backend;
     p.n_tokens = n_tokens;
     ggml_init_params ip{};
@@ -60,6 +60,10 @@ inline bool activation_pair_init(ActivationPair & p,
     if (!p.ctx) return false;
     p.a = ggml_new_tensor_2d(p.ctx, GGML_TYPE_F32, hidden, n_tokens);
     p.b = ggml_new_tensor_2d(p.ctx, GGML_TYPE_F32, hidden, n_tokens);
+    if (!p.a || !p.b) {
+        activation_pair_free(p);
+        return false;
+    }
     ggml_set_name(p.a, "target_split_act_a");
     ggml_set_name(p.b, "target_split_act_b");
     p.buf = ggml_backend_alloc_ctx_tensors(p.ctx, backend);
