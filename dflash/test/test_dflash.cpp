@@ -179,6 +179,7 @@ using dflash27b::draft_feature_mirror_sync_tail;
 
 // ─── Graph builders — extracted to src/qwen35/graph_builders.{h,cpp} ──
 #include "graph_builders.h"
+#include "dflash_draft_graph.h"
 using dflash27b::build_layer_step;
 using dflash27b::build_target_step;
 using dflash27b::build_target_step_tree;
@@ -541,7 +542,7 @@ static int run_target_layer_split_harness(
             const bool use_mirror_view =
                 draft_feature_mirror_can_view(feature_ring, (int)prompt.size(),
                                               draft_ctx, mirror_slot0);
-            if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
+            if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, draft_backend,
                                   draft_ctx, use_mirror_view ? &feature_ring : nullptr,
                                   (int)prompt.size())) {
                 std::fprintf(stderr, "target-split draft smoke build failed\n");
@@ -2396,7 +2397,8 @@ int main(int argc, char ** argv) {
         const bool draft_hidden_bridge = split_gpus;
 
         // 2) Draft forward
-        if (!build_draft_step(draft_sg, dw, draft_hidden_bridge ? nullptr : &w,
+        if (!build_draft_step(draft_sg, dw,
+                              draft_hidden_bridge ? nullptr : w.output,
                               draft_backend, /*ctx_len=*/draft_ctx,
                               use_mirror_view ? &feature_mirror : nullptr,
                               committed)) {

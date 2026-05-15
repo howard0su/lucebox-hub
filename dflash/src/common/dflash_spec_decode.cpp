@@ -4,7 +4,7 @@
 
 #include "internal.h"        // DraftWeights
 #include "io_utils.h"
-#include "graph_builders.h"  // build_draft_step
+#include "dflash_draft_graph.h"  // build_draft_step
 #include "step_graph.h"
 
 #include <algorithm>
@@ -89,7 +89,7 @@ bool run_dflash_spec_decode(
             }
             draft_hidden_host = remote_hidden.data();
         } else {
-            if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
+            if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, draft_backend,
                                   draft_ctx, use_mirror_view ? &feature_ring : nullptr,
                                   committed)) {
                 std::fprintf(stderr, "dflash-spec draft build failed\n");

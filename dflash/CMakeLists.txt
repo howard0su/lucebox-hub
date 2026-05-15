@@ -224,9 +224,10 @@ add_library(dflash27b STATIC
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
     src/common/dflash_draft_ipc.cpp
+    src/common/dflash_draft_ipc_daemon.cpp
+    src/common/dflash_draft_graph.cpp
     src/common/dflash_spec_decode.cpp
     src/qwen35/graph_builders.cpp
-    src/qwen35/draft_ipc_daemon.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp

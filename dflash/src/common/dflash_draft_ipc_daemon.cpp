@@ -1,15 +1,14 @@
-// draft_ipc_daemon.cpp — qwen35-side implementation of the DFlash draft IPC
-// daemon entry point.
+// dflash_draft_ipc_daemon.cpp — generic DFlash draft IPC daemon entry point.
 //
-// The IPC client and the parent-side feature-slice helper live in the
-// target-agnostic common/ layer (`dflash_draft_ipc.{h,cpp}`). The daemon body
-// stays next to qwen35 because it drives qwen35's draft graph builder
-// (`build_draft_step` in graph_builders.cpp) and the shared draft loaders.
+// The DFlash draft model is a single universal Qwen3-style network shared
+// across every target architecture, so the daemon body is target-agnostic
+// and lives in the common/ layer. Only the CLI flag wiring (each target's
+// _daemon.cpp) decides whether to launch this daemon.
 
 #include "dflash_draft_ipc.h"
 #include "internal.h"
 #include "dflash_feature_ring.h"
-#include "graph_builders.h"
+#include "dflash_draft_graph.h"
 #include "step_graph.h"
 #include "io_utils.h"
 
@@ -153,7 +152,7 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
             int mirror_slot0 = 0;
             const bool use_mirror_view =
                 draft_feature_mirror_can_view(feature_ring, committed, ctx_len, mirror_slot0);
-            if (!build_draft_step(draft_sg, draft_weights, nullptr, backend,
+            if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, backend,
                                   ctx_len, use_mirror_view ? &feature_ring : nullptr,
                                   committed)) {
                 std::fprintf(stderr, "[draft-ipc-daemon] draft build failed\n");
