@@ -221,15 +221,17 @@ add_library(dflash27b STATIC
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
-    src/qwen35/draft_feature_mirror.cpp
+    src/common/dflash_feature_ring.cpp
+    src/common/dflash_capture.cpp
+    src/common/dflash_draft_ipc.cpp
+    src/common/dflash_spec_decode.cpp
     src/qwen35/graph_builders.cpp
-    src/qwen35/feature_copy.cpp
-    src/qwen35/draft_ipc.cpp
+    src/qwen35/draft_ipc_daemon.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
-    src/qwen35/spec_decode.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_dflash_target.cpp
+    src/qwen35/qwen35_layer_split_dflash_target.cpp
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp

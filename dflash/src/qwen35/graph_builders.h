@@ -12,7 +12,7 @@
 #pragma once
 
 #include "step_graph.h"
-#include "draft_feature_mirror.h"
+#include "dflash_feature_ring.h"
 #include "attn_masks.h"       // align_up, KQ_MASK_PAD
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights
 
