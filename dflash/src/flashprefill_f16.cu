@@ -583,7 +583,7 @@ extern "C" void launch_sparse_flash_forward_f16(
 // the max of scores[b,m,n,h] for the threshold, then re-scans applying the
 // keep predicate (sink | window | last_n_full | score >= max*alpha).
 
-__global__ void block_select_kernel(
+__global__ void block_select_kernel_f16(
     const float * __restrict__ score,
     int B, int M, int N, int H,
     int attention_sink, int window, int last_n_full, float alpha,
@@ -651,7 +651,7 @@ __global__ void block_select_kernel(
     }
 }
 
-extern "C" void launch_block_select(
+extern "C" void launch_block_select_f16(
     const float * score,
     int B, int M, int N, int H,
     int attention_sink, int window, int last_n_full, float alpha,
@@ -663,7 +663,7 @@ extern "C" void launch_block_select(
 {
     dim3 grid(B, M, H);
     dim3 block(32, 1, 1);
-    block_select_kernel<<<grid, block, 0, stream>>>(
+    block_select_kernel_f16<<<grid, block, 0, stream>>>(
         score, B, M, N, H,
         attention_sink, window, last_n_full, alpha,
         s_b, s_m, s_n, s_h,
