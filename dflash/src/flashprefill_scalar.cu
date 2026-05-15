@@ -422,7 +422,7 @@ extern "C" void launch_sparse_flash_forward_f16_pascal(
 // Kernel 3: block_select (same algorithm, Pascal-compatible shuffles)
 // =============================================================================
 
-__global__ void block_select_kernel(
+__global__ void block_select_kernel_pascal(
     const float * __restrict__ score,
     int B, int M, int N, int H,
     int attention_sink, int window, int last_n_full, float alpha,
@@ -502,7 +502,7 @@ extern "C" void launch_block_select_pascal(
 {
     dim3 grid(B, M, H);
     dim3 block(32, 1, 1);
-    block_select_kernel<<<grid, block, 0, stream>>>(
+    block_select_kernel_pascal<<<grid, block, 0, stream>>>(
         score, B, M, N, H,
         attention_sink, window, last_n_full, alpha,
         s_b, s_m, s_n, s_h,

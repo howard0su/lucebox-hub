@@ -18,7 +18,8 @@ namespace flashprefill {
 // Kernel launcher declarations — architecture-specific.
 // sm_80+ BF16 WMMA launchers are in flashprefill_kernels.cu.
 // sm_70+ F16 WMMA launchers are in flashprefill_f16.cu.
-// launch_block_select is shared (architecture-independent).
+// Each arch-specific source owns its block-select launcher to avoid duplicate
+// CUDA host stubs in multi-arch builds.
 
 #ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
 extern "C" {
@@ -104,7 +105,7 @@ int launch_bsa_sparse_flash_forward_bf16(
 }
 #endif
 
-// Shared: launch_block_select (architecture-independent)
+// sm_80+ block-select launcher.
 extern "C" {
 void launch_block_select(
     const float * score,
@@ -151,6 +152,16 @@ void launch_sparse_flash_forward_f16(
     int s_O_b, int s_O_n, int s_O_h, int s_O_d,
     int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
     int s_cnt_b, int s_cnt_m, int s_cnt_h,
+    cudaStream_t stream);
+
+void launch_block_select_f16(
+    const float * score,
+    int B, int M, int N, int H,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_b, int s_m, int s_n, int s_h,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * idx_out, int32_t * cnt_out,
     cudaStream_t stream);
 }
 #endif
@@ -429,7 +440,7 @@ int flash_prefill_forward_f16_volta(
 
     if (prof) cudaEventRecord(pE[2]);
     // 3. block_select on GPU.
-    launch_block_select(
+    launch_block_select_f16(
         dS, B, M, N, H,
         cfg.attention_sink, cfg.window, cfg.last_n_full, cfg.alpha,
         s_S_b, s_S_m, s_S_n, s_S_h,
