@@ -63,6 +63,7 @@ BUCKETS = {
     "2k":  {"target": 2048,  "sys": SYS_PROMPT_SMALL},
     "8k":  {"target": 8192,  "sys": SYS_PROMPT_LARGE},
     "24k": {"target": 24576, "sys": SYS_PROMPT_LARGE},
+    "64k": {"target": 65536, "sys": SYS_PROMPT_LARGE},
 }
 
 
@@ -131,8 +132,8 @@ _RE_AL = re.compile(r"avg commit/step=(\d+(?:\.\d+)?)")
 _RE_TIMING_LINE = re.compile(r"^\s+([a-z_]+)\s+(\d+(?:\.\d+)?)\s*$")
 
 
-def _parse_dflash(stdout: str) -> dict:
-    """Parse test_dflash stdout into {prefill_s, decode_tps, al, stages{}}."""
+def _parse_dflash(stdout: str, stderr: str = "") -> dict:
+    """Parse test_dflash stdout into {prefill_s, decode_tps, al, kv, stages{}}."""
     m_pf = _RE_DF_PREFILL.search(stdout)
     m_al = _RE_AL.search(stdout)
     # decode tps line is the LAST tok/s in the file ("[dflash] generated ... -> X tok/s")
@@ -140,6 +141,12 @@ def _parse_dflash(stdout: str) -> dict:
     if not (m_pf and m_al and matches):
         raise RuntimeError(f"test_dflash parse failed:\n{stdout[-1500:]}")
     decode_tps = float(matches[-1].group(1))
+
+    # KV cache config emitted by qwen35_target_graph.cpp on stderr
+    kv = ""
+    m_kv = re.search(r"\[kv\]\s+K=(\S+)\s+V=(\S+)\s+rotated_K=(\d)", stderr or stdout)
+    if m_kv:
+        kv = f"K={m_kv.group(1)} V={m_kv.group(2)} rot={m_kv.group(3)}"
 
     # Per-stage timing block (lines like "  draft_compute  14.70")
     stages = {}
@@ -169,6 +176,7 @@ def _parse_dflash(stdout: str) -> dict:
         "n_prompt_seen": int(m_pf.group(1)),
         "decode_tps": decode_tps,
         "al": float(m_al.group(1)),
+        "kv": kv,
         "stages": stages,
     }
 
@@ -198,20 +206,20 @@ def run_ar(path: Path, n_gen: int):
     return p
 
 
-def run_df(path: Path, n_prompt: int, n_gen: int, budget: int = None):
+def run_df(path: Path, n_prompt: int, n_gen: int, budget: int = None, extra_args=None):
     if budget is None:
         budget = BUDGET
     max_ctx = _auto_max_ctx(n_prompt, n_gen)
     out_bin = TMPDIR / "df_out.bin"
-    r, wall_s = _run_timed(
-        [
-            TEST_DFLASH, TARGET, DRAFT, str(path), str(n_gen), str(out_bin),
-            "--fast-rollback", "--ddtree",
-            f"--ddtree-budget={budget}", f"--max-ctx={max_ctx}",
-        ],
-        timeout=900, label="test_dflash",
-    )
-    p = _parse_dflash(r.stdout)
+    cmd = [
+        TEST_DFLASH, TARGET, DRAFT, str(path), str(n_gen), str(out_bin),
+        "--fast-rollback", "--ddtree",
+        f"--ddtree-budget={budget}", f"--max-ctx={max_ctx}",
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    r, wall_s = _run_timed(cmd, timeout=1800, label="test_dflash")
+    p = _parse_dflash(r.stdout, r.stderr)
     p["wall_s"] = wall_s
     p["max_ctx"] = max_ctx
     return p
@@ -329,8 +337,18 @@ def main():
     p.add_argument("--out", type=str, default=str(TMPDIR / "bench_agent_results.json"))
     p.add_argument("--skip-ar", action="store_true",
                    help="skip the AR baseline (useful for budget sweeps)")
+    p.add_argument("--ctk", type=str, default=None,
+                   help="K cache type (f16, q4_0, q8_0, tq3_0, ...)")
+    p.add_argument("--ctv", type=str, default=None,
+                   help="V cache type (f16, q4_0, q8_0, tq3_0, ...)")
     args = p.parse_args()
     BUDGET = args.budget
+
+    df_extra = []
+    if args.ctk:
+        df_extra += ["-ctk", args.ctk]
+    if args.ctv:
+        df_extra += ["-ctv", args.ctv]
 
     DRAFT = _resolve_draft()
     _require_file(TARGET, "target GGUF")
@@ -372,7 +390,7 @@ def main():
             tokenize_to_file(tok, text, path)
 
             try:
-                df_res = run_df(path, n, args.n_gen)
+                df_res = run_df(path, n, args.n_gen, extra_args=df_extra)
             except Exception as e:
                 print(f"  [{i+1:02d}/{len(rows)}] n={n:5d}  DFlash FAILED: {e}",
                       flush=True)
@@ -415,6 +433,7 @@ def main():
                 f"decode={df_res['decode_tps']:6.2f} tok/s  "
                 f"AL={df_res['al']:5.2f}  "
                 f"TTFT={df_ttft_s:6.2f}s  total={df_total_s:6.2f}s"
+                + (f"  [{df_res.get('kv','')}]" if df_res.get('kv') else "")
             )
             if ar_res is not None:
                 ar_decode_s = args.n_gen / max(1e-6, ar_res["decode_tps"])
