@@ -34,16 +34,7 @@ jobs:
             -DDFLASH27B_ENABLE_BSA=OFF \
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target test_dflash test_generate -j$(nproc)
-
-      - name: Build sparse FA smoke target
-        run: |
-          cd dflash
-          cmake -B build-bsa \
-            -DCMAKE_CUDA_ARCHITECTURES="86" \
-            -DDFLASH27B_FA_ALL_QUANTS=OFF \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-bsa --target test_flash_attn_sparse -j$(nproc)
+          cmake --build build --target test_dflash test_generate test_flash_attn_sparse -j$(nproc)
 
       - name: Install megakernel Python deps
         run: pip install torch --index-url https://download.pytorch.org/whl/cu126
