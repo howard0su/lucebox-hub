@@ -1,9 +1,6 @@
 """C++-only NIAH bench: daemon compress + generate, no Python drafter."""
 import argparse, json, sys, time, os
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[2]
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from transformers import AutoTokenizer
 from pflash.dflash_client import DflashClient
@@ -26,11 +23,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", required=True)
     ap.add_argument("--n", type=int, default=1)
-    ap.add_argument("--bin", default=str(ROOT / "dflash" / "build" / "test_dflash"))
-    ap.add_argument("--target", default=str(ROOT / "dflash" / "models" / "Qwen3.6-27B-Q4_K_M.gguf"))
-    ap.add_argument("--draft-spec", default=str(ROOT / "dflash" / "models" / "draft" / "draft-Qwen3.6-27B.gguf"),
+    ap.add_argument("--bin", default="/home/lucebox/lucebox-hub/dflash/build/test_dflash")
+    ap.add_argument("--target", default="/opt/lucebox/models/Qwen3.6-27B-Q4_K_M.gguf")
+    ap.add_argument("--draft-spec", default="/home/lucebox/lucebox-hub/dflash/models/draft/model.safetensors",
                     help="draft model used for spec decoding (NOT drafter scorer)")
-    ap.add_argument("--drafter-gguf", default=str(ROOT / "dflash" / "models" / "Qwen3-0.6B-BF16.gguf"),
+    ap.add_argument("--drafter-gguf", default="/home/lucebox/lucebox-hub/dflash/models/Qwen3-0.6B-BF16.gguf",
                     help="C++ drafter scorer GGUF (Qwen3-0.6B BF16)")
     ap.add_argument("--drafter-arch", default="qwen3-0.6b", choices=["qwen3-0.6b", "qwen35-0.8b"],
                     help="C++ drafter architecture selector")
@@ -144,8 +141,6 @@ def main():
         t0 = time.time()
         compressed_ids = dflash.compress(ids, args.keep_ratio, args.drafter_gguf, args.drafter_arch)
         t_score = time.time() - t0
-        if not compressed_ids:
-            raise RuntimeError("compress returned no token ids")
         comp = len(compressed_ids)
         print(f"[case {i}] compressed={comp} ratio={S/max(comp,1):.1f}x score_s={t_score:.1f}", flush=True)
 
@@ -167,8 +162,6 @@ def main():
         t0 = time.time()
         out_ids = dflash.generate(target_ids, args.n_gen)
         t_gen = time.time() - t0
-        if not out_ids:
-            raise RuntimeError("generate returned no token ids")
         # Re-park for next iter (drafter scoring).
         dflash.park_draft()
         print(f"[case {i}] raw out_ids ({len(out_ids)}): {out_ids[:20]}", flush=True)

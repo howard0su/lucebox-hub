@@ -21,30 +21,6 @@ class FakeTokenizer:
         return mapping.get(text, [99])
 
 
-def _prefill_cfg(**overrides) -> PrefillConfig:
-    cfg = dict(
-        mode="auto",
-        threshold=32000,
-        keep_ratio=0.05,
-        drafter_gguf=Path("drafter.gguf"),
-        drafter_tokenizer_id="Qwen/Qwen3-0.6B",
-        skip_park=False,
-    )
-    cfg.update(overrides)
-    return PrefillConfig(**cfg)
-
-
-def test_prefill_policy_modes_and_threshold():
-    off_cfg = _prefill_cfg(mode="off")
-    always_cfg = _prefill_cfg(mode="always")
-    auto_cfg = _prefill_cfg(mode="auto", threshold=100)
-
-    assert off_cfg.build_policy().decide(1000).compress is False
-    assert always_cfg.build_policy().decide(0).compress is True
-    assert auto_cfg.build_policy().decide(99).compress is False
-    assert auto_cfg.build_policy().decide(100).compress is True
-
-
 def make_cache(tmp_path: Path, *, cap: int = 2, full_cap: int = 2,
                kv_k_type: str = "q8_0", fa_window: int = 2048,
                budget_bytes: int = 0) -> PrefixCache:

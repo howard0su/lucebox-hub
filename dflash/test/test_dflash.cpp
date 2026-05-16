@@ -2360,8 +2360,6 @@ int main(int argc, char ** argv) {
         }
         cache.sfi_selected[0] = sfi::compute_sfi_indices(
             cache.sfi_selector[0], committed, cache.sfi_budget);
-        std::printf("[sfi] init budget=%d indices=%d committed=%d\n",
-                    cache.sfi_budget, (int)cache.sfi_selected[0].size(), committed);
     }
 
     int n_draft_steps = 0, n_accept_sum = 0, n_generated = 0;

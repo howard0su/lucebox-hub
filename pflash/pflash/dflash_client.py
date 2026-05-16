@@ -125,11 +125,6 @@ class DflashClient:
             if struct.unpack("<i", b)[0] == -1:
                 break
 
-    def _raise_if_dead(self, op: str):
-        rc = self.proc.poll()
-        if rc is not None:
-            raise RuntimeError(f"dflash daemon exited during {op} (exit {rc})")
-
     def free_drafter(self): self._send("free drafter\n")
     def park_draft(self):    self._send("park draft\n")
     def unpark_draft(self):  self._send("unpark draft\n")
@@ -146,23 +141,20 @@ class DflashClient:
         with os.fdopen(fd, "wb") as f:
             for t in prompt_ids:
                 f.write(struct.pack("<i", int(t)))
-        try:
-            keep_x1000 = int(round(keep_ratio * 1000))
-            self.proc.stdin.write(f"compress {path} {keep_x1000} {drafter_gguf} {drafter_arch}\n".encode())
-            self.proc.stdin.flush()
-            toks = []
-            while True:
-                b = os.read(self.r_pipe, 4)
-                if not b or len(b) < 4:
-                    break
-                v = struct.unpack("<i", b)[0]
-                if v == -1:
-                    break
-                toks.append(v)
-            self._raise_if_dead("compress")
-            return toks
-        finally:
-            os.unlink(path)
+        keep_x1000 = int(round(keep_ratio * 1000))
+        self.proc.stdin.write(f"compress {path} {keep_x1000} {drafter_gguf} {drafter_arch}\n".encode())
+        self.proc.stdin.flush()
+        toks = []
+        while True:
+            b = os.read(self.r_pipe, 4)
+            if not b or len(b) < 4:
+                break
+            v = struct.unpack("<i", b)[0]
+            if v == -1:
+                break
+            toks.append(v)
+        os.unlink(path)
+        return toks
 
     def generate(self, prompt_ids: list[int], n_gen: int) -> list[int]:
         """Send prompt + n_gen request, return generated token ids."""
@@ -170,22 +162,19 @@ class DflashClient:
         with os.fdopen(fd, "wb") as f:
             for t in prompt_ids:
                 f.write(struct.pack("<i", int(t)))
-        try:
-            self.proc.stdin.write(f"{path} {n_gen}\n".encode())
-            self.proc.stdin.flush()
-            toks = []
-            while True:
-                b = os.read(self.r_pipe, 4)
-                if not b or len(b) < 4:
-                    break
-                v = struct.unpack("<i", b)[0]
-                if v == -1:
-                    break
-                toks.append(v)
-            self._raise_if_dead("generate")
-            return toks
-        finally:
-            os.unlink(path)
+        self.proc.stdin.write(f"{path} {n_gen}\n".encode())
+        self.proc.stdin.flush()
+        toks = []
+        while True:
+            b = os.read(self.r_pipe, 4)
+            if not b or len(b) < 4:
+                break
+            v = struct.unpack("<i", b)[0]
+            if v == -1:
+                break
+            toks.append(v)
+        os.unlink(path)
+        return toks
 
     def close(self, timeout: float = 5.0):
         try:

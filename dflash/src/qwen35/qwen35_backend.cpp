@@ -228,31 +228,18 @@ int Qwen35Backend::snapshot_cur_pos(int slot) const {
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
-    char ppath[1024];
-    int  keep_x1000 = 0;
-    char drafter_path[1024];
-    char arch_name[64] = "qwen3-0.6b";
-    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s %63s",
-                              ppath, &keep_x1000, drafter_path, arch_name);
-    if (n < 3) {
-        std::fprintf(stderr,
-                     "[compress] bad args, need: <bin> <keep_x1000> <drafter_gguf> [drafter_arch]\n");
-        io.emit(-1);
-        return true;
-    }
-
-    DrafterArch drafter_arch;
-    if (!parse_drafter_arch(arch_name, drafter_arch)) {
-        std::fprintf(stderr, "[compress] bad drafter_arch: %s\n", arch_name);
-        io.emit(-1);
-        return true;
-    }
-
-    std::vector<int32_t> tokens = read_int32_file(ppath);
-    if (tokens.empty()) {
-        std::fprintf(stderr, "[compress] empty input\n");
-        io.emit(-1);
-        return true;
+    // Lazy-load drafter on first use
+    if (!drafter_loaded_) {
+        std::fprintf(stderr, "[compress] loading drafter...\n");
+        if (!load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf",
+                          /*gpu_layers=*/999, drafter_ctx_)) {
+            std::fprintf(stderr, "[compress] drafter init failed: %s\n",
+                         dflash27b_last_error());
+            io.emit(-1);
+            return false;
+        }
+        drafter_loaded_ = true;
+        std::fprintf(stderr, "[compress] drafter ready\n");
     }
 
     // Park target+draft to free VRAM for the drafter
@@ -261,43 +248,30 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     if (!target_parked_) park("target");
     if (!draft_parked_)  park("draft");
 
-    const auto restore_park_state = [&]() {
-        if (!was_target_parked) unpark("target");
-        if (!was_draft_parked)  unpark("draft");
-    };
+    // Parse: "compress <n_draft> <prompt_path>"
+    std::istringstream iss(line);
+    std::string cmd;
+    int n_draft = 0;
+    std::string prompt_path;
+    iss >> cmd >> n_draft >> prompt_path;
 
-    const bool drafter_mismatch =
-        !drafter_loaded_ ||
-        drafter_path_ != drafter_path ||
-        drafter_arch_ != drafter_arch;
-    if (drafter_mismatch) {
-        if (drafter_loaded_) {
-            free_drafter();
+    bool ok = false;
+    if (n_draft > 0 && !prompt_path.empty()) {
+        std::vector<int32_t> tokens = read_int32_file(prompt_path);
+        if (!tokens.empty()) {
+            const float keep = (float)n_draft / (float)tokens.size();
+            auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep);
+            ok = !compressed.empty();
+            if (ok) {
+                for (int32_t t : compressed) io.emit(t);
+            }
         }
-        std::fprintf(stderr, "[compress] loading drafter...\n");
-        if (!load_drafter(drafter_path, /*gpu_layers=*/999, drafter_arch, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] drafter init failed: %s\n",
-                         dflash27b_last_error());
-            restore_park_state();
-            io.emit(-1);
-            return true;
-        }
-        drafter_loaded_ = true;
-        drafter_path_ = drafter_path;
-        drafter_arch_ = drafter_arch;
-        std::fprintf(stderr, "[compress] drafter ready (%s, arch=%s)\n",
-                     drafter_path_.c_str(), drafter_arch_name(drafter_arch_));
-    }
-
-    const float keep = (float)keep_x1000 / 1000.0f;
-    auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep);
-    const bool ok = !compressed.empty();
-    if (ok) {
-        for (int32_t t : compressed) io.emit(t);
     }
     io.emit(-1);
 
-    restore_park_state();
+    // Restore park state
+    if (!was_target_parked) unpark("target");
+    if (!was_draft_parked)  unpark("draft");
 
     return ok;
 }
@@ -306,7 +280,6 @@ void Qwen35Backend::free_drafter() {
     if (drafter_loaded_) {
         dflash27b::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
-        drafter_path_.clear();
         std::printf("[drafter] freed\n"); std::fflush(stdout);
     }
 }

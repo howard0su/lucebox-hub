@@ -49,39 +49,6 @@ def _send_and_ack(daemon_stdin, r_pipe: int, line: str) -> None:
     _drain_until_sentinel(r_pipe)
 
 
-def _tokenize_with_drafter(drafter_tokenizer, prompt_text: str) -> list[int]:
-    drafter_ids = drafter_tokenizer(
-        prompt_text,
-        return_tensors=None,
-        add_special_tokens=False,
-    )["input_ids"]
-    if drafter_ids and isinstance(drafter_ids[0], list):
-        drafter_ids = drafter_ids[0]
-    return [int(t) for t in drafter_ids]
-
-
-def _write_ids_tempfile(ids: list[int]) -> str:
-    fd, path = tempfile.mkstemp(suffix=".bin")
-    with os.fdopen(fd, "wb") as f:
-        for t in ids:
-            f.write(struct.pack("<i", int(t)))
-    return path
-
-
-def _compress_ids_via_daemon(
-    *,
-    daemon_stdin,
-    r_pipe: int,
-    cfg: "PrefillConfig",
-    ids_path: str,
-) -> list[int]:
-    keep_x1000 = int(round(cfg.keep_ratio * 1000))
-    daemon_stdin.write(
-        f"compress {ids_path} {keep_x1000} {cfg.drafter_gguf}\n".encode("utf-8"))
-    daemon_stdin.flush()
-    return _drain_until_sentinel(r_pipe)
-
-
 # ─── public configuration block ────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -98,40 +65,12 @@ class PrefillConfig:
     def enabled(self) -> bool:
         return self.mode != "off"
 
-    def build_policy(self) -> "PrefillPolicy":
-        return PrefillPolicy(self)
-
     def should_compress(self, prompt_token_count: int) -> bool:
-        return self.build_policy().decide(prompt_token_count=prompt_token_count).compress
-
-
-@dataclass(frozen=True)
-class PrefillDecision:
-    compress: bool
-    reason: str
-    mode: str
-    prompt_token_count: int
-    threshold_enter: int
-
-
-class PrefillPolicy:
-    """Fast/slow scheduler for speculative prefill decisions."""
-
-    def __init__(self, cfg: PrefillConfig):
-        self.cfg = cfg
-
-    def decide(self, prompt_token_count: int) -> PrefillDecision:
-        mode = self.cfg.mode
-        enter = self.cfg.threshold
-
-        if mode == "always":
-            return PrefillDecision(True, "mode_always", mode, prompt_token_count, enter)
-        if mode != "auto":
-            return PrefillDecision(False, "mode_off", mode, prompt_token_count, enter)
-
-        compress = prompt_token_count >= enter
-        reason = "auto_enter" if compress else "auto_below_enter"
-        return PrefillDecision(compress, reason, mode, prompt_token_count, enter)
+        if self.mode == "always":
+            return True
+        if self.mode == "auto":
+            return prompt_token_count >= self.threshold
+        return False
 
 
 def add_cli_flags(ap) -> None:
@@ -143,10 +82,10 @@ def add_cli_flags(ap) -> None:
                          "'always' compresses every request.")
     ap.add_argument("--prefill-threshold", type=int, default=32000,
                     help="Token threshold above which 'auto' mode triggers "
-                          "compression (default 32000).")
+                         "compression (default 32000).")
     ap.add_argument("--prefill-keep-ratio", type=float, default=0.05,
                     help="Fraction of source tokens to keep after compression "
-                          "(default 0.05; bench setting).")
+                         "(default 0.05; bench setting).")
     ap.add_argument("--prefill-drafter", type=Path, default=None,
                     help="Path to the drafter Qwen3-0.6B BF16 GGUF used by "
                          "the daemon's compress command. Required when "
@@ -162,10 +101,6 @@ def add_cli_flags(ap) -> None:
 
 
 def config_from_args(args) -> PrefillConfig:
-    threshold = int(args.prefill_threshold)
-    if threshold < 0:
-        raise SystemExit("--prefill-threshold must be >= 0")
-
     if args.prefill_compression != "off" and args.prefill_drafter is None:
         raise SystemExit(
             "--prefill-compression != off requires --prefill-drafter "
@@ -176,7 +111,7 @@ def config_from_args(args) -> PrefillConfig:
         raise SystemExit("--prefill-keep-ratio must be in (0.0, 1.0]")
     return PrefillConfig(
         mode=args.prefill_compression,
-        threshold=threshold,
+        threshold=args.prefill_threshold,
         keep_ratio=args.prefill_keep_ratio,
         drafter_gguf=args.prefill_drafter,
         drafter_tokenizer_id=args.prefill_drafter_tokenizer,
@@ -206,23 +141,29 @@ def compress_text_via_daemon(
     subsequent requests, avoiding the ~2s reload penalty per request.
     """
     # 1) drafter-tokenize the prompt
-    drafter_ids = _tokenize_with_drafter(drafter_tokenizer, prompt_text)
+    drafter_ids = drafter_tokenizer(prompt_text, return_tensors=None,
+                                    add_special_tokens=False)["input_ids"]
+    if isinstance(drafter_ids[0], list):  # some tokenizers return [[...]]
+        drafter_ids = drafter_ids[0]
 
     # 2) write drafter ids to a tempfile
-    path = _write_ids_tempfile(drafter_ids)
+    fd, path = tempfile.mkstemp(suffix=".bin")
     try:
+        with os.fdopen(fd, "wb") as f:
+            for t in drafter_ids:
+                f.write(struct.pack("<i", int(t)))
+
         if not skip_park:
             # 3) park target + draft so drafter has VRAM headroom on a 24 GB card
             _send_and_ack(daemon_stdin, r_pipe, "park target\n")
             _send_and_ack(daemon_stdin, r_pipe, "park draft\n")
 
         # 4) compress: drafter loads, FlashPrefill scoring, emit compressed ids, drafter held
-        compressed_ids = _compress_ids_via_daemon(
-            daemon_stdin=daemon_stdin,
-            r_pipe=r_pipe,
-            cfg=cfg,
-            ids_path=path,
-        )
+        keep_x1000 = int(round(cfg.keep_ratio * 1000))
+        daemon_stdin.write(
+            f"compress {path} {keep_x1000} {cfg.drafter_gguf}\n".encode("utf-8"))
+        daemon_stdin.flush()
+        compressed_ids = _drain_until_sentinel(r_pipe)
 
         if not skip_park:
             # 5) free drafter weights + BSA scratch, then restore target + draft

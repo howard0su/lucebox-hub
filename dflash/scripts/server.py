@@ -754,13 +754,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             return JSONResponse({"status": "error", "detail": "daemon exited"}, status_code=503)
         return {"status": "ok"}
 
-    prefill_policy_stats = {
-        "total": 0,
-        "compress": 0,
-        "skip": 0,
-        "reasons": {},
-    }
-
     # FIX 5: richer /v1/models response — Open WebUI uses `context_length` and
     # `created` to populate the model picker and context-bar correctly.
     @app.get("/v1/models")
@@ -795,10 +788,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 "max_context_length": max_ctx,
             }],
         }
-
-    @app.get("/v1/debug/prefill-policy")
-    def prefill_policy_debug():
-        return {"prefill_policy": prefill_policy_stats}
 
     def _ids_to_bin(ids: list[int]) -> Path:
         fd, path = tempfile.mkstemp(suffix=".bin")
@@ -883,20 +872,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         ) -> tuple[Path, list[int]]:
         if not prefill_cfg or not prefill_cfg.enabled:
             return prompt_bin, prompt_ids
-        decision = prefill_cfg.build_policy().decide(
-            prompt_token_count=len(prompt_ids),
-        )
-        prefill_policy_stats["total"] += 1
-        prefill_policy_stats["reasons"][decision.reason] = (
-            prefill_policy_stats["reasons"].get(decision.reason, 0) + 1
-        )
-        if not decision.compress:
-            prefill_policy_stats["skip"] += 1
+        if not prefill_cfg.should_compress(len(prompt_ids)):
             return prompt_bin, prompt_ids
         if drafter_tokenizer is None:
-            prefill_policy_stats["skip"] += 1
             return prompt_bin, prompt_ids
-        prefill_policy_stats["compress"] += 1
 
         last_user_idx = next((i for i in range(len(msgs) - 1, -1, -1)
                               if msgs[i]["role"] == "user"), None)
@@ -2339,10 +2318,6 @@ def main():
                     choices=["f16","bf16","q4_0","q4_1","q5_0","q5_1","q8_0","tq3_0"])
     ap.add_argument("--fa-window", type=int, default=None,
                     help="Sliding window for FA layers. 0 = full attention.")
-    ap.add_argument("--fa-refresh-interval", type=int, default=None,
-                    help="Optional slow-refresh cadence for FA layers. "
-                         "When set to N>0, force one full-attention refresh "
-                         "every N decode positions (env: DFLASH27B_FA_REFRESH_INTERVAL).")
     ap.add_argument("--tokenizer", type=str, default=None)
     ap.add_argument("--lazy-draft", action="store_true",
                     help="Park decode draft (~3.3 GB) when idle; unpark/park "
@@ -2396,8 +2371,6 @@ def main():
 
     if args.fa_window is not None:
         os.environ["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
-    if args.fa_refresh_interval is not None:
-        os.environ["DFLASH27B_FA_REFRESH_INTERVAL"] = str(args.fa_refresh_interval)
 
     placement = resolve_server_placement(args)
     placement.apply_env(os.environ)
