@@ -12,7 +12,7 @@ Usage (RTX 2080 Ti example):
         --fa-window 4096 \
         --bin dflash/build/test_dflash \
         --target dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
-        --draft-spec dflash/models/draft/draft-Qwen3.6-27B.safetensors \
+        --draft-spec dflash/models/draft/draft-Qwen3.6-27B.gguf \
         --drafter-gguf dflash/models/Qwen3-0.6B-BF16.gguf
 """
 import argparse
@@ -168,7 +168,7 @@ def main():
     ap.add_argument("--bin", default="dflash/build/test_dflash")
     ap.add_argument("--target", default="dflash/models/Qwen3.6-27B-Q4_K_M.gguf")
     ap.add_argument("--draft-spec",
-                    default="dflash/models/draft/draft-Qwen3.6-27B.safetensors")
+                    default="dflash/models/draft/draft-Qwen3.6-27B.gguf")
     ap.add_argument("--drafter-gguf",
                     default="dflash/models/Qwen3-0.6B-BF16.gguf")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B")

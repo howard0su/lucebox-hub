@@ -498,7 +498,7 @@ struct QwenGraphInputs {
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
-    ggml_tensor * sfi_gather_idx = nullptr; // [sfi_budget] i32; SFI sparse indices (nullptr = disabled)
+    ggml_tensor * sfi_gather_idx = nullptr; // [sfi_budget, n_head_kv] i32; repeated sparse indices per KV head
     int           sfi_gather_len = 0;       // number of valid indices in sfi_gather_idx
 };
 

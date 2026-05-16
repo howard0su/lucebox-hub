@@ -136,6 +136,8 @@ private:
     // ── Pflash drafter (lazy-loaded) ─────────────────────────────────
     DrafterContext drafter_ctx_;
     bool           drafter_loaded_ = false;
+    std::string    drafter_path_;
+    DrafterArch    drafter_arch_ = DrafterArch::Qwen3_0p6b;
 
     // ── Sampler state ────────────────────────────────────────────────
     SamplerCfg      sampler_;

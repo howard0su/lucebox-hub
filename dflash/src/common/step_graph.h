@@ -29,7 +29,7 @@ struct StepGraph {
     ggml_tensor *   target_hidden_cat = nullptr;  // draft only
     ggml_tensor *   positions_k = nullptr;        // draft only
     ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
-    ggml_tensor *   sfi_gather_idx = nullptr;     // SFI sparse indices [sfi_budget] i32; null when disabled
+    ggml_tensor *   sfi_gather_idx = nullptr;     // SFI sparse indices [sfi_budget, n_head_kv] i32; null when disabled
 
     // Output
     ggml_tensor *   logits = nullptr;

@@ -238,11 +238,15 @@ static bool sfi_fill_indices(StepGraph & sg, TargetCache & cache, int kv_start) 
     }
     const auto & idx = cache.sfi_selected[0];
     if (idx.empty()) return false;
-    std::vector<int32_t> idx_buf(cache.sfi_budget, (int32_t)idx.back());
+    const int n_head_kv = cache.attn_k.empty() ? 1 : (int)cache.attn_k[0]->ne[2];
+    std::vector<int32_t> idx_buf((size_t)cache.sfi_budget * n_head_kv, (int32_t)idx.back());
     const int n = std::min((int)idx.size(), cache.sfi_budget);
-    for (int i = 0; i < n; i++) idx_buf[i] = idx[i];
+    for (int h = 0; h < n_head_kv; ++h) {
+        int32_t * head_idx = idx_buf.data() + (size_t)h * cache.sfi_budget;
+        for (int i = 0; i < n; i++) head_idx[i] = idx[i];
+    }
     ggml_backend_tensor_set(sg.sfi_gather_idx, idx_buf.data(), 0,
-                            sizeof(int32_t) * cache.sfi_budget);
+                            sizeof(int32_t) * idx_buf.size());
     return true;
 }
 

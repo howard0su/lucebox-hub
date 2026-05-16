@@ -8,6 +8,7 @@
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "qwen3/qwen3_drafter.h"
+#include "sfi_decode_utils.h"
 
 #include "ggml-cuda.h"
 
@@ -21,6 +22,44 @@ namespace dflash27b {
 #define IS_EOS_TOK(tok, w)                                         \
     ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
    || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) )
+
+namespace {
+
+void sfi_refresh_heuristic(TargetCache & cache, int kv_len) {
+    if (cache.sfi_budget <= 0 || kv_len <= 0 || cache.sfi_selector.empty()) return;
+    for (auto & scores : cache.sfi_selector) {
+        sfi::refresh_selector_heuristic(scores, kv_len);
+    }
+    if (!cache.sfi_selected.empty()) {
+        cache.sfi_selected[0] = sfi::compute_sfi_indices(
+            cache.sfi_selector[0], kv_len, cache.sfi_budget);
+    }
+}
+
+bool sfi_fill_indices(StepGraph & sg, TargetCache & cache, int kv_len, int n_head_kv) {
+    if (!sg.sfi_gather_idx || cache.sfi_budget <= 0 || kv_len <= 0) return false;
+    if (cache.sfi_selected.empty() || cache.sfi_selected[0].empty()) {
+        if (cache.sfi_selector.empty() || cache.sfi_selector[0].empty()) return false;
+        cache.sfi_selected[0] = sfi::compute_sfi_indices(
+            cache.sfi_selector[0], kv_len, cache.sfi_budget);
+    }
+
+    const auto & idx = cache.sfi_selected[0];
+    if (idx.empty()) return false;
+
+    std::vector<int32_t> idx_buf((size_t)cache.sfi_budget * n_head_kv, (int32_t)idx.back());
+    const int n = std::min((int)idx.size(), cache.sfi_budget);
+    for (int h = 0; h < n_head_kv; ++h) {
+        int32_t * head_idx = idx_buf.data() + (size_t)h * cache.sfi_budget;
+        for (int i = 0; i < n; ++i) head_idx[i] = idx[i];
+    }
+
+    ggml_backend_tensor_set(sg.sfi_gather_idx, idx_buf.data(), 0,
+                            sizeof(int32_t) * idx_buf.size());
+    return true;
+}
+
+} // namespace
 
 // ── Construction / destruction ──────────────────────────────────────────
 
@@ -189,18 +228,31 @@ int Qwen35Backend::snapshot_cur_pos(int slot) const {
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
-    // Lazy-load drafter on first use
-    if (!drafter_loaded_) {
-        std::fprintf(stderr, "[compress] loading drafter...\n");
-        if (!load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf",
-                          /*gpu_layers=*/999, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] drafter init failed: %s\n",
-                         dflash27b_last_error());
-            io.emit(-1);
-            return false;
-        }
-        drafter_loaded_ = true;
-        std::fprintf(stderr, "[compress] drafter ready\n");
+    char ppath[1024];
+    int  keep_x1000 = 0;
+    char drafter_path[1024];
+    char arch_name[64] = "qwen3-0.6b";
+    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s %63s",
+                              ppath, &keep_x1000, drafter_path, arch_name);
+    if (n < 3) {
+        std::fprintf(stderr,
+                     "[compress] bad args, need: <bin> <keep_x1000> <drafter_gguf> [drafter_arch]\n");
+        io.emit(-1);
+        return true;
+    }
+
+    DrafterArch drafter_arch;
+    if (!parse_drafter_arch(arch_name, drafter_arch)) {
+        std::fprintf(stderr, "[compress] bad drafter_arch: %s\n", arch_name);
+        io.emit(-1);
+        return true;
+    }
+
+    std::vector<int32_t> tokens = read_int32_file(ppath);
+    if (tokens.empty()) {
+        std::fprintf(stderr, "[compress] empty input\n");
+        io.emit(-1);
+        return true;
     }
 
     // Park target+draft to free VRAM for the drafter
@@ -209,30 +261,43 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     if (!target_parked_) park("target");
     if (!draft_parked_)  park("draft");
 
-    // Parse: "compress <n_draft> <prompt_path>"
-    std::istringstream iss(line);
-    std::string cmd;
-    int n_draft = 0;
-    std::string prompt_path;
-    iss >> cmd >> n_draft >> prompt_path;
+    const auto restore_park_state = [&]() {
+        if (!was_target_parked) unpark("target");
+        if (!was_draft_parked)  unpark("draft");
+    };
 
-    bool ok = false;
-    if (n_draft > 0 && !prompt_path.empty()) {
-        std::vector<int32_t> tokens = read_int32_file(prompt_path);
-        if (!tokens.empty()) {
-            const float keep = (float)n_draft / (float)tokens.size();
-            auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep);
-            ok = !compressed.empty();
-            if (ok) {
-                for (int32_t t : compressed) io.emit(t);
-            }
+    const bool drafter_mismatch =
+        !drafter_loaded_ ||
+        drafter_path_ != drafter_path ||
+        drafter_arch_ != drafter_arch;
+    if (drafter_mismatch) {
+        if (drafter_loaded_) {
+            free_drafter();
         }
+        std::fprintf(stderr, "[compress] loading drafter...\n");
+        if (!load_drafter(drafter_path, /*gpu_layers=*/999, drafter_arch, drafter_ctx_)) {
+            std::fprintf(stderr, "[compress] drafter init failed: %s\n",
+                         dflash27b_last_error());
+            restore_park_state();
+            io.emit(-1);
+            return true;
+        }
+        drafter_loaded_ = true;
+        drafter_path_ = drafter_path;
+        drafter_arch_ = drafter_arch;
+        std::fprintf(stderr, "[compress] drafter ready (%s, arch=%s)\n",
+                     drafter_path_.c_str(), drafter_arch_name(drafter_arch_));
+    }
+
+    const float keep = (float)keep_x1000 / 1000.0f;
+    auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep);
+    const bool ok = !compressed.empty();
+    if (ok) {
+        for (int32_t t : compressed) io.emit(t);
     }
     io.emit(-1);
 
-    // Restore park state
-    if (!was_target_parked) unpark("target");
-    if (!was_draft_parked)  unpark("draft");
+    restore_park_state();
 
     return ok;
 }
@@ -241,6 +306,7 @@ void Qwen35Backend::free_drafter() {
     if (drafter_loaded_) {
         dflash27b::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
+        drafter_path_.clear();
         std::printf("[drafter] freed\n"); std::fflush(stdout);
     }
 }
@@ -453,6 +519,12 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             return -1;
         }
 
+        int32_t last_tok = -1;
+        const size_t argmax_off =
+            (start + n_tokens < prompt_len) ? 0 : sizeof(int32_t) * (size_t)(n_tokens - 1);
+        ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, argmax_off, sizeof(int32_t));
+        cache_.last_tok = last_tok;
+
         // Snapshot at boundary if requested
         if (snap_pos >= 0 && snap_slot >= 0 &&
             start + n_tokens >= snap_pos && start < snap_pos) {
@@ -473,6 +545,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
     }
 
+    sfi_refresh_heuristic(cache_, committed);
+
     return committed;
 }
 
@@ -492,9 +566,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
+    const int refresh_interval = sfi::parse_env_int("DFLASH27B_FA_REFRESH_INTERVAL", 0);
     std::vector<float> logits_buf(vocab);
     std::vector<float> embed_buf_vec(hidden);
     float * embed_buf = embed_buf_vec.data();
+
+    if (cache_.sfi_budget > 0 && committed > 0 &&
+        (cache_.sfi_selected.empty() || cache_.sfi_selected[0].empty())) {
+        sfi_refresh_heuristic(cache_, committed);
+    }
 
     for (int i = 0; i < n_gen; i++) {
         if (!build_target_step(sg_, w_, cache_, target_backend_,
@@ -507,20 +587,24 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return false;
         }
 
+        sfi_fill_indices(sg_, cache_, committed, w_.n_head_kv);
+
         // Get last generated token (or first prompt token for first iter)
         int32_t tok = out_tokens.empty()
-            ? 0  // Should not happen — prefill emits at least one logit
+            ? cache_.last_tok
             : out_tokens.back();
 
         if (i == 0 && out_tokens.empty()) {
-            // First decode: read argmax from prefill's last logits
-            int32_t argmax = 0;
-            ggml_backend_tensor_get(sg_.argmax_tokens, &argmax, 0, sizeof(int32_t));
-            tok = argmax;
+            if (tok < 0) return false;
             out_tokens.push_back(tok);
             io.emit(tok);
             if (IS_EOS_TOK(tok, w_)) { io.emit(-1); return true; }
             committed++;
+            cache_.cur_pos = committed;
+            cache_.last_tok = tok;
+            if (refresh_interval > 0 && (committed % refresh_interval) == 0) {
+                sfi_refresh_heuristic(cache_, committed);
+            }
             continue;
         }
 
@@ -551,6 +635,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         io.emit(next_tok);
         committed++;
         cache_.cur_pos = committed;
+        cache_.last_tok = next_tok;
+
+        if (refresh_interval > 0 && (committed % refresh_interval) == 0) {
+            sfi_refresh_heuristic(cache_, committed);
+        }
 
         if (IS_EOS_TOK(next_tok, w_)) break;
     }

@@ -88,7 +88,7 @@ python tests/niah_gen.py --n 1 --ctx 131072 --out /tmp/niah_128k.jsonl
 python tests/bench_niah_cpp.py \
   --bin    ../dflash/build/test_dflash \
   --target ../dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft-spec ../dflash/models/draft/model.safetensors \
+  --draft-spec ../dflash/models/draft/draft-Qwen3.6-27B.gguf \
   --drafter-gguf ../dflash/models/Qwen3-0.6B-BF16.gguf \
   --cases  /tmp/niah_128k.jsonl --keep-ratio 0.05 --n-gen 256
 ```
@@ -110,7 +110,7 @@ When `--prefill-compression != off`, the server auto-sets `DFLASH27B_LM_HEAD_FIX
 ```bash
 python dflash/scripts/server.py \
   --target dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft  dflash/models/draft/model.safetensors \
+  --draft  dflash/models/draft/draft-Qwen3.6-27B.gguf \
   --max-ctx 8192 --budget 16 --fa-window 0 \
   --prefill-compression auto \
   --prefill-threshold 4096 \
@@ -128,7 +128,7 @@ The dflash daemon runs persistently and accepts these commands on stdin (newline
 
 | Command | Effect |
 |---|---|
-| `compress <ids.bin> <keep_x1000> <drafter.gguf>` | Drafter scores the prompt and emits the compressed token-id stream (terminated by `-1`). |
+| `compress <ids.bin> <keep_x1000> <drafter.gguf> [drafter_arch]` | Drafter scores the prompt and emits the compressed token-id stream (terminated by `-1`). |
 | `generate <prompt_ids.bin> <n_gen> <out_ids.bin>` | Target spec-decode on the (already compressed) prompt. Streams committed token ids on stdout. |
 | `park draft` / `park target` / `park` | Free draft / target / both weights from VRAM. |
 | `unpark draft` / `unpark target` / `unpark` | Restore weights from disk to VRAM. |

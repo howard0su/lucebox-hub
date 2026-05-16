@@ -135,7 +135,8 @@ bool build_target_step(
     gi.last_token_logits_only     = last_token_logits_only;
 
     if (cache.sfi_budget > 0 && n_tokens == 1 && !with_mask) {
-        sg.sfi_gather_idx = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, cache.sfi_budget);
+        sg.sfi_gather_idx = ggml_new_tensor_2d(
+            sg.ctx, GGML_TYPE_I32, cache.sfi_budget, w.n_head_kv);
         ggml_set_name(sg.sfi_gather_idx, "sfi_gather_idx");
         ggml_set_input(sg.sfi_gather_idx);
         gi.sfi_gather_idx = sg.sfi_gather_idx;
