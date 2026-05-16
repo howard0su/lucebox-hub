@@ -1572,6 +1572,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     timing = {}
                     full_snap_prep_ref = [None]
                     snap_prep = None
+                    snap_waiter = None
 
                     full_hit = prefix_cache.lookup_full(prompt_ids)
                     if full_hit is not None:
@@ -1609,6 +1610,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         cmd_line, snap_prep = _build_cmd_line(
                             req, cur_bin, cur_ids, gen_len, prefix_cache,
                             prompt_ids, full_snap_prep_ref, compression_fired)
+                        snap_waiter = _prime_inline_snap_waiter(snap_prep)
 
                     message_start = {
                         "type": "message_start",
@@ -1700,6 +1702,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             timing = {}
             full_snap_prep_ref = [None]
             snap_prep = None
+            snap_waiter = None
 
             full_hit = prefix_cache.lookup_full(prompt_ids)
             if full_hit is not None:
@@ -1934,6 +1937,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             timing = {}
             full_snap_prep_ref = [None]
             snap_prep = None
+            snap_waiter = None
 
             full_hit = prefix_cache.lookup_full(prompt_ids)
             if full_hit is not None:
