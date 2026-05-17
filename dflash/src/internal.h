@@ -449,6 +449,12 @@ void free_target_cache(TargetCache & c);
 // requests to avoid the ~5 s overhead of full cache destruction + recreation.
 void reset_target_cache(TargetCache & c);
 
+// Zero only the recurrent state (SSM + conv) without touching the KV cache.
+// Much cheaper than reset_target_cache for new requests where KV will be
+// overwritten during prefill anyway. Essential between HTTP requests to avoid
+// stale delta-net state corrupting subsequent prefills.
+void reset_recurrent_state(TargetCache & c);
+
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
 bool migrate_prefill_cache(const TargetWeights & w,

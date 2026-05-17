@@ -305,6 +305,20 @@ void reset_target_cache(TargetCache & c) {
     }
 }
 
+void reset_recurrent_state(TargetCache & c) {
+    auto zero_tensors = [](const std::vector<ggml_tensor *> & tensors) {
+        std::vector<uint8_t> zeros;
+        for (ggml_tensor * t : tensors) {
+            if (!t) continue;
+            const size_t nb = ggml_nbytes(t);
+            if (zeros.size() < nb) zeros.resize(nb, 0);
+            ggml_backend_tensor_set(t, zeros.data(), 0, nb);
+        }
+    };
+    zero_tensors(c.ssm_state);
+    zero_tensors(c.conv_state);
+}
+
 // Attach rollback tensors to an existing prefill cache without touching the
 // base tensors (KV, SSM, conv, target_feat) that prefill already populated.
 // No D2D copies — the base tensors stay right where the graph wrote them.
