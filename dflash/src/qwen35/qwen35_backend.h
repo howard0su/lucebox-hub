@@ -155,6 +155,11 @@ private:
                         std::vector<int32_t> & out_tokens,
                         const DaemonIO & io);
 
+    // AR decode fallback (no draft model or sampling mode).
+    bool do_ar_decode(int committed, int n_gen,
+                      std::vector<int32_t> & out_tokens,
+                      const DaemonIO & io);
+
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);
 

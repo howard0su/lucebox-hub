@@ -3,6 +3,7 @@
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
 #include "step_graph.h"
+#include "attn_masks.h"
 
 namespace dflash27b {
 
@@ -41,12 +42,16 @@ bool Qwen35DFlashTarget::verify_batch(
                            fa_window_,
                            /*last_token_logits_only=*/false,
                            kq_stride_pad_)) {
+        std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
 
     // Embed input tokens and fill positions.
     std::vector<float> embed((size_t)n_tokens * hidden);
-    if (!w_.embedder.embed(tokens.data(), n_tokens, embed.data())) return false;
+    if (!w_.embedder.embed(tokens.data(), n_tokens, embed.data())) {
+        std::fprintf(stderr, "verify_batch: embed failed (n=%d)\n", n_tokens);
+        return false;
+    }
     ggml_backend_tensor_set(sg_.inp_embed, embed.data(), 0,
                             sizeof(float) * embed.size());
 
@@ -61,22 +66,32 @@ bool Qwen35DFlashTarget::verify_batch(
     ggml_backend_tensor_set(sg_.positions, pos.data(), 0,
                             sizeof(int32_t) * pos.size());
 
-    auto st = ggml_backend_graph_compute(backend_, sg_.gf);
-    if (st != GGML_STATUS_SUCCESS) return false;
-
-    // Read argmax from last token.
-    if (n_tokens == 1) {
-        ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, 0, sizeof(int32_t));
-    } else {
-        ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok,
-                                (size_t)(n_tokens - 1) * sizeof(int32_t),
-                                sizeof(int32_t));
+    // Fill causal attention mask when present.
+    if (sg_.attn_mask) {
+        const int win_start = (fa_window_ > 0 && base_pos > fa_window_)
+                                  ? (base_pos - fa_window_) : 0;
+        const int kv_len = base_pos + n_tokens - win_start;
+        std::vector<uint16_t> mask_buf;
+        build_causal_mask(mask_buf, kv_len, n_tokens, base_pos,
+                          kq_stride_pad_, win_start);
+        ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
+                                sizeof(uint16_t) * mask_buf.size());
     }
 
+    auto st = ggml_backend_graph_compute(backend_, sg_.gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "verify_batch: compute failed (status=%d)\n", (int)st);
+        return false;
+    }
+
+    // Read argmax results from GPU.
+    std::vector<int32_t> argmax_buf(n_tokens);
+    ggml_backend_tensor_get(sg_.argmax_tokens, argmax_buf.data(), 0,
+                            sizeof(int32_t) * n_tokens);
+    last_tok = argmax_buf[n_tokens - 1];
+
     if (all_argmax) {
-        all_argmax->resize(n_tokens);
-        ggml_backend_tensor_get(sg_.argmax_tokens, all_argmax->data(), 0,
-                                sizeof(int32_t) * n_tokens);
+        *all_argmax = std::move(argmax_buf);
     }
 
     cache_.cur_pos = base_pos + n_tokens;
@@ -118,6 +133,7 @@ bool Qwen35DFlashTarget::project_hidden_to_tokens(
     auto st = ggml_backend_graph_compute(backend_, proj_sg_.gf);
     if (st != GGML_STATUS_SUCCESS) return false;
 
+    // Read argmax results from GPU.
     tokens_out.resize(n_tokens);
     ggml_backend_tensor_get(proj_sg_.argmax_tokens, tokens_out.data(), 0,
                             sizeof(int32_t) * n_tokens);
