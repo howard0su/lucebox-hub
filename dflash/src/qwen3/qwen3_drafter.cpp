@@ -197,6 +197,14 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 }
 
 void free_drafter(DrafterContext & ctx) {
+    free_drafter_weights(ctx);
+    if (ctx.backend) {
+        ggml_backend_free(ctx.backend);
+        ctx.backend = nullptr;
+    }
+}
+
+void free_drafter_weights(DrafterContext & ctx) {
     if (ctx.arch == DrafterArch::Qwen35_0p8b && ctx.arch_state) {
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
         free_target_weights(st->weights);
@@ -207,10 +215,6 @@ void free_drafter(DrafterContext & ctx) {
         if (ctx.arch == DrafterArch::Qwen3_0p6b) {
             free_qwen3_drafter_model(ctx.weights);
         }
-    }
-    if (ctx.backend) {
-        ggml_backend_free(ctx.backend);
-        ctx.backend = nullptr;
     }
     ctx.loaded = false;
 }

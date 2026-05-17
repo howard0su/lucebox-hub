@@ -54,6 +54,10 @@ bool load_drafter(const std::string & gguf_path, int gpu_layers,
 
 void free_drafter(DrafterContext & ctx);
 
+// Free only model weights, keeping the CUDA backend alive for reuse.
+// Avoids repeated ggml backend create/destroy which corrupts CUDA state.
+void free_drafter_weights(DrafterContext & ctx);
+
 // Score importance per token via Liu Q-hook tail attention, then chunk-top-K
 // span merge. Returns surviving token IDs (drafter vocab).
 //
