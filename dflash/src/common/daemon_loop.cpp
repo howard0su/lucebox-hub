@@ -30,6 +30,13 @@ namespace dflash27b {
 // ── DaemonIO ────────────────────────────────────────────────────────────
 
 void DaemonIO::emit(int32_t v) const {
+    // Call the token callback for non-sentinel tokens.
+    if (on_token && v >= 0) {
+        if (!on_token(v)) {
+            cancelled = true;
+        }
+    }
+
     if (stream_fd < 0) return;
 #ifndef _WIN32
     ssize_t n = ::write(stream_fd, &v, sizeof(v));
@@ -37,6 +44,38 @@ void DaemonIO::emit(int32_t v) const {
 #else
     _write(stream_fd, &v, sizeof(v));
 #endif
+}
+
+// Default typed compress: delegates to handle_compress via temp file + DaemonIO collector.
+ModelBackend::CompressResult ModelBackend::compress(const CompressRequest & req) {
+    CompressResult result;
+
+    if (req.input_ids.empty()) return result;
+
+    // Write input IDs to temp file (handle_compress reads from file)
+    char tmp_path[] = "/tmp/pflash_XXXXXX.bin";
+    int tmp_fd = mkstemps(tmp_path, 4);
+    if (tmp_fd < 0) return result;
+    ::write(tmp_fd, req.input_ids.data(), req.input_ids.size() * sizeof(int32_t));
+    ::close(tmp_fd);
+
+    // Build collecting DaemonIO
+    DaemonIO io;
+    io.stream_fd = -1;
+    io.on_token = [&](int32_t tok) -> bool {
+        result.compressed_ids.push_back(tok);
+        return true;
+    };
+
+    // Build command string for legacy handle_compress
+    int keep_x1000 = (int)(req.keep_ratio * 1000.0f);
+    std::string cmd = std::string("compress ") + tmp_path + " "
+        + std::to_string(keep_x1000) + " " + req.drafter_path;
+    if (req.skip_park) cmd += " nopark";
+
+    result.ok = handle_compress(cmd, io);
+    ::unlink(tmp_path);
+    return result;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

@@ -127,7 +127,8 @@ private:
 
     // Prefill prompt tokens in chunks, return committed position.
     // Saves last-chunk logits in last_logits_.
-    int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io);
+    int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
+                   int kv_offset = 0);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,
