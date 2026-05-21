@@ -139,6 +139,7 @@ extern "C" void dflash_bsa_free_persistent() {
     cache().release();
 }
 
+#ifdef DFLASH27B_HAVE_BSA_BF16
 extern "C" int launch_bsa_sparse_flash_forward_bf16(
     const void* Q, const void* K, const void* V, void* O,
     const int32_t* indices, const int32_t* counts,
@@ -273,6 +274,142 @@ fail:
     std::fprintf(stderr, "[bsa] cudaMalloc failed: %s\n", cudaGetErrorString(err));
     return -1;
 }
+#endif  // DFLASH27B_HAVE_BSA_BF16
+
+#ifdef DFLASH27B_HAVE_BSA_FP16
+extern "C" int launch_bsa_sparse_flash_forward_fp16(
+    const void* Q, const void* K, const void* V, void* O,
+    const int32_t* indices, const int32_t* counts,
+    float scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim,
+    int block_size,
+    int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
+    int s_cnt_b, int s_cnt_m, int s_cnt_h,
+    cudaStream_t stream)
+{
+    if (head_dim != kSupportedHeadDim) {
+        std::fprintf(stderr, "[bsa-fp16] unsupported head_dim=%d (only %d)\n",
+                     head_dim, kSupportedHeadDim);
+        return -1;
+    }
+    if (block_size != kSupportedBlockSize) {
+        std::fprintf(stderr, "[bsa-fp16] unsupported block_size=%d (only %d)\n",
+                     block_size, kSupportedBlockSize);
+        return -1;
+    }
+
+    const int M  = (seq_len + block_size - 1) / block_size;
+    const int Mp = M;
+    const int Np = M;
+    const int seqlen_q_rounded = M * block_size;
+    const int seqlen_k_rounded = M * block_size;
+
+    BsaCache & c = cache();
+
+    const size_t bm_bytes  = (size_t)batch * n_q_heads * Mp * Np * sizeof(int32_t);
+    const size_t lse_bytes = (size_t)batch * n_q_heads * seqlen_q_rounded * sizeof(float);
+
+    cudaError_t err;
+    if ((err = c.ensure_blockmask(bm_bytes)) != cudaSuccess)   goto fail;
+    if ((err = c.ensure_head_mask(n_q_heads)) != cudaSuccess) goto fail;
+    if ((err = c.ensure_softmax_lse(lse_bytes)) != cudaSuccess) goto fail;
+
+    if (c.head_mask_state != 1) {
+        int* h_hmt = (int*)std::malloc(n_q_heads * sizeof(int));
+        for (int h = 0; h < n_q_heads; ++h) h_hmt[h] = h + 1;
+        cudaMemcpyAsync(c.head_mask_type, h_hmt, n_q_heads * sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);
+        std::free(h_hmt);
+        c.head_mask_state = 1;
+    }
+
+    {
+        dim3 grid(batch, Mp, n_q_heads);
+        dim3 block(kConvertThreads, 1, 1);
+        convert_to_blockmask_kernel<<<grid, block, 0, stream>>>(
+            indices, counts, c.blockmask,
+            batch, M, /*N=*/M, n_q_heads, Mp, Np,
+            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+            s_cnt_b, s_cnt_m, s_cnt_h);
+    }
+
+    {
+        FLASH_NAMESPACE::Flash_fwd_params params{};
+        params.q_ptr = const_cast<void*>(Q);
+        params.k_ptr = const_cast<void*>(K);
+        params.v_ptr = const_cast<void*>(V);
+        params.o_ptr = O;
+
+        params.q_batch_stride = (int64_t)seq_len * n_q_heads * head_dim;
+        params.q_row_stride   = (int64_t)n_q_heads * head_dim;
+        params.q_head_stride  = head_dim;
+
+        params.k_batch_stride = (int64_t)seq_len * n_k_heads * head_dim;
+        params.k_row_stride   = (int64_t)n_k_heads * head_dim;
+        params.k_head_stride  = head_dim;
+
+        params.v_batch_stride = (int64_t)seq_len * n_k_heads * head_dim;
+        params.v_row_stride   = (int64_t)n_k_heads * head_dim;
+        params.v_head_stride  = head_dim;
+
+        params.o_batch_stride = (int64_t)seq_len * n_q_heads * head_dim;
+        params.o_row_stride   = (int64_t)n_q_heads * head_dim;
+        params.o_head_stride  = head_dim;
+
+        params.h           = n_q_heads;
+        params.h_k         = n_k_heads;
+        params.h_h_k_ratio = n_q_heads / n_k_heads;
+
+        params.b               = batch;
+        params.seqlen_q        = seq_len;
+        params.seqlen_k        = seq_len;
+        params.d               = head_dim;
+        params.seqlen_q_rounded = seqlen_q_rounded;
+        params.seqlen_k_rounded = seqlen_k_rounded;
+        params.d_rounded       = head_dim;
+
+        params.scale_softmax      = scale;
+        params.scale_softmax_log2 = scale * kLog2E;
+
+        params.cu_seqlens_q   = nullptr;
+        params.cu_seqlens_k   = nullptr;
+        params.seqused_k      = nullptr;
+        params.softmax_lse_ptr = c.softmax_lse;
+        params.p_ptr          = nullptr;
+
+        params.blockmask             = c.blockmask;
+        params.streaming_info        = nullptr;
+        params.head_mask_type        = c.head_mask_type;
+        params.m_block_dim           = block_size;
+        params.n_block_dim           = block_size;
+        params.num_blocksparse_heads = n_q_heads;
+
+        params.window_size_left      = -1;
+        params.window_size_right     = -1;
+        params.is_bf16               = false;
+        params.is_causal             = false;
+        params.is_exact_streaming    = false;
+        params.is_seqlens_k_cumulative = false;
+        params.is_rotary_interleaved = false;
+        params.num_splits            = 1;
+        params.alibi_slopes_ptr      = nullptr;
+        params.alibi_slopes_batch_stride = 0;
+        params.p_dropout             = 1.f;  // 1.0 = no dropout
+
+        FLASH_NAMESPACE::run_mha_fwd_block_<cutlass::half_t,
+                                            kSupportedHeadDim,
+                                            /*Is_causal=*/false>(params, stream);
+    }
+
+    return 0;
+
+fail:
+    std::fprintf(stderr, "[bsa-fp16] cudaMalloc failed: %s\n", cudaGetErrorString(err));
+    return -1;
+}
+#endif  // DFLASH27B_HAVE_BSA_FP16
 
 }  // namespace flashprefill
 }  // namespace dflash27b

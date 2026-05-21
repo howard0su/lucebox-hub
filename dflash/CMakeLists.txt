@@ -403,8 +403,9 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     endif()
 endif()
 
-# BSA needs sm_80+ (FA-2 derived kernel uses BF16 tensor cores). Auto-disable
-# on legacy arches with a clear message instead of failing the link.
+# BSA: the CUTLASS FA-2 kernel supports SM75+ (FP16) and SM80+ (BF16).
+# Auto-disable on arches below SM75 (Volta has incompatible MMA layout) or when
+# the submodule is missing.
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA AND NOT DFLASH27B_HIP_SM80_EQUIV)
     message(WARNING
         "DFLASH27B_ENABLE_BSA=ON requested with DFLASH27B_GPU_BACKEND=hip; "
@@ -412,16 +413,25 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA AND NOT DFLASH2
         "Build with -DDFLASH27B_HIP_SM80_EQUIV=ON to enable the rocWMMA HIP BSA path.")
     set(DFLASH27B_ENABLE_BSA OFF)
 endif()
-if(DFLASH27B_ENABLE_BSA)
+if(DFLASH27B_ENABLE_BSA AND DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    # BSA requires at least sm_75 (Turing tensor cores for FP16 MMA).
+    set(_bsa_has_sm75 OFF)
+    set(_bsa_has_sm80 OFF)
     foreach(_arch IN LISTS _dflash27b_archs)
-        if(_arch LESS 80)
-            message(WARNING
-                "DFLASH27B_ENABLE_BSA=ON requested but CUDA_ARCHITECTURES contains '${_arch}' (<80); "
-                "disabling BSA (the spec-prefill path will fall back to the WMMA kernel).")
-            set(DFLASH27B_ENABLE_BSA OFF)
-            break()
+        string(REGEX REPLACE "[^0-9]" "" _arch_num "${_arch}")
+        if(_arch_num GREATER_EQUAL 80)
+            set(_bsa_has_sm80 ON)
+        endif()
+        if(_arch_num EQUAL 75)
+            set(_bsa_has_sm75 ON)
         endif()
     endforeach()
+    if(NOT _bsa_has_sm75 AND NOT _bsa_has_sm80)
+        message(WARNING
+            "DFLASH27B_ENABLE_BSA=ON requested but no CUDA_ARCHITECTURES >= 75; "
+            "disabling BSA (requires at least Turing sm_75 for FP16 tensor cores).")
+        set(DFLASH27B_ENABLE_BSA OFF)
+    endif()
 endif()
 # BSA on CUDA also requires the Block-Sparse-Attention submodule (with bundled cutlass).
 # Existing users who `git pull` without `--recurse-submodules` would otherwise
@@ -441,7 +451,21 @@ if(DFLASH27B_ENABLE_BSA)
         target_sources(dflash27b PRIVATE src/bsa_launcher_hip.cu)
         set_source_files_properties(src/bsa_launcher_hip.cu PROPERTIES LANGUAGE HIP)
     else()
-        target_sources(dflash27b PRIVATE src/bsa_fwd_inst.cu src/bsa_launcher.cu)
+        target_sources(dflash27b PRIVATE src/bsa_launcher.cu)
+        # BF16 BSA kernel instantiation (sm_80+)
+        if(_bsa_has_sm80)
+            target_sources(dflash27b PRIVATE src/bsa_fwd_inst.cu)
+            set_source_files_properties(src/bsa_fwd_inst.cu PROPERTIES
+                CUDA_ARCHITECTURES "80;86;90;100;110;120;121")
+            target_compile_definitions(dflash27b PRIVATE DFLASH27B_HAVE_BSA_BF16=1)
+        endif()
+        # FP16 BSA kernel instantiation (sm_75 only — Turing)
+        if(_bsa_has_sm75)
+            target_sources(dflash27b PRIVATE src/bsa_fwd_inst_fp16.cu)
+            set_source_files_properties(src/bsa_fwd_inst_fp16.cu PROPERTIES
+                CUDA_ARCHITECTURES "75")
+            target_compile_definitions(dflash27b PRIVATE DFLASH27B_HAVE_BSA_FP16=1)
+        endif()
     endif()
 endif()
 

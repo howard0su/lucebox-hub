@@ -12,13 +12,13 @@
 //
 // Backends:
 //   - Default: WMMA m16n16k16 sparse forward (sm_70+). Functional everywhere.
-//   - Set env DFLASH_FP_USE_BSA=1 to dispatch to the Block-Sparse-Attention
-//     kernel (FA-2 derived, m16n8k16 PTX, sm_80+ via cuBLAS BF16 GEMM).
-//     Requires building with -DDFLASH27B_ENABLE_BSA=ON. ~3x faster than WMMA
-//     on RTX 3090 at S=128K.
+//   - Default: BSA sparse forward (Block-Sparse-Attention FA-2, sm_75+ FP16,
+//     sm_80+ BF16). Falls back to WMMA sparse forward if BSA is unavailable.
+//     Set env DFLASH_FP_NO_BSA=1 (or DFLASH_FP_USE_BSA=0) to force WMMA.
 //
 // Tunables (env vars):
-//   DFLASH_FP_USE_BSA      [0/1] enable BSA backend (default: 0).
+//   DFLASH_FP_NO_BSA       [set] disable BSA backend (default: BSA on).
+//                          Legacy: DFLASH_FP_USE_BSA=0 also disables.
 //   DFLASH_FP_ALPHA        [float in (0,1)] override FlashPrefillConfig.alpha.
 //                          Higher = stricter selection = fewer K-blocks per Q
 //                          row = faster but riskier. Default 0.12. For long

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include "device_runtime.h"
 
@@ -65,7 +66,7 @@ void launch_block_select(
     int32_t * idx_out, int32_t * cnt_out,
     cudaStream_t stream);
 
-#ifdef DFLASH27B_HAVE_BSA
+#ifdef DFLASH27B_HAVE_BSA_BF16
 int launch_bsa_sparse_flash_forward_bf16(
     const void* Q, const void* K, const void* V, void* O,
     const int32_t* indices, const int32_t* counts,
@@ -91,17 +92,6 @@ void launch_sparse_flash_forward_bf16(
     int s_cnt_b, int s_cnt_m, int s_cnt_h,
     cudaStream_t stream);
 
-#ifdef DFLASH27B_HAVE_BSA
-int launch_bsa_sparse_flash_forward_bf16(
-    const void* Q, const void* K, const void* V, void* O,
-    const int32_t* indices, const int32_t* counts,
-    float scale,
-    int batch, int n_q_heads, int n_k_heads,
-    int seq_len, int head_dim, int block_size,
-    int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
-    int s_cnt_b, int s_cnt_m, int s_cnt_h,
-    cudaStream_t stream);
-#endif
 }
 #endif
 
@@ -163,6 +153,18 @@ void launch_block_select_f16(
     int cnt_s_b, int cnt_s_m, int cnt_s_h,
     int32_t * idx_out, int32_t * cnt_out,
     cudaStream_t stream);
+
+#ifdef DFLASH27B_HAVE_BSA_FP16
+int launch_bsa_sparse_flash_forward_fp16(
+    const void* Q, const void* K, const void* V, void* O,
+    const int32_t* indices, const int32_t* counts,
+    float scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int block_size,
+    int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
+    int s_cnt_b, int s_cnt_m, int s_cnt_h,
+    cudaStream_t stream);
+#endif
 }
 #endif
 
@@ -338,16 +340,20 @@ int flash_prefill_forward_bf16(
         std::fprintf(stderr, "[fp-cnt] S=%d M=%d H=%d  total_select=%lld avg=%.1f min=%d max=%d\n",
                      S, M, H, sum, (double)sum/(M*H*B), mn, mx);
     }
-    // 4. sparse flash forward (BSA-or-WMMA)
-#ifdef DFLASH27B_HAVE_BSA
-    static const bool use_bsa = (std::getenv("DFLASH_FP_USE_BSA") != nullptr);
-    if (use_bsa && D == 128 && BLOCK == 128) {
-        launch_bsa_sparse_flash_forward_bf16(
+    // 4. sparse flash forward (BSA default, WMMA fallback)
+#ifdef DFLASH27B_HAVE_BSA_BF16
+    // BSA is default-on. Disable with DFLASH_FP_NO_BSA=1 or DFLASH_FP_USE_BSA=0.
+    static const bool no_bsa = (std::getenv("DFLASH_FP_NO_BSA") != nullptr)
+                            || (std::getenv("DFLASH_FP_USE_BSA") && std::strcmp(std::getenv("DFLASH_FP_USE_BSA"), "0") == 0);
+    bool did_bsa_bf16 = false;
+    if (!no_bsa && D == 128 && BLOCK == 128) {
+        did_bsa_bf16 = (launch_bsa_sparse_flash_forward_bf16(
             Q, K, V, O, dIdx, dCnt, scale,
             B, H, Hk, S, D, BLOCK,
             s_idx_b, s_idx_m, s_idx_n, s_idx_h,
-            s_cnt_b, s_cnt_m, s_cnt_h, 0);
-    } else
+            s_cnt_b, s_cnt_m, s_cnt_h, 0) == 0);
+    }
+    if (!did_bsa_bf16)
 #endif
     {
         launch_sparse_flash_forward_bf16(
@@ -461,16 +467,32 @@ int flash_prefill_forward_f16_volta(
         dIdx, dCnt, 0);
 
     if (prof) cudaEventRecord(pE[3]);
-    // 4. sparse flash forward (F16 WMMA)
-    launch_sparse_flash_forward_f16(
-        Q, K, V, O, dIdx, dCnt, scale,
-        B, H, Hk, S, D, Q_TILE, BLOCK,
-        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-        s_K_b, s_K_n, s_K_h, s_K_d,
-        s_K_b, s_K_n, s_K_h, s_K_d,    // V uses K strides
-        s_Q_b, s_Q_n, s_Q_h, s_Q_d,    // O uses Q strides
-        s_idx_b, s_idx_m, s_idx_n, s_idx_h,
-        s_cnt_b, s_cnt_m, s_cnt_h, 0);
+    // 4. sparse flash forward (BSA default on sm_75+, WMMA fallback)
+#ifdef DFLASH27B_HAVE_BSA_FP16
+    // BSA is default-on. Disable with DFLASH_FP_NO_BSA=1 or DFLASH_FP_USE_BSA=0.
+    static const bool no_bsa_f16 = (std::getenv("DFLASH_FP_NO_BSA") != nullptr)
+                                || (std::getenv("DFLASH_FP_USE_BSA") && std::strcmp(std::getenv("DFLASH_FP_USE_BSA"), "0") == 0);
+    bool did_bsa_f16 = false;
+    if (!no_bsa_f16 && D == 128 && BLOCK == 128) {
+        did_bsa_f16 = (launch_bsa_sparse_flash_forward_fp16(
+            Q, K, V, O, dIdx, dCnt, scale,
+            B, H, Hk, S, D, BLOCK,
+            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+            s_cnt_b, s_cnt_m, s_cnt_h, 0) == 0);
+    }
+    if (!did_bsa_f16)
+#endif
+    {
+        launch_sparse_flash_forward_f16(
+            Q, K, V, O, dIdx, dCnt, scale,
+            B, H, Hk, S, D, Q_TILE, BLOCK,
+            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+            s_K_b, s_K_n, s_K_h, s_K_d,
+            s_K_b, s_K_n, s_K_h, s_K_d,    // V uses K strides
+            s_Q_b, s_Q_n, s_Q_h, s_Q_d,    // O uses Q strides
+            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+            s_cnt_b, s_cnt_m, s_cnt_h, 0);
+    }
 
     if (prof) {
         cudaEventRecord(pE[4]);
