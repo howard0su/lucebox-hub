@@ -477,6 +477,7 @@ int flash_prefill_forward_f16_volta(
         // BSA is default-on. Disable with DFLASH_FP_NO_BSA=1 or DFLASH_FP_USE_BSA=0.
         static const bool no_bsa_f16 = (std::getenv("DFLASH_FP_NO_BSA") != nullptr)
                                     || (std::getenv("DFLASH_FP_USE_BSA") && std::strcmp(std::getenv("DFLASH_FP_USE_BSA"), "0") == 0);
+        static bool first_call = true;
         bool did_bsa_f16 = false;
         if (!no_bsa_f16 && D == 128 && BLOCK == 128) {
             did_bsa_f16 = (launch_bsa_sparse_flash_forward_fp16(
@@ -484,6 +485,11 @@ int flash_prefill_forward_f16_volta(
                 B, H, Hk, S, D, BLOCK,
                 s_idx_b, s_idx_m, s_idx_n, s_idx_h,
                 s_cnt_b, s_cnt_m, s_cnt_h, 0) == 0);
+        }
+        if (first_call) {
+            std::fprintf(stderr, "[fp-bsa-f16] S=%d D=%d BLOCK=%d no_bsa=%d did_bsa=%d\n",
+                         S, D, BLOCK, (int)no_bsa_f16, (int)did_bsa_f16);
+            first_call = false;
         }
         if (!did_bsa_f16)
 #endif

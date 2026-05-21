@@ -275,10 +275,10 @@ bool forward_qwen3_drafter_model(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
-        // Use BF16 when rocWMMA or CUDA WMMA flashprefill kernels are compiled.
-        // HIP Phase 1 (q8 ggml fallback) and old CUDA arches stay with F16.
+        // Use BF16 when SM80+ BF16 FlashPrefill or HIP rocWMMA is available.
+        // SM75/Volta (FP16-only WMMA) uses FP16 buffers for FlashPrefill + BSA.
         const ggml_type half_type =
-#if defined(DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL) || defined(DFLASH27B_HAVE_FLASHPREFILL)
+#if defined(DFLASH27B_HAVE_SM80_FLASHPREFILL) || defined(DFLASH27B_HAVE_FLASHPREFILL)
             GGML_TYPE_BF16;
 #else
             GGML_TYPE_F16;
@@ -520,7 +520,13 @@ bool forward_qwen3_drafter_model(
 #else
                                  && false;
 #endif
-        const bool use_f16_fp = (Q_buf.t->type == GGML_TYPE_F16)
+        // On SM75 (no BF16 FlashPrefill), route BF16 data through the FP16 path
+        // since flash_prefill_forward_f16 handles BF16→FP16 promotion internally.
+        const bool use_f16_fp = (Q_buf.t->type == GGML_TYPE_F16
+#if !defined(DFLASH27B_HAVE_FLASHPREFILL) && !defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
+                                 || Q_buf.t->type == GGML_TYPE_BF16
+#endif
+                                )
 #if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) || defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
                                  && true;
 #else
