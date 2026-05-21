@@ -342,30 +342,34 @@ int flash_prefill_forward_bf16(
     }
     // 4. sparse flash forward (BSA default, WMMA fallback)
 #ifdef DFLASH27B_HAVE_BSA_BF16
-    // BSA is default-on. Disable with DFLASH_FP_NO_BSA=1 or DFLASH_FP_USE_BSA=0.
-    static const bool no_bsa = (std::getenv("DFLASH_FP_NO_BSA") != nullptr)
-                            || (std::getenv("DFLASH_FP_USE_BSA") && std::strcmp(std::getenv("DFLASH_FP_USE_BSA"), "0") == 0);
-    bool did_bsa_bf16 = false;
-    if (!no_bsa && D == 128 && BLOCK == 128) {
-        did_bsa_bf16 = (launch_bsa_sparse_flash_forward_bf16(
-            Q, K, V, O, dIdx, dCnt, scale,
-            B, H, Hk, S, D, BLOCK,
-            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
-            s_cnt_b, s_cnt_m, s_cnt_h, 0) == 0);
-    }
-    if (!did_bsa_bf16)
-#endif
     {
-        launch_sparse_flash_forward_bf16(
-            Q, K, V, O, dIdx, dCnt, scale,
-            B, H, Hk, S, D, Q_TILE, BLOCK,
-            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-            s_K_b, s_K_n, s_K_h, s_K_d,
-            s_K_b, s_K_n, s_K_h, s_K_d,    // V uses K strides
-            s_Q_b, s_Q_n, s_Q_h, s_Q_d,    // O uses Q strides
-            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
-            s_cnt_b, s_cnt_m, s_cnt_h, 0);
+        // BSA is default-on. Disable with DFLASH_FP_NO_BSA=1 or DFLASH_FP_USE_BSA=0.
+        static const bool no_bsa = (std::getenv("DFLASH_FP_NO_BSA") != nullptr)
+                                || (std::getenv("DFLASH_FP_USE_BSA") && std::strcmp(std::getenv("DFLASH_FP_USE_BSA"), "0") == 0);
+        bool did_bsa_bf16 = false;
+        if (!no_bsa && D == 128 && BLOCK == 128) {
+            did_bsa_bf16 = (launch_bsa_sparse_flash_forward_bf16(
+                Q, K, V, O, dIdx, dCnt, scale,
+                B, H, Hk, S, D, BLOCK,
+                s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+                s_cnt_b, s_cnt_m, s_cnt_h, 0) == 0);
+        }
+        if (!did_bsa_bf16)
+#endif
+        {
+            launch_sparse_flash_forward_bf16(
+                Q, K, V, O, dIdx, dCnt, scale,
+                B, H, Hk, S, D, Q_TILE, BLOCK,
+                s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+                s_K_b, s_K_n, s_K_h, s_K_d,
+                s_K_b, s_K_n, s_K_h, s_K_d,    // V uses K strides
+                s_Q_b, s_Q_n, s_Q_h, s_Q_d,    // O uses Q strides
+                s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+                s_cnt_b, s_cnt_m, s_cnt_h, 0);
+        }
+#ifdef DFLASH27B_HAVE_BSA_BF16
     }
+#endif
 
     if (prof) {
         cudaEventRecord(pE[4]);
@@ -469,30 +473,34 @@ int flash_prefill_forward_f16_volta(
     if (prof) cudaEventRecord(pE[3]);
     // 4. sparse flash forward (BSA default on sm_75+, WMMA fallback)
 #ifdef DFLASH27B_HAVE_BSA_FP16
-    // BSA is default-on. Disable with DFLASH_FP_NO_BSA=1 or DFLASH_FP_USE_BSA=0.
-    static const bool no_bsa_f16 = (std::getenv("DFLASH_FP_NO_BSA") != nullptr)
-                                || (std::getenv("DFLASH_FP_USE_BSA") && std::strcmp(std::getenv("DFLASH_FP_USE_BSA"), "0") == 0);
-    bool did_bsa_f16 = false;
-    if (!no_bsa_f16 && D == 128 && BLOCK == 128) {
-        did_bsa_f16 = (launch_bsa_sparse_flash_forward_fp16(
-            Q, K, V, O, dIdx, dCnt, scale,
-            B, H, Hk, S, D, BLOCK,
-            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
-            s_cnt_b, s_cnt_m, s_cnt_h, 0) == 0);
-    }
-    if (!did_bsa_f16)
-#endif
     {
-        launch_sparse_flash_forward_f16(
-            Q, K, V, O, dIdx, dCnt, scale,
-            B, H, Hk, S, D, Q_TILE, BLOCK,
-            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-            s_K_b, s_K_n, s_K_h, s_K_d,
-            s_K_b, s_K_n, s_K_h, s_K_d,    // V uses K strides
-            s_Q_b, s_Q_n, s_Q_h, s_Q_d,    // O uses Q strides
-            s_idx_b, s_idx_m, s_idx_n, s_idx_h,
-            s_cnt_b, s_cnt_m, s_cnt_h, 0);
+        // BSA is default-on. Disable with DFLASH_FP_NO_BSA=1 or DFLASH_FP_USE_BSA=0.
+        static const bool no_bsa_f16 = (std::getenv("DFLASH_FP_NO_BSA") != nullptr)
+                                    || (std::getenv("DFLASH_FP_USE_BSA") && std::strcmp(std::getenv("DFLASH_FP_USE_BSA"), "0") == 0);
+        bool did_bsa_f16 = false;
+        if (!no_bsa_f16 && D == 128 && BLOCK == 128) {
+            did_bsa_f16 = (launch_bsa_sparse_flash_forward_fp16(
+                Q, K, V, O, dIdx, dCnt, scale,
+                B, H, Hk, S, D, BLOCK,
+                s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+                s_cnt_b, s_cnt_m, s_cnt_h, 0) == 0);
+        }
+        if (!did_bsa_f16)
+#endif
+        {
+            launch_sparse_flash_forward_f16(
+                Q, K, V, O, dIdx, dCnt, scale,
+                B, H, Hk, S, D, Q_TILE, BLOCK,
+                s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+                s_K_b, s_K_n, s_K_h, s_K_d,
+                s_K_b, s_K_n, s_K_h, s_K_d,    // V uses K strides
+                s_Q_b, s_Q_n, s_Q_h, s_Q_d,    // O uses Q strides
+                s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+                s_cnt_b, s_cnt_m, s_cnt_h, 0);
+        }
+#ifdef DFLASH27B_HAVE_BSA_FP16
     }
+#endif
 
     if (prof) {
         cudaEventRecord(pE[4]);
@@ -644,6 +652,7 @@ int flash_prefill_forward_f16(
     cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, device);
     const int sm = prop.major * 10 + prop.minor;
+    (void)sm;  // used conditionally below depending on enabled kernel variants
 
 #if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) && defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
     if (sm >= 70) return flash_prefill_forward_f16_volta(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
