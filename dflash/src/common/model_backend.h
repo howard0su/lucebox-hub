@@ -148,6 +148,10 @@ struct ModelBackend {
     // supports_dflash_spec_decode() returns true. Default returns nullptr.
     virtual class DFlashTarget * dflash_target() { return nullptr; }
 
+    // Release oversized scratch buffers between requests to prevent VRAM
+    // growth over time. Default is a no-op.
+    virtual void release_scratch() {}
+
     // ── Cleanup ──────────────────────────────────────────────────────
     // Release all resources (weights, cache, snapshots, drafter).
     // Called by run_daemon() before returning.

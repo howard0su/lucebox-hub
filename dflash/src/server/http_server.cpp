@@ -637,6 +637,10 @@ void HttpServer::worker_loop() {
             backend_.park("draft");
         }
 
+        // Release oversized scratch buffers (gallocr, BSA cache) so VRAM
+        // doesn't grow monotonically across requests with different sizes.
+        backend_.release_scratch();
+
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
             if (completion_tokens > 0 && !client_disconnected) {

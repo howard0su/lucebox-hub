@@ -14,6 +14,7 @@
 #include "ggml-cuda.h"
 #include "common/snapshot_backend.h"
 #include "pflash_ggml_adapter.h"
+#include "flashprefill.h"
 
 #include <algorithm>
 #include <chrono>
@@ -358,6 +359,32 @@ void Qwen35Backend::shutdown() {
         free_snapshot_backend(snap_backend_, target_backend_);
         snap_backend_ = nullptr;
     }
+}
+
+// ── Release scratch buffers between requests ────────────────────────────
+
+void Qwen35Backend::release_scratch() {
+    // Target graph allocator: grows during large prefill batches, not needed
+    // between requests. Will be lazily recreated on next build_target_step().
+    if (sg_.alloc) {
+        ggml_gallocr_free(sg_.alloc);
+        sg_.alloc = nullptr;
+    }
+    step_graph_free(sg_);
+
+    // LM-head projection allocator (same pattern).
+    if (proj_sg_.alloc) {
+        ggml_gallocr_free(proj_sg_.alloc);
+        proj_sg_.alloc = nullptr;
+    }
+    step_graph_free(proj_sg_);
+
+    // BSA persistent CUDA buffers (blockmask, head_mask_type, softmax_lse).
+#ifdef DFLASH27B_HAVE_BSA
+    flashprefill::dflash_bsa_free_persistent();
+#endif
+
+    std::fprintf(stderr, "[vram] released scratch buffers\n");
 }
 
 // ── Generate (speculative decode) ───────────────────────────────────────
