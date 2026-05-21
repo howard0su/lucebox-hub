@@ -619,11 +619,22 @@ void HttpServer::worker_loop() {
         };
 
         // Run generation (with or without restore).
+        // Lazy-draft: ensure decode draft is loaded before generate.
+        if (config_.lazy_draft) {
+            backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
+            backend_.unpark("draft");   // reload decode draft (~3.3 GB)
+        }
+
         GenerateResult result;
         if (using_restore) {
             result = backend_.restore_and_generate(cache_slot, gen_req, io);
         } else {
             result = backend_.generate(gen_req, io);
+        }
+
+        // Lazy-draft: park decode draft after generate to free VRAM.
+        if (config_.lazy_draft) {
+            backend_.park("draft");
         }
 
         // Confirm or abort the inline snapshot.

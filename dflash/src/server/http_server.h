@@ -53,6 +53,7 @@ struct ServerConfig {
     float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
     std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3-0.6B)
     bool        pflash_skip_park = false;   // skip park/unpark for ≥32GB GPUs
+    bool        lazy_draft      = true;    // park decode draft when idle to save VRAM
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
