@@ -19,6 +19,13 @@ struct Qwen35MoeHybridLayerStorage {
     ggml_tensor * down_hot = nullptr;
     ggml_tensor * gate_up_hot = nullptr;
 
+    ggml_context * cold_ctx = nullptr;
+    ggml_backend_buffer_t cold_buf = nullptr;
+    ggml_tensor * gate_cold = nullptr;
+    ggml_tensor * up_cold = nullptr;
+    ggml_tensor * down_cold = nullptr;
+    ggml_tensor * gate_up_cold = nullptr;
+
     std::vector<int32_t> hot_expert_ids;
     std::vector<int32_t> cold_expert_ids;
     std::vector<int32_t> hot_local_by_global;
@@ -37,8 +44,14 @@ struct Qwen35MoeHybridLayerStorage {
 };
 
 struct Qwen35MoeHybridStorage {
+    Qwen35MoeHybridStorage() = default;
+    Qwen35MoeHybridStorage(const Qwen35MoeHybridStorage &) = delete;
+    Qwen35MoeHybridStorage & operator=(const Qwen35MoeHybridStorage &) = delete;
+    Qwen35MoeHybridStorage(Qwen35MoeHybridStorage && other) noexcept;
+    Qwen35MoeHybridStorage & operator=(Qwen35MoeHybridStorage && other) noexcept;
     ~Qwen35MoeHybridStorage();
 
+    ggml_backend_t cpu_backend = nullptr;
     Qwen35MoeExpertPlacement placement;
     std::vector<Qwen35MoeHybridLayerStorage> layers;
 

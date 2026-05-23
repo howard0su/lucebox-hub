@@ -74,18 +74,18 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (layer.fused_gate_up) {
-            if (!layer.gate_up_hot || layer.gate_up_cold_bytes.empty()) {
+            if (!layer.gate_up_hot || !layer.gate_up_cold) {
                 std::fprintf(stderr, "layer %d fused hot/cold storage missing\n", il);
                 return 1;
             }
         } else {
-            if (!layer.gate_hot || !layer.up_hot ||
-                layer.gate_cold_bytes.empty() || layer.up_cold_bytes.empty()) {
+            if (!layer.gate_hot || !layer.up_hot || !layer.gate_cold || !layer.up_cold ||
+                layer.gate_expert_bytes == 0 || layer.up_expert_bytes == 0) {
                 std::fprintf(stderr, "layer %d split hot/cold storage missing\n", il);
                 return 1;
             }
         }
-        if (!layer.down_hot || layer.down_cold_bytes.empty()) {
+        if (!layer.down_hot || !layer.down_cold || layer.down_expert_bytes == 0) {
             std::fprintf(stderr, "layer %d down hot/cold storage missing\n", il);
             return 1;
         }

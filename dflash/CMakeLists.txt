@@ -249,6 +249,8 @@ add_library(dflash_common STATIC
     src/qwen35moe/qwen35moe_routing_stats.cpp
     src/qwen35moe/qwen35moe_expert_placement.cpp
     src/qwen35moe/qwen35moe_hybrid_storage.cpp
+    src/qwen35moe/qwen35moe_hybrid_ffn_eval.cpp
+    src/qwen35moe/qwen35moe_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
@@ -571,6 +573,14 @@ if(DFLASH27B_TESTS)
         endif()
         target_link_libraries(test_qwen35moe_expert_placement PRIVATE dflash_common)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_swap_manager.cpp")
+        add_executable(test_qwen35moe_swap_manager test/test_qwen35moe_swap_manager.cpp)
+        target_include_directories(test_qwen35moe_swap_manager PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_qwen35moe_swap_manager PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_qwen35moe_swap_manager PRIVATE dflash_common)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)
         target_include_directories(smoke_load_draft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -651,6 +661,14 @@ if(DFLASH27B_TESTS)
             target_include_directories(smoke_qwen35moe_hybrid_storage PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
         endif()
         target_link_libraries(smoke_qwen35moe_hybrid_storage PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen35moe_hybrid_ffn.cpp")
+        add_executable(smoke_qwen35moe_hybrid_ffn test/smoke_qwen35moe_hybrid_ffn.cpp)
+        target_include_directories(smoke_qwen35moe_hybrid_ffn PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(smoke_qwen35moe_hybrid_ffn PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(smoke_qwen35moe_hybrid_ffn PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/collect_qwen35moe_routing_stats.cpp")
         add_executable(collect_qwen35moe_routing_stats test/collect_qwen35moe_routing_stats.cpp)

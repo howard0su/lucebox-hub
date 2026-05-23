@@ -1,5 +1,7 @@
 #include "qwen35moe_hybrid_storage.h"
 
+#include "ggml-cpu.h"
+
 #include <algorithm>
 #include <cstring>
 
@@ -47,10 +49,31 @@ static bool validate_expert_tensor(ggml_tensor * tensor, int n_expert, size_t * 
 
 static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor * src, int hot_count) {
     if (!src || hot_count <= 0) return nullptr;
-    return ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], hot_count);
+    const int64_t ne[4] = { src->ne[0], src->ne[1], hot_count, 1 };
+    return ggml_new_tensor(ctx, src->type, 4, ne);
 }
 
 } // namespace
+
+Qwen35MoeHybridStorage::Qwen35MoeHybridStorage(Qwen35MoeHybridStorage && other) noexcept {
+    *this = std::move(other);
+}
+
+Qwen35MoeHybridStorage & Qwen35MoeHybridStorage::operator=(Qwen35MoeHybridStorage && other) noexcept {
+    if (this == &other) return *this;
+    for (auto & layer : layers) {
+        if (layer.hot_buf) ggml_backend_buffer_free(layer.hot_buf);
+        if (layer.hot_ctx) ggml_free(layer.hot_ctx);
+        if (layer.cold_buf) ggml_backend_buffer_free(layer.cold_buf);
+        if (layer.cold_ctx) ggml_free(layer.cold_ctx);
+    }
+    if (cpu_backend) ggml_backend_free(cpu_backend);
+    cpu_backend = other.cpu_backend;
+    placement = std::move(other.placement);
+    layers = std::move(other.layers);
+    other.cpu_backend = nullptr;
+    return *this;
+}
 
 Qwen35MoeHybridStorage::~Qwen35MoeHybridStorage() {
     for (auto & layer : layers) {
@@ -62,10 +85,26 @@ Qwen35MoeHybridStorage::~Qwen35MoeHybridStorage() {
             ggml_free(layer.hot_ctx);
             layer.hot_ctx = nullptr;
         }
+        if (layer.cold_buf) {
+            ggml_backend_buffer_free(layer.cold_buf);
+            layer.cold_buf = nullptr;
+        }
+        if (layer.cold_ctx) {
+            ggml_free(layer.cold_ctx);
+            layer.cold_ctx = nullptr;
+        }
         layer.gate_hot = nullptr;
         layer.up_hot = nullptr;
         layer.down_hot = nullptr;
         layer.gate_up_hot = nullptr;
+        layer.gate_cold = nullptr;
+        layer.up_cold = nullptr;
+        layer.down_cold = nullptr;
+        layer.gate_up_cold = nullptr;
+    }
+    if (cpu_backend) {
+        ggml_backend_free(cpu_backend);
+        cpu_backend = nullptr;
     }
 }
 
@@ -94,6 +133,11 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
     Qwen35MoeHybridStorage tmp;
     tmp.placement = placement;
     tmp.layers.resize((size_t)w.n_layer);
+    tmp.cpu_backend = ggml_backend_cpu_init();
+    if (!tmp.cpu_backend) {
+        if (err) *err = "failed to init cpu backend";
+        return false;
+    }
 
     for (int il = 0; il < w.n_layer; ++il) {
         const TargetLayer & L = w.layers[(size_t)il];
@@ -172,6 +216,32 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
             }
         }
 
+        const int cold_count = (int)dst.cold_expert_ids.size();
+        if (cold_count > 0) {
+            ggml_init_params ip{};
+            ip.mem_size   = 16 * ggml_tensor_overhead();
+            ip.mem_buffer = nullptr;
+            ip.no_alloc   = true;
+            dst.cold_ctx = ggml_init(ip);
+            if (!dst.cold_ctx) {
+                if (err) *err = "failed to init cold_ctx";
+                return false;
+            }
+            if (dst.fused_gate_up) {
+                dst.gate_up_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_gate_up_exps, cold_count);
+                dst.down_cold    = new_like_with_expert_count(dst.cold_ctx, L.ffn_down_exps, cold_count);
+            } else {
+                dst.gate_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_gate_exps, cold_count);
+                dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, L.ffn_up_exps, cold_count);
+                dst.down_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_down_exps, cold_count);
+            }
+            dst.cold_buf = ggml_backend_alloc_ctx_tensors(dst.cold_ctx, tmp.cpu_backend);
+            if (!dst.cold_buf) {
+                if (err) *err = "failed to allocate cold expert buffer";
+                return false;
+            }
+        }
+
         if (dst.fused_gate_up) {
             if (!read_expert_slices(backend, L.ffn_gate_up_exps, dst.cold_expert_ids,
                                     dst.gate_up_expert_bytes, dst.gate_up_cold_bytes, err)) {
@@ -188,6 +258,35 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
         if (!read_expert_slices(backend, L.ffn_down_exps, dst.cold_expert_ids,
                                 dst.down_expert_bytes, dst.down_cold_bytes, err)) {
             return false;
+        }
+
+        if (dst.fused_gate_up) {
+            if (dst.gate_up_cold && !dst.gate_up_cold_bytes.empty()) {
+                ggml_backend_tensor_set(dst.gate_up_cold, dst.gate_up_cold_bytes.data(), 0, dst.gate_up_cold_bytes.size());
+                dst.gate_up_cold_bytes.clear();
+                dst.gate_up_cold_bytes.shrink_to_fit();
+            }
+            if (dst.down_cold && !dst.down_cold_bytes.empty()) {
+                ggml_backend_tensor_set(dst.down_cold, dst.down_cold_bytes.data(), 0, dst.down_cold_bytes.size());
+                dst.down_cold_bytes.clear();
+                dst.down_cold_bytes.shrink_to_fit();
+            }
+        } else {
+            if (dst.gate_cold && !dst.gate_cold_bytes.empty()) {
+                ggml_backend_tensor_set(dst.gate_cold, dst.gate_cold_bytes.data(), 0, dst.gate_cold_bytes.size());
+                dst.gate_cold_bytes.clear();
+                dst.gate_cold_bytes.shrink_to_fit();
+            }
+            if (dst.up_cold && !dst.up_cold_bytes.empty()) {
+                ggml_backend_tensor_set(dst.up_cold, dst.up_cold_bytes.data(), 0, dst.up_cold_bytes.size());
+                dst.up_cold_bytes.clear();
+                dst.up_cold_bytes.shrink_to_fit();
+            }
+            if (dst.down_cold && !dst.down_cold_bytes.empty()) {
+                ggml_backend_tensor_set(dst.down_cold, dst.down_cold_bytes.data(), 0, dst.down_cold_bytes.size());
+                dst.down_cold_bytes.clear();
+                dst.down_cold_bytes.shrink_to_fit();
+            }
         }
     }
 
