@@ -171,51 +171,6 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
             return false;
         }
 
-        const int hot_count = (int)dst.hot_expert_ids.size();
-        if (hot_count > 0) {
-            ggml_init_params ip{};
-            ip.mem_size   = 16 * ggml_tensor_overhead();
-            ip.mem_buffer = nullptr;
-            ip.no_alloc   = true;
-            dst.hot_ctx = ggml_init(ip);
-            if (!dst.hot_ctx) {
-                if (err) *err = "failed to init hot_ctx";
-                return false;
-            }
-            if (dst.fused_gate_up) {
-                dst.gate_up_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_gate_up_exps, hot_count);
-                dst.down_hot    = new_like_with_expert_count(dst.hot_ctx, L.ffn_down_exps, hot_count);
-            } else {
-                dst.gate_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_gate_exps, hot_count);
-                dst.up_hot   = new_like_with_expert_count(dst.hot_ctx, L.ffn_up_exps, hot_count);
-                dst.down_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_down_exps, hot_count);
-            }
-            dst.hot_buf = ggml_backend_alloc_ctx_tensors(dst.hot_ctx, backend);
-            if (!dst.hot_buf) {
-                if (err) *err = "failed to allocate hot expert buffer";
-                return false;
-            }
-
-            auto copy_hot = [&](ggml_tensor * src, ggml_tensor * dst_tensor, size_t expert_bytes) {
-                if (!src || !dst_tensor || expert_bytes == 0) return true;
-                std::vector<uint8_t> tmp_bytes(expert_bytes);
-                for (size_t i = 0; i < dst.hot_expert_ids.size(); ++i) {
-                    const int32_t expert_id = dst.hot_expert_ids[i];
-                    ggml_backend_tensor_get(src, tmp_bytes.data(), expert_bytes * (size_t)expert_id, expert_bytes);
-                    ggml_backend_tensor_set(dst_tensor, tmp_bytes.data(), expert_bytes * i, expert_bytes);
-                }
-                return true;
-            };
-            if (dst.fused_gate_up) {
-                copy_hot(L.ffn_gate_up_exps, dst.gate_up_hot, dst.gate_up_expert_bytes);
-                copy_hot(L.ffn_down_exps, dst.down_hot, dst.down_expert_bytes);
-            } else {
-                copy_hot(L.ffn_gate_exps, dst.gate_hot, dst.gate_expert_bytes);
-                copy_hot(L.ffn_up_exps, dst.up_hot, dst.up_expert_bytes);
-                copy_hot(L.ffn_down_exps, dst.down_hot, dst.down_expert_bytes);
-            }
-        }
-
         const int cold_count = (int)dst.cold_expert_ids.size();
         if (cold_count > 0) {
             ggml_init_params ip{};

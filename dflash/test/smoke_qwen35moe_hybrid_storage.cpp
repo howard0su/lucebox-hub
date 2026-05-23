@@ -1,8 +1,8 @@
 // Smoke test for qwen35moe hybrid storage construction.
 //
 // Loads qwen35moe, builds a simple per-layer placement (1 hot expert per layer),
-// constructs hybrid storage, and validates that hot GPU tensors / cold host
-// buffers are materialized.
+// constructs hybrid storage, and validates that hot/cold placement metadata is
+// built while only cold expert buffers are materialized separately.
 
 #include "internal.h"
 #include "qwen35moe_expert_placement.h"
@@ -73,20 +73,25 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "layer %d local maps wrong size\n", il);
             return 1;
         }
+        if (layer.hot_buf || layer.hot_ctx || layer.gate_hot || layer.up_hot ||
+            layer.down_hot || layer.gate_up_hot) {
+            std::fprintf(stderr, "layer %d hot expert duplication unexpectedly allocated\n", il);
+            return 1;
+        }
         if (layer.fused_gate_up) {
-            if (!layer.gate_up_hot || !layer.gate_up_cold) {
-                std::fprintf(stderr, "layer %d fused hot/cold storage missing\n", il);
+            if (!layer.gate_up_cold) {
+                std::fprintf(stderr, "layer %d fused cold storage missing\n", il);
                 return 1;
             }
         } else {
-            if (!layer.gate_hot || !layer.up_hot || !layer.gate_cold || !layer.up_cold ||
+            if (!layer.gate_cold || !layer.up_cold ||
                 layer.gate_expert_bytes == 0 || layer.up_expert_bytes == 0) {
-                std::fprintf(stderr, "layer %d split hot/cold storage missing\n", il);
+                std::fprintf(stderr, "layer %d split cold storage missing\n", il);
                 return 1;
             }
         }
-        if (!layer.down_hot || !layer.down_cold || layer.down_expert_bytes == 0) {
-            std::fprintf(stderr, "layer %d down hot/cold storage missing\n", il);
+        if (!layer.down_cold || layer.down_expert_bytes == 0) {
+            std::fprintf(stderr, "layer %d down cold storage missing\n", il);
             return 1;
         }
     }
