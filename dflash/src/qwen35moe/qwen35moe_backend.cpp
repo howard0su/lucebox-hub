@@ -58,8 +58,6 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         return false;
     }
     out.moe_hybrid = std::move(hybrid);
-    hybrid_mode_ = true;
-    cfg_.draft_path = nullptr;  // policy: hybrid mode falls back to AR-only until hybrid FFN lands
     int total_cold = 0;
     uint64_t hot_bytes = 0;
     uint64_t cold_bytes = 0;
@@ -71,12 +69,19 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         hot_bytes  += per_expert_bytes * (uint64_t)layer.hot_expert_ids.size();
         cold_bytes += per_expert_bytes * (uint64_t)layer.cold_expert_ids.size();
     }
-    std::printf("[qwen35moe] hybrid storage ready: total_hot=%d (%.2f GiB VRAM) total_cold=%d (%.2f GiB RAM) placement=%s (AR-only mode)\n",
+    std::printf("[qwen35moe] hybrid storage ready: total_hot=%d (%.2f GiB VRAM) total_cold=%d (%.2f GiB RAM) placement=%s\n",
                 out.moe_hybrid->placement.total_hot,
                 hot_bytes / 1024.0 / 1024.0 / 1024.0,
                 total_cold,
                 cold_bytes / 1024.0 / 1024.0 / 1024.0,
                 placement_path);
+    if (total_cold > 0) {
+        hybrid_mode_ = true;
+        cfg_.draft_path = nullptr;  // hybrid mode falls back to AR-only
+        std::printf("[qwen35moe] hybrid decode path active (%d cold experts)\n", total_cold);
+    } else {
+        std::printf("[qwen35moe] all experts hot — using fused all-GPU decode path\n");
+    }
     if (const char * out_path = std::getenv("DFLASH_QWEN35MOE_NEXT_PLACEMENT_OUT")) {
         placement_out_path_ = out_path;
     }
