@@ -83,6 +83,14 @@ bool Qwen35Backend::init() {
         }
         std::printf("[draft]  loaded\n");
 
+        // Override draft RoPE theta with target's value — the GGUF was
+        // exported with a stale freq_base (1M) but config.json specifies 10M.
+        if (dw_.rope_theta != w_.rope_theta && w_.rope_theta > 0.0f) {
+            std::printf("[draft]  rope_theta override: %.0f -> %.0f (match target)\n",
+                        dw_.rope_theta, w_.rope_theta);
+            dw_.rope_theta = w_.rope_theta;
+        }
+
         if (cfg_.draft_swa_window > 0) {
             dw_.swa_window = cfg_.draft_swa_window;
             for (int il = 0; il < dw_.n_layer - 1; il++)
