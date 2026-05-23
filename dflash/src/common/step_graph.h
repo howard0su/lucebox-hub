@@ -42,6 +42,7 @@ struct StepGraph {
 
     // Per-delta-net-layer captures (verify only).
     std::vector<DeltaNetCapture> delta_captures;
+    std::vector<ggml_tensor *> moe_selected;
 };
 
 // Reset the per-call graph state (ctx + graph + tensor handles) but KEEP the
@@ -58,6 +59,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.argmax_tokens = nullptr;
     sg.topk_indices = nullptr;
     sg.delta_captures.clear();
+    sg.moe_selected.clear();
 }
 
 // Full cleanup: release the persistent gallocr + its CUDA buffer.

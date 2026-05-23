@@ -524,6 +524,7 @@ struct QwenGraphInputs {
     int           kv_start;       // position where the new tokens begin
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
+    bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
@@ -536,6 +537,9 @@ struct QwenGraphOutputs {
     // views marked as ggml_set_output() so their data persists after
     // graph_compute; the spec-decode loop reads them host-side for rollback.
     std::vector<DeltaNetCapture> delta_captures;
+    // One entry per target layer. Populated only when capture_moe_router is
+    // true; qwen35 dense layers and non-MoE models leave entries null.
+    std::vector<ggml_tensor *> moe_selected;
 };
 
 QwenGraphOutputs build_qwen35_graph(

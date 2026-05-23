@@ -8,7 +8,8 @@ ggml_tensor * build_qwen35moe_ffn(
     ggml_context *        ctx,
     ggml_tensor *         cur,
     const TargetWeights & w,
-    const TargetLayer &   L) {
+    const TargetLayer &   L,
+    ggml_tensor **        selected_out) {
     const int n_tokens = (int)cur->ne[1];
     const int n_expert = w.n_expert;
     const int n_used   = w.n_expert_used;
@@ -28,6 +29,9 @@ ggml_tensor * build_qwen35moe_ffn(
     }
 
     ggml_tensor * selected = ggml_top_k(ctx, probs, n_used);
+    if (selected_out) {
+        *selected_out = selected;
+    }
 
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
     ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);

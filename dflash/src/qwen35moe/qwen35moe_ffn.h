@@ -10,6 +10,7 @@ ggml_tensor * build_qwen35moe_ffn(
     ggml_context *        ctx,
     ggml_tensor *         cur,   // [hidden, n_tokens], post-attention normed
     const TargetWeights & w,
-    const TargetLayer &   L);
+    const TargetLayer &   L,
+    ggml_tensor **        selected_out = nullptr);
 
 }  // namespace dflash::common

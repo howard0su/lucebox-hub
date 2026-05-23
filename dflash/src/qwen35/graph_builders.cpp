@@ -92,7 +92,8 @@ bool build_target_step(
     bool capture_delta_intermediate,
     int fa_window,
     bool last_token_logits_only,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    bool capture_moe_router) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -133,6 +134,7 @@ bool build_target_step(
     gi.kv_start                   = kv_start;
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
+    gi.capture_moe_router         = capture_moe_router;
     gi.fa_window                  = fa_window;
     gi.last_token_logits_only     = last_token_logits_only;
 
@@ -140,6 +142,7 @@ bool build_target_step(
     if (!go.logits) return false;
     sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
+    sg.moe_selected = std::move(go.moe_selected);
     ggml_set_output(sg.logits);
 
     sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);

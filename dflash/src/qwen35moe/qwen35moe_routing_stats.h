@@ -25,6 +25,10 @@ struct Qwen35MoeRoutingStats {
 
     uint64_t count(int layer_idx, int expert_idx) const;
     bool observe(int layer_idx, const int32_t * expert_ids, int n_ids);
+    bool observe_selected_tensor(ggml_backend_t backend,
+                                 int layer_idx,
+                                 ggml_tensor * selected,
+                                 std::string * err = nullptr);
 
     std::vector<int> ranked_experts(int layer_idx) const;
     std::vector<int> hot_experts(int layer_idx, int hot_count) const;

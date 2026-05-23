@@ -920,7 +920,8 @@ static ggml_tensor * build_single_layer(
     bool                  capture,
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
-    int                   q_tail_start = 0)
+    int                   q_tail_start = 0,
+    ggml_tensor **        moe_selected_out = nullptr)
 {
     const int hidden = w.n_embd;
     const float eps   = w.rms_eps;
@@ -959,8 +960,12 @@ static ggml_tensor * build_single_layer(
 
     ggml_tensor * ffn_residual = cur;
     ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
-    ggml_tensor * ffn  = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L)
+    ggml_tensor * moe_selected = nullptr;
+    ggml_tensor * ffn  = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L, &moe_selected)
                                   : build_swiglu_ffn(ctx, post, L);
+    if (moe_selected_out) {
+        *moe_selected_out = moe_selected;
+    }
     cur = ggml_add(ctx, ffn, ffn_residual);
 
     if (capture && cache.target_feat) {
@@ -1027,6 +1032,9 @@ QwenGraphOutputs build_qwen35_graph(
         const int n_delta     = w.n_layer - n_full_attn;
         og_early.delta_captures.resize(n_delta);
     }
+    if (in.capture_moe_router && w.is_moe) {
+        og_early.moe_selected.assign((size_t)w.n_layer, nullptr);
+    }
 
     // DFlash target layer IDs for feature capture (from TargetWeights config).
     const int * CAPTURE_LAYERS = w.capture_layer_ids;
@@ -1078,8 +1086,14 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
 
         // FFN (dense SwiGLU for qwen35, MoE for qwen35moe)
-        ggml_tensor * ffn = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L)
+        ggml_tensor * moe_selected = nullptr;
+        ggml_tensor * ffn = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L,
+                                                           in.capture_moe_router ? &moe_selected : nullptr)
                                      : build_swiglu_ffn(ctx, post, L);
+        if (in.capture_moe_router && moe_selected) {
+            ggml_set_output(moe_selected);
+            og_early.moe_selected[(size_t)il] = moe_selected;
+        }
         cur = ggml_add(ctx, ffn, ffn_residual);
 
         // ── DFlash layer feature capture ──
@@ -1174,7 +1188,7 @@ ggml_tensor * build_qwen35_layer(
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
-                              q_tail_capture, q_tail_start);
+                              q_tail_capture, q_tail_start, nullptr);
 }
 
 // ─── Cross-request prefix snapshot (Phase A) ─────────────────────────

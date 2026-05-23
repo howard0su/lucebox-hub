@@ -62,6 +62,32 @@ bool Qwen35MoeRoutingStats::observe(int layer_idx, const int32_t * expert_ids, i
     return true;
 }
 
+bool Qwen35MoeRoutingStats::observe_selected_tensor(ggml_backend_t backend,
+                                                    int layer_idx,
+                                                    ggml_tensor * selected,
+                                                    std::string * err) {
+    if (!backend || !selected) {
+        if (err) *err = "null backend or selected tensor";
+        return false;
+    }
+    if (selected->type != GGML_TYPE_I32) {
+        if (err) *err = "selected tensor must be i32";
+        return false;
+    }
+    if (selected->ne[0] <= 0 || selected->ne[1] <= 0) {
+        if (err) *err = "selected tensor has invalid shape";
+        return false;
+    }
+    const int64_t n_ids = selected->ne[0] * selected->ne[1];
+    std::vector<int32_t> ids((size_t)n_ids);
+    ggml_backend_tensor_get(selected, ids.data(), 0, sizeof(int32_t) * (size_t)n_ids);
+    if (!observe(layer_idx, ids.data(), (int)n_ids)) {
+        if (err) *err = "failed to observe selected ids";
+        return false;
+    }
+    return true;
+}
+
 std::vector<int> Qwen35MoeRoutingStats::ranked_experts(int layer_idx) const {
     if (layer_idx < 0 || layer_idx >= n_layer) return {};
     std::vector<int> ranked((size_t)n_expert);
