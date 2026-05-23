@@ -641,7 +641,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*last_token_logits_only=*/(start + n_tokens < prompt_len),
-                               cfg_.kq_stride_pad)) {
+                               cfg_.kq_stride_pad,
+                               should_capture_moe_router())) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }
@@ -682,6 +683,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             std::fprintf(stderr, "prefill compute @%d failed\n", kv_pos);
             return -1;
         }
+        after_target_compute(sg_, kv_pos, n_tokens);
 
         int32_t last_tok = -1;
         const bool is_final_chunk = (start + n_tokens >= prompt_len);
@@ -765,12 +767,14 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*last_token_logits_only=*/false,
-                               cfg_.kq_stride_pad)) {
+                               cfg_.kq_stride_pad,
+                               should_capture_moe_router())) {
             return false;
         }
 
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
+        after_target_compute(sg_, committed, 1);
 
         ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
                                 sizeof(float) * vocab);

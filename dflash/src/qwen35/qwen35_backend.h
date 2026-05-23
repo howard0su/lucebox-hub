@@ -116,6 +116,14 @@ public:
 
 protected:
     virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
+    virtual bool should_capture_moe_router() const { return false; }
+    virtual void after_target_compute(StepGraph &,
+                                      int /*kv_start*/,
+                                      int /*n_tokens*/) {}
+
+    TargetWeights & target_weights() { return w_; }
+    const TargetWeights & target_weights() const { return w_; }
+    ggml_backend_t target_backend() const { return target_backend_; }
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
 
