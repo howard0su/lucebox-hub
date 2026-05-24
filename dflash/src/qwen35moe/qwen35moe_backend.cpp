@@ -482,38 +482,59 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     ggml_backend_t cpu_be = target_weights().moe_hybrid->cpu_backend;
 
     StepGraph layer_sg;
+    // Cached pre-FFN graphs for DeltaNet layers (position-independent, reusable)
+    const int n_layer = target_weights().n_layer;
+    std::vector<StepGraph> cached_prefn((size_t)n_layer);
+    std::vector<bool> prefn_built((size_t)n_layer, false);
     uint64_t build_us_total = 0, compute_us_total = 0, readback_us_total = 0, ffn_us_total = 0;
+
+    auto cleanup_graphs = [&]() {
+        step_graph_destroy(layer_sg);
+        for (auto & sg : cached_prefn) step_graph_destroy(sg);
+    };
 
     // Helper: process one token through all layers (hybrid: pre-FFN on GPU, FFN split)
     auto process_one_token = [&](int kv_pos) -> bool {
-        for (int il = 0; il < target_weights().n_layer; ++il) {
+        for (int il = 0; il < n_layer; ++il) {
+            const bool is_attn = (((il + 1) % target_weights().full_attention_interval) == 0);
             const auto t0 = HybridClock::now();
-            if (!build_layer_prefn_step(layer_sg, target_weights(), target_cache(), target_backend(),
-                                        il, kv_pos, /*n_tokens=*/1,
-                                        /*with_mask=*/false, /*fa_window=*/0, cfg_.kq_stride_pad)) {
-                return false;
+
+            StepGraph * sg_ptr;
+            if (!is_attn && prefn_built[(size_t)il]) {
+                // Reuse cached DeltaNet graph — just set input
+                sg_ptr = &cached_prefn[(size_t)il];
+            } else {
+                // Build (or rebuild for attention layers)
+                StepGraph & sg = is_attn ? layer_sg : cached_prefn[(size_t)il];
+                if (!build_layer_prefn_step(sg, target_weights(), target_cache(), target_backend(),
+                                            il, kv_pos, /*n_tokens=*/1,
+                                            /*with_mask=*/false, /*fa_window=*/0, cfg_.kq_stride_pad)) {
+                    return false;
+                }
+                if (!is_attn) prefn_built[(size_t)il] = true;
+                sg_ptr = &sg;
             }
-            ggml_backend_tensor_set(layer_sg.inp_embed, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
-            if (layer_sg.positions) {
+            ggml_backend_tensor_set(sg_ptr->inp_embed, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+            if (sg_ptr->positions) {
                 int32_t pos4[4] = {kv_pos, kv_pos, kv_pos, 0};
-                ggml_backend_tensor_set(layer_sg.positions, pos4, 0, sizeof(pos4));
+                ggml_backend_tensor_set(sg_ptr->positions, pos4, 0, sizeof(pos4));
             }
             const auto t1 = HybridClock::now();
             build_us_total += elapsed_us(t0, t1);
 
-            auto st = ggml_backend_graph_compute(target_backend(), layer_sg.gf);
+            auto st = ggml_backend_graph_compute(target_backend(), sg_ptr->gf);
             if (st != GGML_STATUS_SUCCESS) return false;
             const auto t2 = HybridClock::now();
             compute_us_total += elapsed_us(t1, t2);
 
-            ggml_backend_tensor_get(layer_sg.ffn_residual, residual_buf.data(), 0, sizeof(float) * (size_t)hidden);
-            ggml_backend_tensor_get(layer_sg.ffn_post, post_buf.data(), 0, sizeof(float) * (size_t)hidden);
-            if (!layer_sg.moe_selected.empty() && layer_sg.moe_selected[(size_t)il]) {
-                ggml_backend_tensor_get(layer_sg.moe_selected[(size_t)il], selected.data(), 0,
+            ggml_backend_tensor_get(sg_ptr->ffn_residual, residual_buf.data(), 0, sizeof(float) * (size_t)hidden);
+            ggml_backend_tensor_get(sg_ptr->ffn_post, post_buf.data(), 0, sizeof(float) * (size_t)hidden);
+            if (!sg_ptr->moe_selected.empty() && sg_ptr->moe_selected[(size_t)il]) {
+                ggml_backend_tensor_get(sg_ptr->moe_selected[(size_t)il], selected.data(), 0,
                                         sizeof(int32_t) * selected.size());
             }
-            if (layer_sg.moe_weights) {
-                ggml_backend_tensor_get(layer_sg.moe_weights, weights_buf.data(), 0,
+            if (sg_ptr->moe_weights) {
+                ggml_backend_tensor_get(sg_ptr->moe_weights, weights_buf.data(), 0,
                                         sizeof(float) * weights_buf.size());
             }
             if (routing_stats_) {
@@ -580,12 +601,12 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
         int32_t tok = req.prompt[(size_t)i];
         if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
             result.error = "prefill_embed";
-            step_graph_destroy(layer_sg);
+            cleanup_graphs();
             return result;
         }
         if (!process_one_token(i)) {
             result.error = "prefill";
-            step_graph_destroy(layer_sg);
+            cleanup_graphs();
             return result;
         }
     }
@@ -601,7 +622,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
         // Get logits from last prefill token
         if (!compute_logits()) {
             result.error = "decode_logits";
-            step_graph_destroy(layer_sg);
+            cleanup_graphs();
             return result;
         }
 
@@ -628,17 +649,17 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 int32_t tok = result.tokens.back();
                 if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
                     result.error = "decode_embed";
-                    step_graph_destroy(layer_sg);
+                    cleanup_graphs();
                     return result;
                 }
                 if (!process_one_token(committed)) {
                     result.error = "decode";
-                    step_graph_destroy(layer_sg);
+                    cleanup_graphs();
                     return result;
                 }
                 if (!compute_logits()) {
                     result.error = "decode_logits";
-                    step_graph_destroy(layer_sg);
+                    cleanup_graphs();
                     return result;
                 }
                 int32_t next_tok;
@@ -665,7 +686,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    step_graph_destroy(layer_sg);
+    cleanup_graphs();
     if (hybrid_telemetry_) {
         std::printf("[qwen35moe] perf breakdown: build=%.1fms compute=%.1fms readback=%.1fms ffn=%.1fms\n",
                     build_us_total / 1000.0, compute_us_total / 1000.0,
