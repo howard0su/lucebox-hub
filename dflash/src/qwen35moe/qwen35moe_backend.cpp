@@ -187,6 +187,14 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
 
 void Qwen35MoeBackend::after_target_compute(StepGraph & sg, int, int) {
     if (!routing_stats_) return;
+    if (sg.moe_selected.empty()) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr, "[qwen35moe] warning: moe_selected is empty in after_target_compute\n");
+            warned = true;
+        }
+        return;
+    }
     std::string err;
     for (int il = 0; il < target_weights().n_layer; ++il) {
         ggml_tensor * selected = (il < (int)sg.moe_selected.size()) ? sg.moe_selected[(size_t)il] : nullptr;
@@ -507,6 +515,9 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             if (layer_sg.moe_weights) {
                 ggml_backend_tensor_get(layer_sg.moe_weights, weights_buf.data(), 0,
                                         sizeof(float) * weights_buf.size());
+            }
+            if (routing_stats_) {
+                routing_stats_->observe(il, selected.data(), (int)selected.size());
             }
             const auto t3 = HybridClock::now();
             readback_us_total += elapsed_us(t2, t3);
