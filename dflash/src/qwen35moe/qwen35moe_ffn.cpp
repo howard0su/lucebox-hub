@@ -91,14 +91,10 @@ ggml_tensor * build_qwen35moe_ffn(
     ggml_tensor * w_view = ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens);
     experts = ggml_mul(ctx, experts, w_view);
 
-    ggml_tensor * routed = nullptr;
-    for (int i = 0; i < n_used; ++i) {
-        ggml_tensor * slice = ggml_view_2d(ctx, experts,
-            n_embd, n_tokens,
-            experts->nb[2],
-            (size_t)i * experts->nb[1]);
-        routed = (i == 0) ? slice : ggml_add(ctx, routed, slice);
-    }
+    // Sum over experts (single op: repeat_back sums dim 1)
+    ggml_tensor * sum_shape = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+    ggml_tensor * moe_sum   = ggml_repeat_back(ctx, experts, sum_shape);
+    ggml_tensor * routed    = ggml_reshape_2d(ctx, moe_sum, n_embd, n_tokens);
 
     if (L.ffn_up_shexp && L.ffn_gate_shexp && L.ffn_down_shexp) {
         ggml_tensor * sh_gate = apply_scale2(
