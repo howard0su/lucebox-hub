@@ -594,22 +594,148 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
         return true;
     };
 
-    // ── Hybrid Prefill: process prompt tokens one at a time ──
+    // ── Hybrid Prefill: chunked batched pre-FFN per layer, per-token FFN ──
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int prompt_len = (int)req.prompt.size();
+    const int prefill_chunk = std::min(32, prompt_len); // batch size per GPU compute
+
+    // Embed all prompt tokens
+    const int n_expert_used = target_weights().n_expert_used;
+    std::vector<float> embed_all((size_t)prompt_len * (size_t)hidden);
     for (int i = 0; i < prompt_len; ++i) {
         int32_t tok = req.prompt[(size_t)i];
-        if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
+        if (!target_weights().embedder.embed(&tok, 1, embed_all.data() + (size_t)i * (size_t)hidden)) {
             result.error = "prefill_embed";
             cleanup_graphs();
             return result;
         }
-        if (!process_one_token(i)) {
-            result.error = "prefill";
-            cleanup_graphs();
-            return result;
+    }
+
+    // Process layer by layer, chunked within each layer
+    for (int il = 0; il < n_layer; ++il) {
+        auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
+        const auto & L = target_weights().layers[(size_t)il];
+
+        for (int chunk_start = 0; chunk_start < prompt_len; chunk_start += prefill_chunk) {
+            const int chunk_len = std::min(prefill_chunk, prompt_len - chunk_start);
+            const auto t0 = HybridClock::now();
+
+            const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (chunk_len > 1);
+
+            // Build pre-FFN graph for this chunk
+            StepGraph prefill_sg;
+            if (!build_layer_prefn_step(prefill_sg, target_weights(), target_cache(), target_backend(),
+                                        il, /*kv_start=*/chunk_start, /*n_tokens=*/chunk_len,
+                                        with_mask, /*fa_window=*/0, cfg_.kq_stride_pad)) {
+                result.error = "prefill_build";
+                step_graph_destroy(prefill_sg);
+                cleanup_graphs();
+                return result;
+            }
+
+            // Set input embeddings for this chunk
+            ggml_backend_tensor_set(prefill_sg.inp_embed,
+                                    embed_all.data() + (size_t)chunk_start * (size_t)hidden, 0,
+                                    sizeof(float) * (size_t)chunk_len * (size_t)hidden);
+
+            // Set positions if attention layer
+            if (prefill_sg.positions) {
+                std::vector<int32_t> pos_data((size_t)chunk_len * 4);
+                for (int i = 0; i < chunk_len; ++i) {
+                    pos_data[(size_t)i * 4 + 0] = chunk_start + i;
+                    pos_data[(size_t)i * 4 + 1] = chunk_start + i;
+                    pos_data[(size_t)i * 4 + 2] = chunk_start + i;
+                    pos_data[(size_t)i * 4 + 3] = 0;
+                }
+                ggml_backend_tensor_set(prefill_sg.positions, pos_data.data(), 0, sizeof(int32_t) * pos_data.size());
+            }
+
+            // Set causal attention mask if needed
+            if (prefill_sg.attn_mask) {
+                const int kv_len = chunk_start + chunk_len;
+                const int kv_pad_override = (int)prefill_sg.attn_mask->ne[0];
+                std::vector<uint16_t> mask_buf;
+                build_causal_mask(mask_buf, kv_len, chunk_len, /*kv_start=*/chunk_start,
+                                  cfg_.kq_stride_pad, /*win_start=*/0, kv_pad_override);
+                ggml_backend_tensor_set(prefill_sg.attn_mask, mask_buf.data(), 0,
+                                        sizeof(uint16_t) * mask_buf.size());
+            }
+
+            const auto t1 = HybridClock::now();
+            build_us_total += elapsed_us(t0, t1);
+
+            // Compute batched pre-FFN
+            auto st = ggml_backend_graph_compute(target_backend(), prefill_sg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                result.error = "prefill_compute";
+                step_graph_destroy(prefill_sg);
+                cleanup_graphs();
+                return result;
+            }
+            const auto t2 = HybridClock::now();
+            compute_us_total += elapsed_us(t1, t2);
+
+            // Read back chunk results
+            std::vector<float> chunk_residuals((size_t)chunk_len * (size_t)hidden);
+            std::vector<float> chunk_post((size_t)chunk_len * (size_t)hidden);
+            std::vector<int32_t> chunk_selected((size_t)chunk_len * (size_t)n_expert_used);
+            std::vector<float> chunk_weights((size_t)chunk_len * (size_t)n_expert_used);
+
+            ggml_backend_tensor_get(prefill_sg.ffn_residual, chunk_residuals.data(), 0,
+                                    sizeof(float) * chunk_residuals.size());
+            ggml_backend_tensor_get(prefill_sg.ffn_post, chunk_post.data(), 0,
+                                    sizeof(float) * chunk_post.size());
+            if (!prefill_sg.moe_selected.empty() && prefill_sg.moe_selected[(size_t)il]) {
+                ggml_backend_tensor_get(prefill_sg.moe_selected[(size_t)il], chunk_selected.data(), 0,
+                                        sizeof(int32_t) * chunk_selected.size());
+            }
+            if (prefill_sg.moe_weights) {
+                ggml_backend_tensor_get(prefill_sg.moe_weights, chunk_weights.data(), 0,
+                                        sizeof(float) * chunk_weights.size());
+            }
+            const auto t3 = HybridClock::now();
+            readback_us_total += elapsed_us(t2, t3);
+
+            // Observe routing stats
+            if (routing_stats_) {
+                for (int i = 0; i < chunk_len; ++i) {
+                    routing_stats_->observe(il, chunk_selected.data() + (size_t)i * (size_t)n_expert_used, n_expert_used);
+                }
+            }
+
+            // Per-token FFN eval for this chunk
+            for (int i = 0; i < chunk_len; ++i) {
+                const float * tok_post = chunk_post.data() + (size_t)i * (size_t)hidden;
+                const int32_t * tok_sel = chunk_selected.data() + (size_t)i * (size_t)n_expert_used;
+                const float * tok_wt = chunk_weights.data() + (size_t)i * (size_t)n_expert_used;
+
+                if (!eval_qwen35moe_hybrid_ffn_single(
+                        target_backend(), target_weights(), L, storage, cpu_be,
+                        tok_post, tok_sel, tok_wt, n_expert_used, ffn_out, nullptr, nullptr)) {
+                    result.error = "prefill_ffn";
+                    step_graph_destroy(prefill_sg);
+                    cleanup_graphs();
+                    return result;
+                }
+
+                // Combine: embed_all[chunk_start+i] = ffn_out + residual for next layer
+                const float * tok_res = chunk_residuals.data() + (size_t)i * (size_t)hidden;
+                float * tok_embed = embed_all.data() + (size_t)(chunk_start + i) * (size_t)hidden;
+                for (int j = 0; j < hidden; ++j) {
+                    tok_embed[j] = ffn_out[(size_t)j] + tok_res[j];
+                }
+            }
+            const auto t4 = HybridClock::now();
+            ffn_us_total += elapsed_us(t3, t4);
+
+            step_graph_destroy(prefill_sg);
         }
     }
+
+    // Copy last token's output to act_cur for decode
+    std::memcpy(act_cur.data(), embed_all.data() + (size_t)(prompt_len - 1) * (size_t)hidden,
+                sizeof(float) * (size_t)hidden);
+
     int committed = prompt_len;
     target_cache().cur_pos = committed;
     auto t_prefill_end = std::chrono::steady_clock::now();
