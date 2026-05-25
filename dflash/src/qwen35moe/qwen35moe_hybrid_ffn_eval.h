@@ -100,6 +100,27 @@ bool eval_qwen35moe_batched_prefill_ffn(
     std::vector<float> &   out,
     std::string *          err = nullptr);
 
+// Batched hybrid prefill FFN: processes n_tokens at once with hot experts on GPU
+// and cold experts on CPU concurrently.  Uses pre-computed routing from the pre-FFN
+// graph.  Falls back to eval_qwen35moe_batched_prefill_ffn when all selected experts
+// are hot.
+// cur_host: [n_embd × n_tokens] post-norm hidden states (row-major)
+// selected_ids: [n_expert_used × n_tokens] expert selections (global IDs)
+// selected_weights: [n_expert_used × n_tokens] routing weights
+// out: [n_embd × n_tokens] output (resized internally)
+bool eval_qwen35moe_hybrid_ffn_batched(
+    ggml_backend_t                      gpu_backend,
+    ggml_backend_t                      cpu_backend,
+    const TargetWeights &               w,
+    const TargetLayer &                 L,
+    Qwen35MoeHybridLayerStorage &       storage,
+    const float *                       cur_host,
+    const int32_t *                     selected_ids,
+    const float *                       selected_weights,
+    int                                 n_tokens,
+    std::vector<float> &                out,
+    std::string *                       err = nullptr);
+
 // Build/rebuild cached hot FFN graph for a given number of hot experts.
 bool build_cached_hot_graph(
     CachedFfnGraph & out,

@@ -624,10 +624,10 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
         return true;
     };
 
-    // ── Hybrid Prefill: chunked batched pre-FFN per layer, per-token FFN ──
+    // ── Hybrid Prefill: chunked batched pre-FFN per layer, batched FFN ──
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int prompt_len = (int)req.prompt.size();
-    const int prefill_chunk = std::min(32, prompt_len); // batch size per GPU compute
+    const int prefill_chunk = std::min(128, prompt_len); // batch size per GPU compute
 
     // Embed all prompt tokens
     const int n_expert_used = target_weights().n_expert_used;
@@ -738,26 +738,24 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 }
             }
 
-            // Per-token FFN eval for this chunk (correctness-first path)
-            for (int i = 0; i < chunk_len; ++i) {
-                const float * tok_post = chunk_post.data() + (size_t)i * (size_t)hidden;
-                const int32_t * tok_sel = chunk_selected.data() + (size_t)i * (size_t)n_expert_used;
-                const float * tok_wt = chunk_weights.data() + (size_t)i * (size_t)n_expert_used;
-                if (!eval_qwen35moe_hybrid_ffn_single(
-                        target_backend(), target_weights(), L, storage, cpu_be,
-                        tok_post, tok_sel, tok_wt, n_expert_used, ffn_out,
-                        nullptr, nullptr)) {
-                    result.error = "prefill_ffn";
-                    step_graph_destroy(prefill_sg);
-                    cleanup_graphs();
-                    return result;
-                }
+            // Batched hybrid FFN for this chunk
+            std::vector<float> ffn_batch_out;
+            if (!eval_qwen35moe_hybrid_ffn_batched(
+                    target_backend(), cpu_be, target_weights(), L, storage,
+                    chunk_post.data(), chunk_selected.data(), chunk_weights.data(),
+                    chunk_len, ffn_batch_out, &result.error)) {
+                step_graph_destroy(prefill_sg);
+                cleanup_graphs();
+                return result;
+            }
 
-                // Combine FFN output + residual → embed_all for next layer
+            // Combine FFN output + residual → embed_all for next layer
+            for (int i = 0; i < chunk_len; ++i) {
+                const float * ffn = ffn_batch_out.data() + (size_t)i * (size_t)hidden;
                 const float * tok_res = chunk_residuals.data() + (size_t)i * (size_t)hidden;
                 float * tok_embed = embed_all.data() + (size_t)(chunk_start + i) * (size_t)hidden;
                 for (int j = 0; j < hidden; ++j) {
-                    tok_embed[j] = ffn_out[(size_t)j] + tok_res[j];
+                    tok_embed[j] = ffn[j] + tok_res[j];
                 }
 
                 // Feature capture at capture layers for spec-decode

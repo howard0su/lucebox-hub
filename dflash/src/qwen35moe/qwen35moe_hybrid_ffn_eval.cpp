@@ -834,6 +834,275 @@ bool eval_qwen35moe_batched_prefill_ffn(
 
 // ── GPU-Resident Residual State ──
 
+// ── Hybrid Batched Prefill FFN ──
+// Processes n_tokens at once with hot experts on GPU and cold experts on CPU
+// concurrently.  Uses pre-computed routing from the pre-FFN graph.
+
+static bool build_batched_routed_graph(
+    ggml_context * ctx,
+    ggml_tensor * gate_tensor,
+    ggml_tensor * up_tensor,
+    ggml_tensor * down_tensor,
+    ggml_tensor * gate_up_tensor,
+    float gate_scale,
+    float up_scale,
+    float down_scale,
+    float gate_up_scale,
+    ggml_tensor * inp,          // [n_embd, n_tokens]
+    ggml_tensor * sel,          // [n_used, n_tokens]
+    ggml_tensor * wts,          // [n_used, n_tokens]
+    int n_embd, int n_ff_exp, int n_used, int n_tokens,
+    ggml_tensor ** out_routed)
+{
+    ggml_tensor * cur_3d = ggml_reshape_3d(ctx, inp, n_embd, 1, n_tokens);
+    ggml_tensor * gu = nullptr;
+    if (gate_up_tensor) {
+        ggml_tensor * gate_up_e = apply_scale2(ctx,
+            ggml_mul_mat_id(ctx, gate_up_tensor, cur_3d, sel), gate_up_scale);
+        ggml_tensor * gate_e = ggml_view_3d(ctx, gate_up_e,
+            n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
+            gate_up_e->nb[1], gate_up_e->nb[2], 0);
+        ggml_tensor * up_e = ggml_view_3d(ctx, gate_up_e,
+            n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
+            gate_up_e->nb[1], gate_up_e->nb[2],
+            (size_t)n_ff_exp * ggml_element_size(gate_up_e));
+        gate_e = ggml_cont(ctx, gate_e);
+        up_e = ggml_cont(ctx, up_e);
+        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+    } else {
+        ggml_tensor * gate_e = apply_scale2(ctx,
+            ggml_mul_mat_id(ctx, gate_tensor, cur_3d, sel), gate_scale);
+        ggml_tensor * up_e = apply_scale2(ctx,
+            ggml_mul_mat_id(ctx, up_tensor, cur_3d, sel), up_scale);
+        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+    }
+
+    ggml_tensor * experts = apply_scale2(ctx,
+        ggml_mul_mat_id(ctx, down_tensor, gu, sel), down_scale);
+
+    // Weight and sum over experts: [n_embd, n_used, n_tokens] * [1, n_used, n_tokens]
+    ggml_tensor * w_view = ggml_reshape_3d(ctx, wts, 1, n_used, n_tokens);
+    experts = ggml_mul(ctx, experts, w_view);
+
+    ggml_tensor * sum_shape = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+    ggml_tensor * moe_sum = ggml_repeat_back(ctx, experts, sum_shape);
+    *out_routed = ggml_reshape_2d(ctx, moe_sum, n_embd, n_tokens);
+    return true;
+}
+
+bool eval_qwen35moe_hybrid_ffn_batched(
+    ggml_backend_t                      gpu_backend,
+    ggml_backend_t                      cpu_backend,
+    const TargetWeights &               w,
+    const TargetLayer &                 L,
+    Qwen35MoeHybridLayerStorage &       storage,
+    const float *                       cur_host,
+    const int32_t *                     selected_ids,
+    const float *                       selected_weights,
+    int                                 n_tokens,
+    std::vector<float> &                out,
+    std::string *                       err) {
+
+    const int n_embd = w.n_embd;
+    const int n_used = w.n_expert_used;
+    const int n_ff_exp = w.n_ff_exp;
+    out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    if (n_tokens <= 0) return true;
+
+    // ── Step 1: Partition routing into hot and cold ──
+    // Use dummy expert ID 0 with weight 0.0 for "other device" slots
+    // (ggml_mul_mat_id does not handle -1 IDs safely)
+    const int total_slots = n_used * n_tokens;
+    std::vector<int32_t> hot_sel(total_slots, 0);
+    std::vector<float>   hot_wts(total_slots, 0.0f);
+    std::vector<int32_t> cold_sel(total_slots, 0);
+    std::vector<float>   cold_wts(total_slots, 0.0f);
+    bool has_hot = false, has_cold = false;
+
+    for (int i = 0; i < total_slots; ++i) {
+        const int32_t gid = selected_ids[i];
+        if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) continue;
+        const int32_t hot_lid = storage.hot_local_by_global[(size_t)gid];
+        if (hot_lid >= 0) {
+            hot_sel[i] = hot_lid;
+            hot_wts[i] = selected_weights[i];
+            has_hot = true;
+        } else {
+            const int32_t cold_lid = storage.cold_local_by_global[(size_t)gid];
+            if (cold_lid >= 0) {
+                cold_sel[i] = cold_lid;
+                cold_wts[i] = selected_weights[i];
+                has_cold = true;
+            }
+        }
+    }
+
+    // Fast path: all hot → use hot stack only (no cold compute needed)
+    // NOTE: Cannot use eval_qwen35moe_batched_prefill_ffn here since
+    // L.ffn_gate_exps is not allocated in hybrid mode (skip_expert_tensors=true).
+    // Fall through to hybrid path which uses storage.gate_hot correctly.
+
+    // ── Step 2: Build and run hot GPU graph (includes shared expert always) ──
+    std::vector<float> hot_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    bool hot_async_launched = false;
+
+    ggml_context * hot_ctx = nullptr;
+    ggml_cgraph * hot_gf = nullptr;
+    ggml_gallocr_t hot_alloc = nullptr;
+    ggml_tensor * hot_output = nullptr;
+
+    // Always run GPU graph: shared expert is always on GPU, and hot routed when present
+    const bool has_shared = (L.ffn_up_shexp && L.ffn_gate_shexp && L.ffn_down_shexp);
+    if (has_hot || has_shared) {
+        ggml_init_params ip{};
+        ip.mem_size = 128 * 1024 * 1024;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc = true;
+        hot_ctx = ggml_init(ip);
+        if (!hot_ctx) { if (err) *err = "hot ggml_init failed"; return false; }
+
+        ggml_tensor * inp = ggml_new_tensor_2d(hot_ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp);
+
+        // Only create routing tensors if we have hot routed experts
+        ggml_tensor * sel = nullptr;
+        ggml_tensor * wts = nullptr;
+        ggml_tensor * routed = nullptr;
+        if (has_hot) {
+            sel = ggml_new_tensor_2d(hot_ctx, GGML_TYPE_I32, n_used, n_tokens);
+            ggml_set_input(sel);
+            wts = ggml_new_tensor_2d(hot_ctx, GGML_TYPE_F32, n_used, n_tokens);
+            ggml_set_input(wts);
+
+            build_batched_routed_graph(hot_ctx,
+                storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+                L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+        }
+
+        // Shared expert (always on GPU)
+        ggml_tensor * combined = routed;
+        if (has_shared) {
+            ggml_tensor * sh_gate = apply_scale2(hot_ctx,
+                ggml_mul_mat(hot_ctx, L.ffn_gate_shexp, inp), L.ffn_gate_shexp_s);
+            ggml_tensor * sh_up = apply_scale2(hot_ctx,
+                ggml_mul_mat(hot_ctx, L.ffn_up_shexp, inp), L.ffn_up_shexp_s);
+            ggml_tensor * sh_gu = ggml_swiglu_split(hot_ctx, sh_gate, sh_up);
+            ggml_tensor * shared = apply_scale2(hot_ctx,
+                ggml_mul_mat(hot_ctx, L.ffn_down_shexp, sh_gu), L.ffn_down_shexp_s);
+            if (L.ffn_gate_inp_shexp) {
+                ggml_tensor * shared_gate = apply_scale2(hot_ctx,
+                    ggml_mul_mat(hot_ctx, L.ffn_gate_inp_shexp, inp), L.ffn_gate_inp_shexp_s);
+                shared_gate = ggml_sigmoid(hot_ctx, shared_gate);
+                shared = ggml_mul(hot_ctx, shared, shared_gate);
+            }
+            combined = combined ? ggml_add(hot_ctx, combined, shared) : shared;
+        }
+        hot_output = combined;
+
+        hot_gf = ggml_new_graph_custom(hot_ctx, 4096, false);
+        ggml_set_output(hot_output);
+        ggml_build_forward_expand(hot_gf, hot_output);
+        hot_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+        if (!ggml_gallocr_alloc_graph(hot_alloc, hot_gf)) {
+            if (err) *err = "hybrid batched hot gallocr failed";
+            ggml_gallocr_free(hot_alloc); ggml_free(hot_ctx);
+            return false;
+        }
+
+        ggml_backend_tensor_set(inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        if (has_hot) {
+            ggml_backend_tensor_set(sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+            ggml_backend_tensor_set(wts, hot_wts.data(), 0, sizeof(float) * (size_t)total_slots);
+        }
+
+        // Launch GPU async
+        ggml_backend_graph_compute_async(gpu_backend, hot_gf);
+        hot_async_launched = true;
+    }
+
+    // ── Step 3: Build and run cold CPU graph (overlaps with GPU) ──
+    std::vector<float> cold_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
+
+    if (has_cold) {
+        ggml_init_params ip{};
+        ip.mem_size = 128 * 1024 * 1024;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc = true;
+        ggml_context * cold_ctx = ggml_init(ip);
+        if (!cold_ctx) {
+            if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+            if (hot_alloc) ggml_gallocr_free(hot_alloc);
+            if (hot_ctx) ggml_free(hot_ctx);
+            if (err) *err = "cold ggml_init failed";
+            return false;
+        }
+
+        ggml_tensor * inp = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp);
+        ggml_tensor * sel = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_input(sel);
+        ggml_tensor * wts = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_F32, n_used, n_tokens);
+        ggml_set_input(wts);
+
+        ggml_tensor * cold_routed = nullptr;
+        build_batched_routed_graph(cold_ctx,
+            storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
+            L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+            inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &cold_routed);
+
+        ggml_cgraph * cold_gf = ggml_new_graph_custom(cold_ctx, 4096, false);
+        ggml_set_output(cold_routed);
+        ggml_build_forward_expand(cold_gf, cold_routed);
+        ggml_gallocr_t cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+        if (!ggml_gallocr_alloc_graph(cold_alloc, cold_gf)) {
+            if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+            if (hot_alloc) ggml_gallocr_free(hot_alloc);
+            if (hot_ctx) ggml_free(hot_ctx);
+            ggml_gallocr_free(cold_alloc); ggml_free(cold_ctx);
+            if (err) *err = "hybrid batched cold gallocr failed";
+            return false;
+        }
+
+        ggml_backend_tensor_set(inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        ggml_backend_tensor_set(sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+        ggml_backend_tensor_set(wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
+
+        // Run CPU synchronously (overlaps with GPU async)
+        auto st = ggml_backend_graph_compute(cpu_backend, cold_gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+            if (hot_alloc) ggml_gallocr_free(hot_alloc);
+            if (hot_ctx) ggml_free(hot_ctx);
+            ggml_gallocr_free(cold_alloc); ggml_free(cold_ctx);
+            if (err) *err = "hybrid batched cold compute failed";
+            return false;
+        }
+
+        ggml_backend_tensor_get(cold_routed, cold_partial.data(), 0,
+            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        ggml_gallocr_free(cold_alloc);
+        ggml_free(cold_ctx);
+    }
+
+    // ── Step 4: Sync GPU and read hot result ──
+    if (hot_async_launched) {
+        ggml_backend_synchronize(gpu_backend);
+        ggml_backend_tensor_get(hot_output, hot_partial.data(), 0,
+            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    }
+    if (hot_alloc) ggml_gallocr_free(hot_alloc);
+    if (hot_ctx) ggml_free(hot_ctx);
+
+    // ── Step 5: Merge hot + cold ──
+    const size_t total_floats = (size_t)n_embd * (size_t)n_tokens;
+    for (size_t i = 0; i < total_floats; ++i) {
+        out[i] = hot_partial[i] + cold_partial[i];
+    }
+
+    return true;
+}
+
 void ResidualCombineGraph::free() {
     if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
     if (ctx) { ggml_free(ctx); ctx = nullptr; }
