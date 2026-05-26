@@ -943,11 +943,11 @@ bool eval_qwen35moe_hybrid_ffn_batched(
     // Fall through to hybrid path which uses storage.gate_hot correctly.
 
     // ── Step 2: Build and run hot GPU graphs ──
-    // CUDA's mul_mat_id uses the MMVQ fast path only when n_tokens <= 8.
+    // CUDA's mul_mat_id uses the MMVQ fast path only when n_tokens <= 16.
     // Larger batches trigger the MMQ path which has issues with pre-allocated
     // external expert tensors. We sub-batch routed experts to stay on MMVQ,
     // while the shared expert (regular ggml_mul_mat) handles full batches fine.
-    static constexpr int MMVQ_MAX = 8;
+    static constexpr int MMVQ_MAX = 16;
 
     std::vector<float> hot_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
     bool hot_async_launched = false;
