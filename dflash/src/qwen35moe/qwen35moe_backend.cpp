@@ -627,7 +627,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     // ── Hybrid Prefill: chunked batched pre-FFN per layer, batched FFN ──
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int prompt_len = (int)req.prompt.size();
-    const int prefill_chunk = std::min(128, prompt_len); // batch size per GPU compute
+    const int prefill_chunk = std::min(512, prompt_len); // batch size per GPU compute
 
     // Embed all prompt tokens
     const int n_expert_used = target_weights().n_expert_used;
