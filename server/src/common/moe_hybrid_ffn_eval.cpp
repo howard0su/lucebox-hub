@@ -19,6 +19,18 @@ inline ggml_tensor * apply_scale2(ggml_context * ctx, ggml_tensor * mm_result, f
     return ggml_scale(ctx, mm_result, scale);
 }
 
+inline ggml_tensor * swiglu_maybe_clamped(ggml_context * ctx,
+                                          ggml_tensor * gate,
+                                          ggml_tensor * up,
+                                          float clamp) {
+    if (clamp > 1.0e-6f) {
+        // DeepSeek V4 clamps only the upper side of the gate, and both sides of up.
+        gate = ggml_clamp(ctx, gate, -INFINITY, clamp);
+        up   = ggml_clamp(ctx, up,   -clamp, clamp);
+    }
+    return ggml_swiglu_split(ctx, gate, up);
+}
+
 using HybridClock = std::chrono::steady_clock;
 
 static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_point end) {
@@ -28,14 +40,15 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
 // Build the shared-expert FFN subgraph onto an existing ggml_context.
 // Returns the output tensor (or nullptr if no shared expert is present).
 static ggml_tensor * build_shared_expert_subgraph(
-        ggml_context * ctx, const MoeLayerDesc & desc, ggml_tensor * inp) {
+        ggml_context * ctx, const MoeLayerDesc & desc, ggml_tensor * inp,
+        float swiglu_clamp = 0.0f) {
     if (!desc.ffn_up_shexp || !desc.ffn_gate_shexp || !desc.ffn_down_shexp)
         return nullptr;
     ggml_tensor * sh_gate = apply_scale2(ctx,
         ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
     ggml_tensor * sh_up = apply_scale2(ctx,
         ggml_mul_mat(ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
-    ggml_tensor * sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
+    ggml_tensor * sh_gu = swiglu_maybe_clamped(ctx, sh_gate, sh_up, swiglu_clamp);
     ggml_tensor * shared = apply_scale2(ctx,
         ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
     if (desc.ffn_gate_inp_shexp) {
@@ -68,6 +81,7 @@ static bool run_routed_subset(ggml_backend_t backend,
                               float gate_up_scale,
                               int n_embd,
                               int n_ff_exp,
+                              float swiglu_clamp,
                               const float * cur_host,
                               const int32_t * selected_ids,
                               const float * selected_weights,
@@ -129,13 +143,13 @@ static bool run_routed_subset(ggml_backend_t backend,
             (size_t)n_ff_exp * ggml_element_size(gate_up_e));
         gate_e = ggml_cont(ctx, gate_e);
         up_e = ggml_cont(ctx, up_e);
-        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        gu = swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp);
     } else {
         ggml_tensor * gate_e = apply_scale2(ctx,
             ggml_mul_mat_id(ctx, gate_tensor, cur_3d, ids), gate_scale);
         ggml_tensor * up_e = apply_scale2(ctx,
             ggml_mul_mat_id(ctx, up_tensor, cur_3d, ids), up_scale);
-        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        gu = swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp);
     }
 
     ggml_tensor * experts = apply_scale2(ctx,
@@ -248,6 +262,7 @@ static bool run_hot_and_shared_ffn_gpu(
     const MoeLayerDesc & desc,
     int n_embd,
     int n_ff_exp,
+    float swiglu_clamp,
     const float * cur_host,
     const int32_t * hot_ids,
     const float * hot_weights,
@@ -298,13 +313,13 @@ static bool run_hot_and_shared_ffn_gpu(
                 (size_t)n_ff_exp * ggml_element_size(gate_up_e));
             gate_e = ggml_cont(ctx, gate_e);
             up_e = ggml_cont(ctx, up_e);
-            gu = ggml_swiglu_split(ctx, gate_e, up_e);
+            gu = swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp);
         } else {
             ggml_tensor * gate_e = apply_scale2(ctx,
                 ggml_mul_mat_id(ctx, gate_tensor, cur_3d, ids_tensor), gate_scale);
             ggml_tensor * up_e = apply_scale2(ctx,
                 ggml_mul_mat_id(ctx, up_tensor, cur_3d, ids_tensor), up_scale);
-            gu = ggml_swiglu_split(ctx, gate_e, up_e);
+            gu = swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp);
         }
 
         ggml_tensor * experts = apply_scale2(ctx,
@@ -319,7 +334,7 @@ static bool run_hot_and_shared_ffn_gpu(
         }
     }
 
-    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp, swiglu_clamp);
 
     // Combine hot routed + shared into a single output tensor
     ggml_tensor * combined = nullptr;
@@ -379,6 +394,7 @@ static bool build_batched_routed_graph(
     ggml_tensor * sel,
     ggml_tensor * wts,
     int n_embd, int n_ff_exp, int n_used, int n_tokens,
+    float swiglu_clamp,
     ggml_tensor ** out_routed)
 {
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, inp, n_embd, 1, n_tokens);
@@ -395,13 +411,13 @@ static bool build_batched_routed_graph(
             (size_t)n_ff_exp * ggml_element_size(gate_up_e));
         gate_e = ggml_cont(ctx, gate_e);
         up_e = ggml_cont(ctx, up_e);
-        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        gu = swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp);
     } else {
         ggml_tensor * gate_e = apply_scale2(ctx,
             ggml_mul_mat_id(ctx, gate_tensor, cur_3d, sel), gate_scale);
         ggml_tensor * up_e = apply_scale2(ctx,
             ggml_mul_mat_id(ctx, up_tensor, cur_3d, sel), up_scale);
-        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        gu = swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp);
     }
 
     ggml_tensor * experts = apply_scale2(ctx,
@@ -434,6 +450,7 @@ bool build_cached_hot_graph(
     int n_embd,
     int n_ff_exp,
     int n_hot,
+    float swiglu_clamp,
     bool gpu_remap,
     int n_expert) {
 
@@ -488,13 +505,13 @@ bool build_cached_hot_graph(
                 (size_t)n_ff_exp * ggml_element_size(gate_up_e));
             gate_e = ggml_cont(out.ctx, gate_e);
             up_e = ggml_cont(out.ctx, up_e);
-            gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+            gu = swiglu_maybe_clamped(out.ctx, gate_e, up_e, swiglu_clamp);
         } else {
             ggml_tensor * gate_e = apply_scale2(out.ctx,
                 ggml_mul_mat_id(out.ctx, gate_tensor, cur_3d, out.ids), gate_scale);
             ggml_tensor * up_e = apply_scale2(out.ctx,
                 ggml_mul_mat_id(out.ctx, up_tensor, cur_3d, out.ids), up_scale);
-            gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+            gu = swiglu_maybe_clamped(out.ctx, gate_e, up_e, swiglu_clamp);
         }
 
         ggml_tensor * experts = apply_scale2(out.ctx,
@@ -509,7 +526,7 @@ bool build_cached_hot_graph(
         }
     }
 
-    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp);
+    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp, swiglu_clamp);
 
     if (routed && shared) {
         out.output = ggml_add(out.ctx, routed, shared);
@@ -545,7 +562,8 @@ bool build_cached_cold_graph(
     float gate_up_scale,
     int n_embd,
     int n_ff_exp,
-    int n_cold) {
+    int n_cold,
+    float swiglu_clamp) {
 
     out.free();
     out.n_hot = n_cold;  // reuse field for "n experts in this graph"
@@ -578,13 +596,13 @@ bool build_cached_cold_graph(
             (size_t)n_ff_exp * ggml_element_size(gate_up_e));
         gate_e = ggml_cont(out.ctx, gate_e);
         up_e = ggml_cont(out.ctx, up_e);
-        gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+        gu = swiglu_maybe_clamped(out.ctx, gate_e, up_e, swiglu_clamp);
     } else {
         ggml_tensor * gate_e = apply_scale2(out.ctx,
             ggml_mul_mat_id(out.ctx, gate_tensor, cur_3d, out.ids), gate_scale);
         ggml_tensor * up_e = apply_scale2(out.ctx,
             ggml_mul_mat_id(out.ctx, up_tensor, cur_3d, out.ids), up_scale);
-        gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+        gu = swiglu_maybe_clamped(out.ctx, gate_e, up_e, swiglu_clamp);
     }
 
     ggml_tensor * experts = apply_scale2(out.ctx,
@@ -648,7 +666,7 @@ bool build_cached_hot_batched_graph(
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
-    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp);
+    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp, swiglu_clamp);
     if (shared) {
         combined = combined ? ggml_add(out.ctx, combined, shared) : shared;
     }
@@ -784,7 +802,7 @@ bool eval_moe_hybrid_ffn_single(
             build_cached_hot_graph(storage.hot_graph, gpu_backend,
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                   desc, cfg.n_embd, cfg.n_ff_exp, n_hot);
+                                   desc, cfg.n_embd, cfg.n_ff_exp, n_hot, cfg.swiglu_clamp);
         }
         if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
             ggml_backend_tensor_set(storage.hot_graph.inp, cur_host, 0, sizeof(float) * (size_t)cfg.n_embd);
@@ -803,6 +821,7 @@ bool eval_moe_hybrid_ffn_single(
                                             storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                             desc, cfg.n_embd, cfg.n_ff_exp,
+                                            cfg.swiglu_clamp,
                                             cur_host,
                                             hot_ids.empty() ? nullptr : hot_ids.data(),
                                             hot_weights.empty() ? nullptr : hot_weights.data(),
@@ -819,7 +838,7 @@ bool eval_moe_hybrid_ffn_single(
             build_cached_cold_graph(storage.cold_graph, cpu_backend,
                                     storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                     desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                    cfg.n_embd, cfg.n_ff_exp, n_cold);
+                                    cfg.n_embd, cfg.n_ff_exp, n_cold, cfg.swiglu_clamp);
         }
         if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
             ggml_backend_tensor_set(storage.cold_graph.inp, cur_host, 0, sizeof(float) * (size_t)cfg.n_embd);
@@ -837,7 +856,7 @@ bool eval_moe_hybrid_ffn_single(
             if (!run_routed_subset(cpu_backend,
                                    storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                   cfg.n_embd, cfg.n_ff_exp,
+                                   cfg.n_embd, cfg.n_ff_exp, cfg.swiglu_clamp,
                                    cur_host, cold_ids.data(), cold_weights.data(), n_cold, cold, err)) {
                 if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
                 return false;
@@ -924,13 +943,13 @@ bool eval_moe_batched_prefill_ffn(
             (size_t)n_ff_exp * ggml_element_size(gate_up_e));
         gate_e = ggml_cont(ctx, gate_e);
         up_e = ggml_cont(ctx, up_e);
-        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        gu = swiglu_maybe_clamped(ctx, gate_e, up_e, cfg.swiglu_clamp);
     } else {
         ggml_tensor * gate_e = apply_scale2(ctx,
             ggml_mul_mat_id(ctx, desc.ffn_gate_exps, cur_3d, sel), desc.ffn_gate_exps_s);
         ggml_tensor * up_e = apply_scale2(ctx,
             ggml_mul_mat_id(ctx, desc.ffn_up_exps, cur_3d, sel), desc.ffn_up_exps_s);
-        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        gu = swiglu_maybe_clamped(ctx, gate_e, up_e, cfg.swiglu_clamp);
     }
 
     ggml_tensor * experts = apply_scale2(ctx,
@@ -946,7 +965,7 @@ bool eval_moe_batched_prefill_ffn(
 
     // Shared expert
     ggml_tensor * combined = routed;
-    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp);
     if (shared) {
         combined = combined ? ggml_add(ctx, combined, shared) : shared;
     }
@@ -1179,12 +1198,12 @@ static bool eval_moe_hybrid_ffn_batched_core(
             build_batched_routed_graph(hot_ctx,
                 storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                 desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+                inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
         }
 
         // Shared expert (always on GPU)
         ggml_tensor * combined = routed;
-        ggml_tensor * shared = build_shared_expert_subgraph(hot_ctx, desc, inp);
+        ggml_tensor * shared = build_shared_expert_subgraph(hot_ctx, desc, inp, cfg.swiglu_clamp);
         if (shared) {
             combined = combined ? ggml_add(hot_ctx, combined, shared) : shared;
         }
@@ -1246,7 +1265,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
         build_batched_routed_graph(cold_ctx,
             storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-            inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &cold_routed);
+            inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &cold_routed);
 
         ggml_cgraph * cold_gf = ggml_new_graph_custom(cold_ctx, 4096, false);
         ggml_set_output(cold_routed);
@@ -1438,7 +1457,7 @@ bool eval_moe_hot_only_batched(
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
-    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp);
     if (shared) {
         combined = combined ? ggml_add(ctx, combined, shared) : shared;
     }
@@ -1766,7 +1785,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
             build_cached_hot_graph(storage.hot_graph, gpu_backend,
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                   desc, n_embd, cfg.n_ff_exp, n_hot);
+                                   desc, n_embd, cfg.n_ff_exp, n_hot, cfg.swiglu_clamp);
         }
         if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
             // GPU→GPU copy: ffn_post → hot_graph.inp (no PCIe!)
@@ -1802,7 +1821,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
             build_cached_cold_graph(storage.cold_graph, cpu_backend,
                                     storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                     desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                    n_embd, cfg.n_ff_exp, n_cold);
+                                    n_embd, cfg.n_ff_exp, n_cold, cfg.swiglu_clamp);
         }
         if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
             ggml_backend_tensor_set(storage.cold_graph.inp, post_host.data(), 0,
