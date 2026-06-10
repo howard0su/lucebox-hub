@@ -184,7 +184,8 @@ MoeHybridStorage::~MoeHybridStorage() {
 bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
     return placement.matches(cfg) &&
            (int)layers.size() == cfg.n_layer &&
-           cold_backend_kind == cfg.cold_expert_backend;
+           cold_backend_kind == cfg.cold_expert_backend &&
+           materialized_cold_experts == cfg.materialize_cold_experts;
 }
 
 bool MoeHybridStorage::empty() const {
@@ -215,6 +216,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
     }
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
     out.cold_backend_kind = cfg.cold_expert_backend;
+    out.materialized_cold_experts = cfg.materialize_cold_experts;
     out.cold_backend = (cfg.cold_expert_backend == MoeHybridColdBackend::Gpu) ? gpu_backend : out.cpu_backend;
     if (!out.cold_backend) {
         if (err) *err = "failed to select cold expert backend";
@@ -323,7 +325,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         }
 
         // Allocate cold expert tensors on the selected cold backend.
-        if (cold_count > 0) {
+        if (cold_count > 0 && cfg.materialize_cold_experts) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -414,6 +416,7 @@ bool build_moe_hybrid_storage_from_file(
     }
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
     out.cold_backend_kind = cfg.cold_expert_backend;
+    out.materialized_cold_experts = cfg.materialize_cold_experts;
     out.cold_backend = (cfg.cold_expert_backend == MoeHybridColdBackend::Gpu) ? gpu_backend : out.cpu_backend;
     if (!out.cold_backend) {
         if (err) *err = "failed to select cold expert backend";
@@ -533,7 +536,7 @@ bool build_moe_hybrid_storage_from_file(
         }
 
         // Allocate cold expert tensors on the selected cold backend.
-        if (cold_count > 0) {
+        if (cold_count > 0 && cfg.materialize_cold_experts) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
