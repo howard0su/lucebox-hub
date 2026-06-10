@@ -214,6 +214,7 @@ struct TargetLoadPlan {
     int  layer_end   = -1;    // exclusive; <0 means all layers
     bool load_output = true;  // output_norm + lm_head
     bool skip_expert_tensors = false;  // skip ffn_*_exps from GPU (for hybrid MoE split load)
+    bool expert_metadata_only = false; // keep only routed expert tensor metadata; upload nothing
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.
