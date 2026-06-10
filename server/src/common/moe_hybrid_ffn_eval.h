@@ -138,7 +138,8 @@ bool eval_moe_hybrid_ffn_batched(
     std::vector<float> &            out,
     std::string *                   err = nullptr,
     ggml_gallocr_t *                p_hot_alloc = nullptr,
-    ggml_gallocr_t *                p_cold_alloc = nullptr);
+    ggml_gallocr_t *                p_cold_alloc = nullptr,
+    MoeHybridFfnTelemetry *         telemetry = nullptr);
 
 // Hot-only batched prefill: all selected experts are in VRAM.
 // Skips cold graph build, CPU compute, and merge — pure GPU path.

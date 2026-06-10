@@ -1058,8 +1058,11 @@ static bool eval_moe_hybrid_ffn_batched_core(
     std::vector<float> &            out,
     std::string *                   err,
     ggml_gallocr_t *                p_hot_alloc,
-    ggml_gallocr_t *                p_cold_alloc) {
+    ggml_gallocr_t *                p_cold_alloc,
+    MoeHybridFfnTelemetry *         telemetry) {
 
+    const auto ffn_wall_t0 = HybridClock::now();
+    const auto partition_t0 = HybridClock::now();
     const int n_embd = cfg.n_embd;
     const int n_used = cfg.n_expert_used;
     const int n_ff_exp = cfg.n_ff_exp;
@@ -1158,6 +1161,8 @@ static bool eval_moe_hybrid_ffn_batched_core(
     for (int i = 0; i < total_slots; ++i) cold_sel[i] = i % std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
     std::vector<float>   cold_wts(total_slots, 0.0f);
     bool has_hot = false, has_cold = false;
+    int hot_selected = 0;
+    int cold_selected = 0;
 
     for (int i = 0; i < total_slots; ++i) {
         const int32_t gid = selected_ids[i];
@@ -1167,14 +1172,22 @@ static bool eval_moe_hybrid_ffn_batched_core(
             hot_sel[i] = hot_lid;
             hot_wts[i] = selected_weights[i];
             has_hot = true;
+            hot_selected++;
         } else {
             const int32_t cold_lid = storage.cold_local_by_global[(size_t)gid];
             if (cold_lid >= 0) {
                 cold_sel[i] = cold_lid;
                 cold_wts[i] = selected_weights[i];
                 has_cold = true;
+                cold_selected++;
             }
         }
+    }
+    const auto partition_t1 = HybridClock::now();
+    if (telemetry) {
+        telemetry->partition_us += elapsed_us(partition_t0, partition_t1);
+        telemetry->hot_selected += hot_selected;
+        telemetry->cold_selected += cold_selected;
     }
 
     ggml_backend_t cold_backend = storage.cold_backend ? storage.cold_backend : cpu_backend;
@@ -1185,6 +1198,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
     // ── Step 2: Build and run hot GPU graph (includes shared expert always) ──
     std::vector<float> hot_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
     bool hot_async_launched = false;
+    const auto hot_t0 = HybridClock::now();
 
     ggml_context * hot_ctx = nullptr;
     ggml_cgraph * hot_gf = nullptr;
@@ -1260,6 +1274,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
     // ── Step 3: Build and run cold graph on selected backend ──
     std::vector<float> cold_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
 
+    const auto cold_t0 = HybridClock::now();
     if (has_cold) {
         if (!storage.down_cold) {
             if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
@@ -1332,6 +1347,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
 
         ggml_backend_tensor_get(cold_routed, cold_partial.data(), 0,
             sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        if (telemetry) telemetry->cold_us += elapsed_us(cold_t0, HybridClock::now());
         if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
         ggml_free(cold_ctx);
     }
@@ -1342,13 +1358,20 @@ static bool eval_moe_hybrid_ffn_batched_core(
         ggml_backend_tensor_get(hot_output, hot_partial.data(), 0,
             sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
     }
+    if (telemetry) telemetry->hot_us += elapsed_us(hot_t0, HybridClock::now());
     if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
     if (hot_ctx) ggml_free(hot_ctx);
 
     // ── Step 5: Merge hot + cold ──
+    const auto combine_t0 = HybridClock::now();
     const size_t total_floats = (size_t)n_embd * (size_t)n_tokens;
     for (size_t i = 0; i < total_floats; ++i) {
         out[i] = hot_partial[i] + cold_partial[i];
+    }
+    if (telemetry) {
+        const auto end = HybridClock::now();
+        telemetry->combine_us += elapsed_us(combine_t0, end);
+        telemetry->ffn_wall_us += elapsed_us(ffn_wall_t0, end);
     }
 
     return true;
@@ -1553,7 +1576,9 @@ bool eval_moe_hybrid_ffn_batched(
     std::vector<float> &            out,
     std::string *                   err,
     ggml_gallocr_t *                p_hot_alloc,
-    ggml_gallocr_t *                p_cold_alloc) {
+    ggml_gallocr_t *                p_cold_alloc,
+    MoeHybridFfnTelemetry *         telemetry) {
+    if (telemetry) *telemetry = {};
     const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;
@@ -1572,13 +1597,24 @@ bool eval_moe_hybrid_ffn_batched(
         std::vector<float> sub_out;
         for (int t0 = 0; t0 < n_tokens; t0 += MMQ_SAFE_SUB_BATCH) {
             const int tc = std::min(MMQ_SAFE_SUB_BATCH, n_tokens - t0);
+            MoeHybridFfnTelemetry sub_tel;
             if (!eval_moe_hybrid_ffn_batched_core(
                     gpu_backend, cpu_backend, cfg, desc, storage,
                     cur_host + (size_t)t0 * (size_t)n_embd,
                     selected_ids + (size_t)t0 * (size_t)n_used,
                     selected_weights + (size_t)t0 * (size_t)n_used,
-                    tc, sub_out, err, p_hot_alloc, p_cold_alloc)) {
+                    tc, sub_out, err, p_hot_alloc, p_cold_alloc,
+                    telemetry ? &sub_tel : nullptr)) {
                 return false;
+            }
+            if (telemetry) {
+                telemetry->ffn_wall_us += sub_tel.ffn_wall_us;
+                telemetry->partition_us += sub_tel.partition_us;
+                telemetry->hot_us += sub_tel.hot_us;
+                telemetry->cold_us += sub_tel.cold_us;
+                telemetry->combine_us += sub_tel.combine_us;
+                telemetry->hot_selected += sub_tel.hot_selected;
+                telemetry->cold_selected += sub_tel.cold_selected;
             }
             std::memcpy(out.data() + (size_t)t0 * (size_t)n_embd,
                         sub_out.data(),
@@ -1589,7 +1625,7 @@ bool eval_moe_hybrid_ffn_batched(
     return eval_moe_hybrid_ffn_batched_core(
         gpu_backend, cpu_backend, cfg, desc, storage,
         cur_host, selected_ids, selected_weights, n_tokens, out, err,
-        p_hot_alloc, p_cold_alloc);
+        p_hot_alloc, p_cold_alloc, telemetry);
 }
 
 void ResidualCombineGraph::free() {
