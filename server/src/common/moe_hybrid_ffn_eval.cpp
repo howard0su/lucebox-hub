@@ -790,6 +790,10 @@ bool eval_moe_hybrid_ffn_single(
     const bool has_shared = (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp);
     const bool has_cold = !cold_ids.empty();
     const int n_cold = (int)cold_ids.size();
+    ggml_backend_t cold_backend = storage.cold_backend ? storage.cold_backend : cpu_backend;
+    const bool cold_on_gpu = has_cold &&
+                             storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+                             cold_backend == gpu_backend;
 
     // ── Hot + Shared path on GPU ──
     bool hot_async_launched = false;
@@ -812,9 +816,12 @@ bool eval_moe_hybrid_ffn_single(
             if (storage.hot_graph.weights && has_hot) {
                 ggml_backend_tensor_set(storage.hot_graph.weights, hot_weights.data(), 0, sizeof(float) * (size_t)n_hot);
             }
-            // Launch GPU async — kernel runs while we do cold on CPU
+            // Launch GPU async — kernel runs while the cold backend runs.
             ggml_backend_graph_compute_async(gpu_backend, storage.hot_graph.gf);
             hot_async_launched = true;
+            if (cold_on_gpu) {
+                ggml_backend_synchronize(gpu_backend);
+            }
         } else {
             // Fallback: sync compute (no overlap)
             if (!run_hot_and_shared_ffn_gpu(gpu_backend,
@@ -831,11 +838,11 @@ bool eval_moe_hybrid_ffn_single(
         }
     }
 
-    // ── Cold path on CPU (overlaps with GPU kernels in flight) ──
+    // ── Cold path on selected cold backend ──
     const auto cold_t0 = HybridClock::now();
     if (has_cold) {
         if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
-            build_cached_cold_graph(storage.cold_graph, cpu_backend,
+            build_cached_cold_graph(storage.cold_graph, cold_backend,
                                     storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                     desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                     cfg.n_embd, cfg.n_ff_exp, n_cold, cfg.swiglu_clamp);
@@ -844,7 +851,7 @@ bool eval_moe_hybrid_ffn_single(
             ggml_backend_tensor_set(storage.cold_graph.inp, cur_host, 0, sizeof(float) * (size_t)cfg.n_embd);
             ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids.data(), 0, sizeof(int32_t) * (size_t)n_cold);
             ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights.data(), 0, sizeof(float) * (size_t)n_cold);
-            auto st = ggml_backend_graph_compute(cpu_backend, storage.cold_graph.gf);
+            auto st = ggml_backend_graph_compute(cold_backend, storage.cold_graph.gf);
             if (st != GGML_STATUS_SUCCESS) {
                 if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
                 if (err) *err = "cached cold graph compute failed";
@@ -853,7 +860,7 @@ bool eval_moe_hybrid_ffn_single(
             cold.resize((size_t)cfg.n_embd);
             ggml_backend_tensor_get(storage.cold_graph.output, cold.data(), 0, sizeof(float) * (size_t)cfg.n_embd);
         } else {
-            if (!run_routed_subset(cpu_backend,
+            if (!run_routed_subset(cold_backend,
                                    storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                    cfg.n_embd, cfg.n_ff_exp, cfg.swiglu_clamp,
@@ -1165,6 +1172,11 @@ static bool eval_moe_hybrid_ffn_batched_core(
         }
     }
 
+    ggml_backend_t cold_backend = storage.cold_backend ? storage.cold_backend : cpu_backend;
+    const bool cold_on_gpu = has_cold &&
+                             storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+                             cold_backend == gpu_backend;
+
     // ── Step 2: Build and run hot GPU graph (includes shared expert always) ──
     std::vector<float> hot_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
     bool hot_async_launched = false;
@@ -1235,9 +1247,12 @@ static bool eval_moe_hybrid_ffn_batched_core(
         // Launch GPU async
         ggml_backend_graph_compute_async(gpu_backend, hot_gf);
         hot_async_launched = true;
+        if (cold_on_gpu) {
+            ggml_backend_synchronize(gpu_backend);
+        }
     }
 
-    // ── Step 3: Build and run cold CPU graph (overlaps with GPU) ──
+    // ── Step 3: Build and run cold graph on selected backend ──
     std::vector<float> cold_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
 
     if (has_cold) {
@@ -1273,10 +1288,10 @@ static bool eval_moe_hybrid_ffn_batched_core(
         ggml_gallocr_t cold_alloc;
         if (p_cold_alloc) {
             if (!*p_cold_alloc)
-                *p_cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+                *p_cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cold_backend));
             cold_alloc = *p_cold_alloc;
         } else {
-            cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+            cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cold_backend));
         }
         if (!ggml_gallocr_alloc_graph(cold_alloc, cold_gf)) {
             if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
@@ -1292,8 +1307,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
         ggml_backend_tensor_set(sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
         ggml_backend_tensor_set(wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
 
-        // Run CPU synchronously (overlaps with GPU async)
-        auto st = ggml_backend_graph_compute(cpu_backend, cold_gf);
+        auto st = ggml_backend_graph_compute(cold_backend, cold_gf);
         if (st != GGML_STATUS_SUCCESS) {
             if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
             if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
@@ -1531,9 +1545,15 @@ bool eval_moe_hybrid_ffn_batched(
     const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;
+    const int n_cold_stack = storage.gate_up_cold ? (int)storage.gate_up_cold->ne[2]
+                            : storage.gate_cold    ? (int)storage.gate_cold->ne[2]
+                            : 0;
+    const bool cold_on_gpu = storage.cold_backend_kind == MoeHybridColdBackend::Gpu;
     const int MMQ_SAFE_SUB_BATCH = mmq_safe_sub_batch();
     if (!mmq_full_batch_ok(cfg, n_tokens)
-        && n_hot_stack > 0 && n_tokens > MMQ_SAFE_SUB_BATCH) {
+        && ((n_hot_stack > 0 && n_hot_stack < cfg.n_expert) ||
+            (cold_on_gpu && n_cold_stack > 0 && n_cold_stack < cfg.n_expert))
+        && n_tokens > MMQ_SAFE_SUB_BATCH) {
         const int n_embd = cfg.n_embd;
         const int n_used = cfg.n_expert_used;
         out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
@@ -1801,9 +1821,13 @@ bool eval_moe_hybrid_ffn_gpu_resident(
         }
     }
 
-    // ── If cold needed, read ffn_post to CPU BEFORE launching hot async ──
+    ggml_backend_t cold_backend = storage.cold_backend ? storage.cold_backend : cpu_backend;
+    const bool cold_on_gpu = storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+                             cold_backend == gpu_backend;
+
+    // ── If CPU cold is needed, read ffn_post before launching hot async ──
     std::vector<float> post_host;
-    if (has_cold) {
+    if (has_cold && !cold_on_gpu) {
         post_host.resize((size_t)n_embd);
         ggml_backend_tensor_get(ffn_post_gpu, post_host.data(), 0, sizeof(float) * (size_t)n_embd);
     }
@@ -1812,32 +1836,41 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     if ((has_hot || has_shared) && storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
         ggml_backend_graph_compute_async(gpu_backend, storage.hot_graph.gf);
         hot_async_launched = true;
+        if (cold_on_gpu) {
+            ggml_backend_synchronize(gpu_backend);
+        }
     }
 
-    // ── Cold path on CPU (overlaps with hot GPU kernels) ──
+    // ── Cold path on selected cold backend ──
     std::vector<float> cold_result;
     if (has_cold) {
         if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
-            build_cached_cold_graph(storage.cold_graph, cpu_backend,
+            build_cached_cold_graph(storage.cold_graph, cold_backend,
                                     storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                     desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                     n_embd, cfg.n_ff_exp, n_cold, cfg.swiglu_clamp);
         }
         if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
-            ggml_backend_tensor_set(storage.cold_graph.inp, post_host.data(), 0,
-                                    sizeof(float) * (size_t)n_embd);
+            if (cold_on_gpu) {
+                ggml_backend_tensor_copy(ffn_post_gpu, storage.cold_graph.inp);
+            } else {
+                ggml_backend_tensor_set(storage.cold_graph.inp, post_host.data(), 0,
+                                        sizeof(float) * (size_t)n_embd);
+            }
             ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids.data(), 0,
                                     sizeof(int32_t) * (size_t)n_cold);
             ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights.data(), 0,
                                     sizeof(float) * (size_t)n_cold);
-            auto st = ggml_backend_graph_compute(cpu_backend, storage.cold_graph.gf);
+            auto st = ggml_backend_graph_compute(cold_backend, storage.cold_graph.gf);
             if (st != GGML_STATUS_SUCCESS) {
                 if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
                 return false;
             }
-            cold_result.resize((size_t)n_embd);
-            ggml_backend_tensor_get(storage.cold_graph.output, cold_result.data(), 0,
-                                    sizeof(float) * (size_t)n_embd);
+            if (!cold_on_gpu) {
+                cold_result.resize((size_t)n_embd);
+                ggml_backend_tensor_get(storage.cold_graph.output, cold_result.data(), 0,
+                                        sizeof(float) * (size_t)n_embd);
+            }
         } else {
             if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
             return false;
@@ -1855,10 +1888,14 @@ bool eval_moe_hybrid_ffn_gpu_resident(
                                 sizeof(float) * (size_t)n_embd);
     }
 
-    // ── Upload cold result (or zeros) to combine.cold_in ──
+    // ── Upload/copy cold result (or zeros) to combine.cold_in ──
     if (has_cold) {
-        ggml_backend_tensor_set(gpu_state.combine.cold_in, cold_result.data(), 0,
-                                sizeof(float) * (size_t)n_embd);
+        if (cold_on_gpu) {
+            ggml_backend_tensor_copy(storage.cold_graph.output, gpu_state.combine.cold_in);
+        } else {
+            ggml_backend_tensor_set(gpu_state.combine.cold_in, cold_result.data(), 0,
+                                    sizeof(float) * (size_t)n_embd);
+        }
     } else {
         std::vector<float> zeros((size_t)n_embd, 0.0f);
         ggml_backend_tensor_set(gpu_state.combine.cold_in, zeros.data(), 0,
