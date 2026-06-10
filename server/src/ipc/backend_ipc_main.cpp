@@ -1,6 +1,7 @@
 // Standalone backend IPC daemon entry point.
 
 #include "backend_ipc.h"
+#include "deepseek4_expert_ipc.h"
 #include "dflash_draft_ipc.h"
 #include "pflash_drafter_ipc.h"
 #include "qwen35_target_shard_ipc.h"
@@ -113,7 +114,10 @@ int main(int argc, char ** argv) {
             "--stream-fd=FD [--draft-gpu=N]\n"
             "   or: %s --backend-ipc-mode=qwen35-target-shard <target.gguf> "
             "--stream-fd=FD --target-gpu=N --layer-begin=N --layer-end=N "
-            "--max-ctx=N\n",
+            "--max-ctx=N\n"
+            "   or: %s --backend-ipc-mode=deepseek4-expert <model.gguf> "
+            "--stream-fd=FD [--payload-fd=FD] [--draft-gpu=N]\n",
+            argv[0],
             argv[0],
             argv[0],
             argv[0]);
@@ -257,6 +261,9 @@ int main(int argc, char ** argv) {
                 max_verify_tokens, kq_stride_pad, fa_window, stream_fd,
                 payload_fd, shared_payload_fd, shared_payload_bytes,
                 enable_dflash);
+        case BackendIpcMode::DeepSeek4Expert:
+            return run_deepseek4_expert_ipc_daemon(payload_path, draft_gpu,
+                                                   stream_fd, payload_fd);
     }
     std::fprintf(stderr, "[backend-ipc-daemon] unsupported mode\n");
     return 2;
