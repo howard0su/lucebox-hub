@@ -47,7 +47,7 @@ bool parse_backend_ipc_mode(const std::string & value, BackendIpcMode & out) {
         out = BackendIpcMode::Qwen35TargetShard;
         return true;
     }
-    if (value == "moe-expert" || value == "deepseek4-expert") {
+    if (value == "moe-expert") {
         out = BackendIpcMode::MoeExpert;
         return true;
     }
