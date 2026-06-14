@@ -27,7 +27,7 @@ enum class BackendIpcMode {
     Qwen35TargetShard,
     Gemma4TargetShard,
     LagunaTargetShard,
-    DeepSeek4Expert,
+    MoeExpert,
 };
 
 const char * backend_ipc_mode_name(BackendIpcMode mode);
