@@ -3,6 +3,7 @@
 #include "backend_ipc.h"
 #include "expert_ipc.h"
 #include "dflash_draft_ipc.h"
+#include "deepseek4/deepseek4_layer_split_adapter.h"
 #include "gemma4/gemma4_layer_split_adapter.h"
 #include "laguna/laguna_layer_split_adapter.h"
 #include "pflash_drafter_ipc.h"
@@ -352,6 +353,13 @@ int main(int argc, char ** argv) {
                 payload_path, target_gpus, layer_begins, layer_ends, max_ctx,
                 stream_fd, payload_fd, shared_payload_fd, shared_payload_bytes,
                 kvflash_pool_tokens);
+        case BackendIpcMode::DeepSeek4TargetShard:
+            if (target_gpus.empty()) target_gpus.push_back(target_gpu);
+            if (layer_begins.empty()) layer_begins.push_back(layer_begin);
+            if (layer_ends.empty()) layer_ends.push_back(layer_end);
+            return run_deepseek4_target_shard_ipc_daemon(
+                payload_path, target_gpus, layer_begins, layer_ends, max_ctx,
+                stream_fd, payload_fd);
         case BackendIpcMode::MoeExpert:
             return run_expert_ipc_daemon(payload_path, draft_gpu,
                                          stream_fd, payload_fd);
