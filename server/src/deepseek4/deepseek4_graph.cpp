@@ -2887,8 +2887,14 @@ bool deepseek4_step_layer_range(
                        embed + (size_t)t * n_embd, (size_t)n_embd * sizeof(float));
             }
         }
-    } else {
-        // Later shard: embed contains full HC state from previous shard
+    } else if (embed != nullptr) {
+        // Later shard via the IPC/mixed path: embed carries the full HC state
+        // handed off from the previous shard. In the local multi-GPU path embed
+        // is null and hc_state already holds the previous shard's state (it is
+        // shared by reference across local shards), so we must NOT memcpy here --
+        // embed would be the token embedding (only n_embd*n_tokens floats), and
+        // copying hc_dim*n_tokens = n_hc*n_embd*n_tokens = 4x that would over-read
+        // the buffer, feeding garbage/NaN HC state into this shard.
         memcpy(hc_state.data(), embed, sizeof(float) * (size_t)hc_dim * (size_t)n_tokens);
     }
 
