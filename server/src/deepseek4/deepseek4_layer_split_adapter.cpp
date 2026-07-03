@@ -462,7 +462,11 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
 
         if (!deepseek4_step_layer_range(
                 shard.backend, shard.weights, shard.cache,
-                hc_state_, embed.data(), n_tokens, base_pos,
+                // Only the first local shard consumes the token embedding. Later
+                // shards continue from hc_state_ (shared by reference, already
+                // updated by the previous shard); passing embed here would make
+                // step_layer_range 4x-over-read it as if it were the HC state.
+                hc_state_, (si == 0 ? embed.data() : nullptr), n_tokens, base_pos,
                 shard.layer_begin, shard.layer_end,
                 shard_logits, tokens.data(), timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
