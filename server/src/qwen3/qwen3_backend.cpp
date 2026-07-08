@@ -18,9 +18,26 @@
 #include <chrono>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
 #include <sstream>
 
 namespace dflash::common {
+
+static ggml_tensor * coda_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
+                                      ggml_tensor * w_gate, ggml_tensor * w_up,
+                                      ggml_tensor * w_down) {
+    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    if (coda) {
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_gate, cur);
+        ggml_tensor * up   = ggml_mul_mat(ctx, w_up,   cur);
+        ggml_tensor * gu   = ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
+        return ggml_mul_mat(ctx, w_down, gu);
+    }
+
+    ggml_tensor * gate = ggml_silu(ctx, ggml_mul_mat(ctx, w_gate, cur));
+    ggml_tensor * up   = ggml_mul_mat(ctx, w_up, cur);
+    return ggml_mul_mat(ctx, w_down, ggml_mul(ctx, gate, up));
+}
 
 // ── Cache management ───────────────────────────────────────────────────
 
@@ -290,10 +307,7 @@ bool Qwen3Backend::do_step(const float * embed, int n_tokens, int kv_start,
         ggml_tensor * ffn_in = ggml_rms_norm(ctx, cur, eps);
         ffn_in = ggml_mul(ctx, ffn_in, L.ffn_norm);
 
-        ggml_tensor * gate = ggml_mul_mat(ctx, L.ffn_gate, ffn_in);
-        gate = ggml_silu(ctx, gate);
-        ggml_tensor * up = ggml_mul_mat(ctx, L.ffn_up, ffn_in);
-        ggml_tensor * ffn_out = ggml_mul_mat(ctx, L.ffn_down, ggml_mul(ctx, gate, up));
+        ggml_tensor * ffn_out = coda_swiglu_ffn(ctx, ffn_in, L.ffn_gate, L.ffn_up, L.ffn_down);
 
         cur = ggml_add(ctx, cur, ffn_out);
     }

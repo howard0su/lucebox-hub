@@ -47,6 +47,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -57,6 +58,22 @@ namespace dflash::common {
 namespace {
 
 constexpr int FA_WINDOW  = 512;
+
+static ggml_tensor * coda_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
+                                      ggml_tensor * w_gate, ggml_tensor * w_up,
+                                      ggml_tensor * w_down) {
+    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    if (coda) {
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_gate, cur);
+        ggml_tensor * up   = ggml_mul_mat(ctx, w_up,   cur);
+        ggml_tensor * gu   = ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
+        return ggml_mul_mat(ctx, w_down, gu);
+    }
+
+    ggml_tensor * gate = ggml_silu(ctx, ggml_mul_mat(ctx, w_gate, cur));
+    ggml_tensor * up   = ggml_mul_mat(ctx, w_up, cur);
+    return ggml_mul_mat(ctx, w_down, ggml_mul(ctx, gate, up));
+}
 
 int chunk_s_ff() {
     if (const char * e = std::getenv("DFLASH_FP_CHUNK_S")) {
@@ -159,10 +176,7 @@ bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
 
     // gf_ffn: one combined graph for all FFN ops after the RMSNorm.
     // h_after and hf are both inputs so no re-traversal into proj_add or norm.
-    ggml_tensor * gate    = ggml_silu(out.ctx, ggml_mul_mat(out.ctx, L.ffn_gate, out.hf));
-    ggml_tensor * up      = ggml_mul_mat(out.ctx, L.ffn_up, out.hf);
-    ggml_tensor * gu      = ggml_mul(out.ctx, gate, up);
-    ggml_tensor * ffn_out = ggml_mul_mat(out.ctx, L.ffn_down, gu);
+    ggml_tensor * ffn_out = coda_swiglu_ffn(out.ctx, out.hf, L.ffn_gate, L.ffn_up, L.ffn_down);
     out.h_next = ggml_add(out.ctx, out.h_after, ffn_out);
     ggml_set_output(out.h_next);
     out.gf_ffn = ggml_new_graph_custom(out.ctx, 1024, false);
@@ -719,11 +733,7 @@ bool forward_qwen3_drafter_model(
             ggml_tensor * h_after  = ggml_add(gB, h_in, attn_proj);
             ggml_tensor * hf = ggml_rms_norm(gB, h_after, eps);
             hf = ggml_mul(gB, hf, L.ffn_norm);
-            ggml_tensor * gate_t = ggml_mul_mat(gB, L.ffn_gate, hf);
-            gate_t = ggml_silu(gB, gate_t);
-            ggml_tensor * up_t   = ggml_mul_mat(gB, L.ffn_up, hf);
-            ggml_tensor * gu     = ggml_mul(gB, gate_t, up_t);
-            ggml_tensor * ffn_out = ggml_mul_mat(gB, L.ffn_down, gu);
+            ggml_tensor * ffn_out = coda_swiglu_ffn(gB, hf, L.ffn_gate, L.ffn_up, L.ffn_down);
             ggml_tensor * h_next = ggml_add(gB, h_after, ffn_out);
             ggml_set_output(h_next);
             ggml_build_forward_expand(gfB, h_next);

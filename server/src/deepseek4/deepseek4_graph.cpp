@@ -431,7 +431,15 @@ static ggml_tensor * build_clamped_swiglu(ggml_context * ctx,
     // DS4 clamps only the upper side of gate, but both sides of up.
     gate = ggml_clamp(ctx, gate, -INFINITY, clamp);
     up   = ggml_clamp(ctx, up,   -clamp, clamp);
-    // silu(gate) * up
+    // This is not ggml_swiglu_oai: DS4 uses silu(gate) * up after asymmetric
+    // clamps, while SWIGLU_OAI uses silu_alpha(x) * (1 + g). Keep the clamps
+    // explicit and fuse only the exact silu*mul activation when DFLASH_CODA is
+    // enabled. The clamp nodes prevent a GEMM-epilogue fusion, but this still
+    // collapses the activation from {SILU, MUL} into a single GLU op.
+    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    if (coda) {
+        return ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
+    }
     gate = ggml_silu(ctx, gate);
     return ggml_mul(ctx, gate, up);
 }

@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -44,13 +45,21 @@ static ggml_tensor * gemma4_rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
     return ggml_mul(ctx, n, weight);
 }
 
+static ggml_tensor * coda_geglu(ggml_context * ctx, ggml_tensor * gate, ggml_tensor * up) {
+    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    if (coda) {
+        return ggml_glu_split(ctx, gate, up, GGML_GLU_OP_GEGLU);
+    }
+    return ggml_mul(ctx, ggml_gelu(ctx, gate), up);
+}
+
 // Dense GELU-gated FFN (layer 0 / lead dense layers).
 // Gemma4 uses GELU not SiLU: cur = down( gelu(gate(x)) * up(x) )
 static ggml_tensor * build_gemma4_dense_ffn(ggml_context * ctx, ggml_tensor * cur,
                                               const Gemma4Layer & L) {
     ggml_tensor * gate = ggml_mul_mat(ctx, L.ffn_gate, cur);
     ggml_tensor * up   = ggml_mul_mat(ctx, L.ffn_up,   cur);
-    ggml_tensor * gu   = ggml_mul(ctx, ggml_gelu(ctx, gate), up);
+    ggml_tensor * gu   = coda_geglu(ctx, gate, up);
     return ggml_mul_mat(ctx, L.ffn_down, gu);
 }
 
@@ -68,7 +77,7 @@ static ggml_tensor * build_gemma4_moe_block(ggml_context * ctx, ggml_tensor * at
     // ---- Shared expert (GELU-gated MLP) ----
     ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate, cur_normed);
     ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up,   cur_normed);
-    ggml_tensor * sh_gu   = ggml_mul(ctx, ggml_gelu(ctx, sh_gate), sh_up);
+    ggml_tensor * sh_gu   = coda_geglu(ctx, sh_gate, sh_up);
     ggml_tensor * shared  = ggml_mul_mat(ctx, L.ffn_down, sh_gu);
 
     if (L.ffn_post_norm_1) {
@@ -120,7 +129,7 @@ static ggml_tensor * build_gemma4_moe_block(ggml_context * ctx, ggml_tensor * at
         (size_t)n_ff_exp * ggml_element_size(gate_up_e));
     gate_e = ggml_cont(ctx, gate_e);
     up_e = ggml_cont(ctx, up_e);
-    ggml_tensor * gu = ggml_mul(ctx, ggml_gelu(ctx, gate_e), up_e);
+    ggml_tensor * gu = coda_geglu(ctx, gate_e, up_e);
     ggml_tensor * experts = ggml_mul_mat_id(ctx, L.ffn_down_exps, gu, selected);
 
     // Weighted sum of expert outputs
@@ -351,9 +360,8 @@ static ggml_tensor * build_gemma4_layer(
         ggml_tensor * pe_in = cur;
         // Gate: cur -> [n_embd_per_layer, n_tokens]
         ggml_tensor * gate = ggml_mul_mat(ctx, L.per_layer_inp_gate, cur);
-        gate = ggml_gelu(ctx, gate);
-        // Element-wise mul with per-layer input
-        gate = ggml_mul(ctx, gate, per_layer_input);
+        // Element-wise GEGLU-style mul with per-layer input.
+        gate = coda_geglu(ctx, gate, per_layer_input);
         // Project back: [n_embd_per_layer, n_tokens] -> [n_embd, n_tokens]
         ggml_tensor * proj = ggml_mul_mat(ctx, L.per_layer_proj, gate);
         if (L.per_layer_post_norm) {
@@ -1723,8 +1731,7 @@ bool gemma4_prefill_bsa(
                     ((size_t)il * S + cs) * D_pl * sizeof(float));
 
                 ggml_tensor * gate = ggml_mul_mat(gB, L.per_layer_inp_gate, cur);
-                gate = ggml_gelu(gB, gate);
-                gate = ggml_mul(gB, gate, pl_slice);
+                gate = coda_geglu(gB, gate, pl_slice);
                 ggml_tensor * proj = ggml_mul_mat(gB, L.per_layer_proj, gate);
                 if (L.per_layer_post_norm) {
                     proj = gemma4_rms_norm_mul(gB, proj, L.per_layer_post_norm, eps);
