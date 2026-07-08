@@ -192,23 +192,27 @@ python test_multi_turn_prefix_cache.py --url http://localhost:8000
 CODA ([arXiv:2605.19269](https://arxiv.org/abs/2605.19269) §3) rewrites transformer
 blocks as GEMM-epilogue programs, fusing the memory-bound residual / norm / activation
 work into the surrounding GEMMs so the epilogue is hidden behind the matmul. This repo
-implements the ggml-native subset for the **qwen35** target graph, gated behind the
-`DFLASH_CODA` environment variable (unset = default, unchanged behavior).
+implements the ggml-native subset for the qwen-family, Laguna, Gemma4, and DeepSeek4
+graphs, gated behind the `DFLASH_CODA` environment variable (unset = default, unchanged
+behavior).
 
 What engages when `DFLASH_CODA` is set:
 
 | Pattern | Path | How |
 | --- | --- | --- |
-| **SwiGLU** (§3.2.2): `silu(gate) * up` | prefill + decode | `build_swiglu_ffn` emits `ggml_glu_split(..., SWIGLU)`, triggering ggml's fused `{MUL_MAT, MUL_MAT, GLU}` kernel. Only when the gate/up weight scales are 1.0 (non-NVFP4). |
+| **SwiGLU** (§3.2.2): `silu(gate) * up` | prefill + decode | qwen35 and qwen3 emit `ggml_glu_split(..., SWIGLU)`, triggering ggml's fused `{MUL_MAT, MUL_MAT, GLU}` kernel. qwen35 only does this when gate/up weight scales are 1.0 (non-NVFP4). Laguna and qwen35moe already used `ggml_swiglu_split`. |
+| **GEGLU**: `gelu(gate) * up` | prefill + decode | gemma4 emits `ggml_glu_split(..., GEGLU)` for dense/shared FFN and per-layer injection. Dense/shared FFN uses `{MUL_MAT, MUL_MAT, GLU}`; per-layer injection and routed combined-gate-up paths get activation-level GLU fusion. |
+| **Clamped SwiGLU**: `silu(clamp(gate)) * clamp(up)` | prefill + decode | deepseek4 keeps the asymmetric clamps explicit and uses `ggml_glu_split(..., SWIGLU)` after them. This is exact; it is **not** `SWIGLU_OAI`. Clamp nodes prevent GEMM-epilogue fusion, but collapse the activation from `{SILU, MUL}` into one GLU op. |
 | **GEMM-Residual** (§3.2.1): `mul_mat(W,x) + residual` | decode (M=1) | Already fused upstream via the mmvq (`{MUL_MAT, ADD}`) mat-vec epilogue. |
-| **GEMM-Residual** (§3.2.1) | prefill / verify (M>1) | Forked `mmq` kernel adds a dst-shaped residual in its write-back epilogue. Detected automatically from any `{MUL_MAT, ADD}` with a contiguous, dst-shaped residual (non-MoE); **no graph rewrite needed** — the qwen35 FFN already emits down-proj `mul_mat` directly followed by the residual `add`. |
+| **GEMM-Residual** (§3.2.1) | prefill / verify (M>1) | Forked `mmq` kernel adds a dst-shaped residual in its write-back epilogue. Detected automatically from any `{MUL_MAT, ADD}` with a contiguous, dst-shaped residual (non-MoE); **no graph rewrite needed** for pre-norm qwen/laguna/deepseek dense projections. Gemma4's sandwich/post-norm breaks this adjacency. |
 
 Set `DFLASH_CODA_DEBUG=1` to trace when the forked mmq residual epilogue engages.
 Set `GGML_CUDA_DISABLE_FUSION=1` to disable all ggml-cuda fusion (baseline).
 
 Core changes: `deps/llama.cpp/ggml/src/ggml-cuda/{mmq.cuh,mmq.cu,ggml-cuda.cu}`
-(residual threaded through `mmq_args` → `mul_mat_q` → `mmq_write_back_*`) and
-`src/qwen35/qwen35_target_graph.cpp` (`build_swiglu_ffn`).
+(residual threaded through `mmq_args` → `mul_mat_q` → `mmq_write_back_*`) plus GLU
+rewrites in `src/qwen35/qwen35_target_graph.cpp`, `src/qwen3/`, `src/gemma4/`, and
+`src/deepseek4/deepseek4_graph.cpp`.
 
 ### Local model-free tests (no weights, any CUDA arch incl. sm_75)
 
@@ -218,7 +222,7 @@ synthetic tensors, so they run without the 27B model:
 ```bash
 cd server/build
 
-# SwiGLU fusion: fused CODA graph vs unfused baseline (Q4_K bit-exact)
+# GLU-family fusion: SWIGLU, GEGLU, clamped SWIGLU correctness + microbenchmarks
 ./test_coda_swiglu
 
 # GEMM-Residual mmq epilogue: GPU fused-vs-unfused parity (rel ~1e-7) + GPU-vs-CPU

@@ -139,22 +139,37 @@ Starting point: Chain DFlash at 112.8 tok/s mean on HumanEval, AL 7.67.
 ## CODA fused kernels (`DFLASH_CODA`) — local model-free validation
 
 CODA ([arXiv:2605.19269](https://arxiv.org/abs/2605.19269) §3) block-as-GEMM-epilogue
-fusions for the qwen35 target graph, gated behind `DFLASH_CODA`. See
-`DEVELOPER.md` → "CODA fused kernels". The following were validated locally on the
-RTX 2080 Ti (sm_75) with synthetic tensors (no 27B model), Q4_K, K=512 N=1024:
+fusions for qwen-family / Laguna / Gemma4 / DeepSeek4 graphs, gated behind
+`DFLASH_CODA`. See `DEVELOPER.md` → "CODA fused kernels". The following were
+validated locally on the RTX 2080 Ti (sm_75) with synthetic tensors (no full model),
+Q4_K:
 
 **Correctness** (`test_coda_residual`, `test_coda_swiglu`):
 
 | Check | Result |
 |-------|--------|
-| SwiGLU fused vs unfused graph (Q4_K) | bit-exact (M=1/8/32) |
+| SWIGLU fused vs unfused graph (qwen3/qwen35 shape, Q4_K) | bit-exact (M=1/8/32) |
+| GEGLU fused vs unfused graph (gemma4 shape, Q4_K) | bit-exact (M=1/8/32) |
+| clamped SWIGLU fused vs unfused graph (deepseek4 shape, Q4_K) | bit-exact (M=1/8/32) |
 | mmq residual epilogue: GPU fused vs unfused GEMM+add | rel ~1e-7 (M=1..512), essentially exact |
 | mmq residual epilogue: GPU vs CPU backend | within Q4_K quant tol (~7e-3) |
 | Engagement (`DFLASH_CODA_DEBUG`) | fused mmq residual fires for M≥8; M=1 uses mmvq |
 
-**Microbenchmark** (full-graph wall-clock, RTX 2080 Ti, 200 iters, noisy at these small
-sizes — the residual add is cheap vs Q4_K weight traffic and host launch overhead
-dominates; reported for reference only, not a headline speedup):
+**GLU microbenchmark** (`test_coda_swiglu`, full-graph wall-clock, RTX 2080 Ti,
+Q4_K K=512 N=256, 200 iters):
+
+| op | M | unfused ms | fused ms | speedup |
+|----|--:|:--:|:--:|:--:|
+| SWIGLU | 1  | 0.181 | 0.082 | 2.21× |
+| SWIGLU | 32 | 0.230 | 0.173 | 1.33× |
+| GEGLU | 1  | 0.208 | 0.064 | 3.24× |
+| GEGLU | 32 | 0.214 | 0.129 | 1.66× |
+| clamped SWIGLU | 1  | 0.188 | 0.124 | 1.51× |
+| clamped SWIGLU | 32 | 0.226 | 0.152 | 1.49× |
+
+**Residual microbenchmark** (full-graph wall-clock, RTX 2080 Ti, 200 iters, noisy at
+these small sizes — the residual add is cheap vs Q4_K weight traffic and host launch
+overhead dominates; reported for reference only, not a headline speedup):
 
 | M | unfused (mmq+add) ms | fused (mmq epilogue) ms |
 |--:|:--:|:--:|
