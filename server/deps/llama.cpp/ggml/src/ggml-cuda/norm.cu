@@ -209,6 +209,32 @@ static __global__ void rms_norm_from_partial_ms_f32(const float * x,
 }
 
 template <int block_size>
+static __global__ void coda_partial_ms_f32(const float * x,
+                                           float * partial_ms,
+                                           const int ncols,
+                                           const int n_partial_blocks,
+                                           const int partial_block,
+                                           const int64_t stride_row) {
+    const int token = blockIdx.x;
+    const int block = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const float * row = x + token*stride_row + block*partial_block;
+    float sum = 0.0f;
+    for (int col = tid; col < partial_block; col += block_size) {
+        const float v = row[col];
+        sum += v*v;
+    }
+
+    extern __shared__ float s_sum[];
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, s_sum);
+
+    if (tid == 0) {
+        partial_ms[token*n_partial_blocks + block] = sum / (float) partial_block;
+    }
+}
+
+template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
@@ -402,6 +428,22 @@ static void rms_norm_from_partial_ms_f32_cuda(
                 mul, mul_stride_row, mul_stride_channel, mul_stride_sample,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
         }
+    }
+}
+
+static void coda_partial_ms_f32_cuda(const float * x, float * partial_ms,
+                                     const int ncols, const int nrows, const int n_partial_blocks,
+                                     const int partial_block, const int64_t stride_row,
+                                     cudaStream_t stream) {
+    const dim3 blocks_num(nrows, n_partial_blocks, 1);
+    if (partial_block < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        coda_partial_ms_f32<256><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+            x, partial_ms, ncols, n_partial_blocks, partial_block, stride_row);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        coda_partial_ms_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+            x, partial_ms, ncols, n_partial_blocks, partial_block, stride_row);
     }
 }
 
@@ -673,6 +715,32 @@ void ggml_cuda_op_rms_norm_from_partial_ms_fused(ggml_backend_cuda_context & ctx
                                       (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1],
                                       (uint32_t) mul_src->ne[2], (uint32_t) mul_src->ne[3],
                                       eps, stream);
+}
+
+void ggml_cuda_op_coda_partial_ms(ggml_backend_cuda_context & ctx,
+                                  const ggml_tensor * src,
+                                  ggml_tensor * partial_ms,
+                                  int partial_block) {
+    const float * src_d = (const float *) src->data;
+    float * partial_ms_d = (float *) partial_ms->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(partial_ms->type == GGML_TYPE_F32);
+    GGML_ASSERT(partial_block > 0 && src->ne[0] % partial_block == 0);
+    GGML_ASSERT(partial_ms->ne[0] == src->ne[0] / partial_block);
+    GGML_ASSERT(partial_ms->ne[1] == src->ne[1]);
+    GGML_ASSERT(src->ne[2] == 1 && src->ne[3] == 1);
+    GGML_ASSERT(partial_ms->ne[2] == 1 && partial_ms->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(partial_ms));
+
+    const size_t ts0 = ggml_type_size(src->type);
+    GGML_ASSERT(src->nb[0] == ts0);
+    const int64_t stride_row = src->nb[1] / ts0;
+
+    coda_partial_ms_f32_cuda(src_d, partial_ms_d,
+                             (int) src->ne[0], (int) src->ne[1], (int) partial_ms->ne[0],
+                             partial_block, stride_row, stream);
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {

@@ -249,6 +249,15 @@ Synthetic timing is mixed: M=32 ratio 0.98x vs normal fused RMSNorm+MUL, M=128 1
 remaining RMS bottleneck is not the separate weight multiply alone; optimize partial-stat
 writing/scheduling before treating RMS CODA as an e2e performance win.
 
+**Experimental post-reduction stats path** (`DFLASH_CODA_RMS_POST_STATS=1`): instead of
+writing partial stats with atomics in the mmq epilogue, mmq writes only `h` and a small
+CUDA reduction fills `coda_partial_ms:<tag>` immediately before the matching RMS consumer.
+Correctness passes and verify compute nearly returns to baseline (82.45 ms baseline vs
+82.75 ms post-stats RMS), but e2e still loses: 76.95 tok/s baseline vs 72.22 tok/s,
+with draft steps increasing from 14 to 15 and output differing. This suggests standalone
+RMS materialization tweaks are exhausted; the next CODA opportunity is deferred row-scale
+into the following GEMM.
+
 ## Reproducibility
 
 - Deterministic: greedy decode + greedy verify. Same prompts + same weights + same binary = same numbers ±1 tok/s.

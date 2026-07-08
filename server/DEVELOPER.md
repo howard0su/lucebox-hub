@@ -211,6 +211,10 @@ What engages:
 | **RMS partial-stats consumer** (§3.2.1) | `DFLASH_CODA_RMS` or umbrella | prefill / verify (qwen/qwen35 eligible residual→norm sites) | A CUDA RMSNorm helper consumes tagged `coda_partial_ms:<tag>` side outputs by reducing block means instead of recomputing `sum(h^2)` over all features. qwen35 and qwen3 graph builders emit tagged side-output/consumer pairs only when the residual input is a direct `{MUL_MAT, ADD}` with M>8 and 256-feature block alignment. |
 
 Set `DFLASH_CODA_DEBUG=1` to trace when the forked mmq residual epilogue engages.
+Set `DFLASH_CODA_RMS_POST_STATS=1` with `DFLASH_CODA_RMS=1` to test the experimental
+post-reduction stats path: mmq writes only `h`, then a separate CUDA reduction fills
+`coda_partial_ms:<tag>` immediately before the RMS consumer. This is correctness-covered
+but not an e2e win in current measurements.
 Set `GGML_CUDA_DISABLE_FUSION=1` to disable all ggml-cuda fusion (baseline).
 
 Core changes: `deps/llama.cpp/ggml/src/ggml-cuda/{mmq.cuh,mmq.cu,ggml-cuda.cu}`

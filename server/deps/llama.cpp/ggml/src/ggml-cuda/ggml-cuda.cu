@@ -3726,6 +3726,15 @@ static ggml_tensor * ggml_cuda_coda_partial_ms_for_tag(const ggml_cgraph * cgrap
     return ggml_graph_get_tensor(cgraph, "coda_partial_ms");
 }
 
+static bool ggml_cuda_coda_has_rms_consumer_for_tag(const ggml_cgraph * cgraph, const char * tag) {
+    if (tag && tag[0] != '\0') {
+        char name[GGML_MAX_NAME];
+        snprintf(name, sizeof(name), "coda_rms_from_partial:%s", tag);
+        return ggml_graph_get_tensor(cgraph, name) != nullptr;
+    }
+    return ggml_graph_get_tensor(cgraph, "coda_rms_from_partial") != nullptr;
+}
+
 static bool ggml_cuda_coda_feature_enabled(const char * feature_env) {
     return getenv("DFLASH_CODA") != nullptr || getenv(feature_env) != nullptr;
 }
@@ -4249,9 +4258,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                             (int) bias_node->ne[1], (int) bias_node->ne[0],
                                             partial_ms ? "yes" : "no", partial_block);
                                 }
+                                static const bool coda_rms_post_stats = (getenv("DFLASH_CODA_RMS_POST_STATS") != nullptr);
+                                const bool post_stats_for_consumer =
+                                    coda_rms_post_stats && partial_ms &&
+                                    ggml_cuda_coda_has_rms_consumer_for_tag(cgraph, bias_node->name);
+                                float * partial_ms_d = partial_ms && !post_stats_for_consumer ? (float *) partial_ms->data : nullptr;
                                 ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, /*ids=*/nullptr, bias_node,
                                                     (const float *) bias_tensor->data,
-                                                    partial_ms ? (float *) partial_ms->data : nullptr,
+                                                    partial_ms_d,
                                                     partial_block);
                                 fused_mul_mat_vec = true;
                                 fused_node_count = 2;
@@ -4288,10 +4302,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                         if (partial_block > 0) {
                             static const bool coda_debug = (getenv("DFLASH_CODA_DEBUG") != nullptr);
+                            static const bool coda_rms_post_stats = (getenv("DFLASH_CODA_RMS_POST_STATS") != nullptr);
                             if (coda_debug) {
                                 fprintf(stderr, "[CODA] RMSNorm from partial stats: M=%d N=%d stats=%d block=%d\n",
                                         (int) node->src[0]->ne[1], (int) node->src[0]->ne[0],
                                         (int) partial_ms->ne[0], partial_block);
+                            }
+                            if (coda_rms_post_stats) {
+                                if (coda_debug) {
+                                    fprintf(stderr, "[CODA] partial stats post-reduction before RMSNorm\n");
+                                }
+                                ggml_cuda_op_coda_partial_ms(*cuda_ctx, node->src[0], partial_ms, partial_block);
                             }
                             if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL}, {})) {
                                 if (coda_debug) {
