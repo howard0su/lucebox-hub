@@ -144,7 +144,7 @@ fusions for qwen-family / Laguna / Gemma4 / DeepSeek4 graphs, gated behind
 validated locally on the RTX 2080 Ti (sm_75) with synthetic tensors (no full model),
 Q4_K:
 
-**Correctness** (`test_coda_residual`, `test_coda_swiglu`):
+**Correctness** (`test_coda_residual`, `test_coda_swiglu`, `test_coda_rms_side_output`):
 
 | Check | Result |
 |-------|--------|
@@ -154,6 +154,8 @@ Q4_K:
 | clamped SWIGLU fused vs unfused graph (deepseek4 shape, Q4_K) | bit-exact (M=1/8/32) |
 | mmq residual epilogue: GPU fused vs unfused GEMM+add | rel ~1e-7 (M=1..512), essentially exact |
 | mmq residual epilogue: GPU vs CPU backend | within Q4_K quant tol (~7e-3) |
+| mmq residual + RMS partial-stats side-output vs composed graph | h rel ~2e-7, stats rel ~1e-6 (Q4_K, M=32/128) |
+| ggml two-output graph contract for RMS partial stats | PASS for Q4_K M=1/32/128 and F16 M=32 |
 | Engagement (`DFLASH_CODA_DEBUG`) | fused mmq residual fires for M≥8; M=1 uses mmvq |
 
 **GLU microbenchmark** (`test_coda_swiglu`, full-graph wall-clock, RTX 2080 Ti,
@@ -184,6 +186,20 @@ overhead dominates; reported for reference only, not a headline speedup):
 The structural win is removing a separate elementwise ADD pass (a full N×M read+write)
 per residual; its impact at model scale / chained blocks and end-to-end prefill/decode
 tok/s vs the paper is pending measurement on the remote GPU with the 27B model.
+
+**RMS side-output prototype benchmark** (`test_coda_rms_side_output`, Q4_K K=512 N=1024,
+block=256, 200 iters):
+
+| M | residual-only ms | composed side-output ms | fused side-output ms | fused vs composed |
+|--:|:--:|:--:|:--:|:--:|
+| 32  | 0.111 | 0.567 | 0.138 | 4.11× faster |
+| 128 | 0.146 | 0.508 | 0.226 | 2.24× faster |
+| 512 | 0.192 | 0.404 | 0.240 | 1.69× faster |
+
+The fused side-output path still costs 1.2-1.6× over residual-only on this small
+synthetic benchmark because it performs atomic partial-stat accumulation, but it avoids
+the composed graph's `cont+sqr+sum_rows+concat` materialization and validates the
+remaining CODA RMSNorm fusion surface.
 
 ## Reproducibility
 

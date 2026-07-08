@@ -4212,12 +4212,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             // GPU. Correctness is identical either way (see test_coda_residual).
                             if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0)) {
                                 static const bool coda_debug = (getenv("DFLASH_CODA_DEBUG") != nullptr);
+                                ggml_tensor * partial_ms = ggml_graph_get_tensor(cgraph, "coda_partial_ms");
+                                int partial_block = 0;
+                                if (partial_ms) {
+                                    const bool ok_partial =
+                                        partial_ms->type == GGML_TYPE_F32 &&
+                                        partial_ms->ne[1] == bias_node->ne[1] &&
+                                        partial_ms->ne[2] == 1 && partial_ms->ne[3] == 1 &&
+                                        bias_node->ne[0] % partial_ms->ne[0] == 0 &&
+                                        ggml_is_contiguous(partial_ms);
+                                    if (ok_partial) {
+                                        partial_block = (int) (bias_node->ne[0] / partial_ms->ne[0]);
+                                    } else {
+                                        partial_ms = nullptr;
+                                    }
+                                }
                                 if (coda_debug) {
-                                    fprintf(stderr, "[CODA] fused mmq residual epilogue: M=%d N=%d\n",
-                                            (int) bias_node->ne[1], (int) bias_node->ne[0]);
+                                    fprintf(stderr, "[CODA] fused mmq residual epilogue: M=%d N=%d partial_ms=%s block=%d\n",
+                                            (int) bias_node->ne[1], (int) bias_node->ne[0],
+                                            partial_ms ? "yes" : "no", partial_block);
                                 }
                                 ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, /*ids=*/nullptr, bias_node,
-                                                    (const float *) bias_tensor->data);
+                                                    (const float *) bias_tensor->data,
+                                                    partial_ms ? (float *) partial_ms->data : nullptr,
+                                                    partial_block);
                                 fused_mul_mat_vec = true;
                                 fused_node_count = 2;
                                 break;

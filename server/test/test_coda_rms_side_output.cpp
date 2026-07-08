@@ -63,6 +63,7 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
                                  const std::vector<float> & zdata,
                                  std::vector<float> & h_out,
                                  std::vector<float> & stats_out,
+                                 bool fused_side_output = false,
                                  double * ms_per_iter = nullptr,
                                  int iters = 0) {
     const size_t ctx_size = 128 * 1024 * 1024;
@@ -77,15 +78,21 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
     ggml_set_input(z);
 
     ggml_tensor * h = ggml_add(ctx, ggml_mul_mat(ctx, W, x), z);
-    ggml_tensor * stats = build_partial_ms(ctx, h, block);
+    ggml_tensor * stats = nullptr;
+    if (fused_side_output) {
+        stats = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N / block, M);
+        ggml_set_name(stats, "coda_partial_ms");
+    } else {
+        stats = build_partial_ms(ctx, h, block);
+    }
 
     ggml_set_output(h);
     ggml_set_output(stats);
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    // `h` and `stats` are two observable outputs. Expanding both makes the
-    // intended graph contract explicit; the second expansion reuses the already
-    // visited residual subgraph.
+    // `h` and `stats` are two observable outputs. In fused_side_output mode the
+    // stats tensor is a named leaf output written as a side effect by the mmq
+    // residual epilogue prototype.
     ggml_build_forward_expand(gf, h);
     ggml_build_forward_expand(gf, stats);
 
@@ -200,8 +207,39 @@ static bool test_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, int
     for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
 
     std::vector<float> h, stats;
-    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats);
-    return check_partial_ms(h, stats, N, M, block, ggml_type_name(wtype));
+    std::vector<float> h_ref, stats_ref;
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h_ref, stats_ref,
+                         /*fused_side_output=*/false);
+
+    bool ok = check_partial_ms(h_ref, stats_ref, N, M, block, ggml_type_name(wtype));
+
+    const bool expect_fused = ggml_is_quantized(wtype) && M > 8;
+    if (!expect_fused) {
+        printf("[coda_rms_fused] %-8s N=%4d M=%4d block=%3d SKIP (mmq quantized M>8 only)\n",
+               ggml_type_name(wtype), N, M, block);
+        return ok;
+    }
+
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
+                         /*fused_side_output=*/true);
+
+    ok &= check_partial_ms(h, stats, N, M, block, ggml_type_name(wtype));
+
+    float max_h = 0.0f, max_h_diff = 0.0f, max_s = 0.0f, max_s_diff = 0.0f;
+    for (size_t i = 0; i < h.size(); ++i) {
+        max_h = std::fmax(max_h, std::fabs(h_ref[i]));
+        max_h_diff = std::fmax(max_h_diff, std::fabs(h[i] - h_ref[i]));
+    }
+    for (size_t i = 0; i < stats.size(); ++i) {
+        max_s = std::fmax(max_s, std::fabs(stats_ref[i]));
+        max_s_diff = std::fmax(max_s_diff, std::fabs(stats[i] - stats_ref[i]));
+    }
+    const float h_rel = max_h > 0.0f ? max_h_diff / max_h : max_h_diff;
+    const float s_rel = max_s > 0.0f ? max_s_diff / max_s : max_s_diff;
+    const bool parity = h_rel < 1e-5f && s_rel < 1e-5f;
+    printf("[coda_rms_fused] %-8s N=%4d M=%4d block=%3d h_rel=%.2e stats_rel=%.2e %s\n",
+           ggml_type_name(wtype), N, M, block, h_rel, s_rel, parity ? "PASS" : "FAIL");
+    return ok && parity;
 }
 
 static void bench_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, int N, int M, int block) {
@@ -215,10 +253,16 @@ static void bench_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, in
 
     std::vector<float> h, stats;
     double ms = 0.0;
-    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats, &ms, 200);
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
+                         /*fused_side_output=*/false, &ms, 200);
+    double fused_ms = 0.0;
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
+                         /*fused_side_output=*/true, &fused_ms, 200);
     const double residual_ms = bench_residual_only(backend, wtype, K, N, M, wbytes, xdata, zdata, 200);
-    printf("[bench_rms_side] wtype=%-6s K=%4d N=%4d M=%4d block=%3d  residual=%.4f ms side=%.4f ms overhead=%.2fx\n",
-           ggml_type_name(wtype), K, N, M, block, residual_ms, ms, residual_ms > 0.0 ? ms / residual_ms : 0.0);
+    printf("[bench_rms_side] wtype=%-6s K=%4d N=%4d M=%4d block=%3d  residual=%.4f ms composed=%.4f ms fused=%.4f ms fused/residual=%.2fx fused/composed=%.2fx\n",
+           ggml_type_name(wtype), K, N, M, block, residual_ms, ms, fused_ms,
+           residual_ms > 0.0 ? fused_ms / residual_ms : 0.0,
+           ms > 0.0 ? fused_ms / ms : 0.0);
 }
 
 int main() {

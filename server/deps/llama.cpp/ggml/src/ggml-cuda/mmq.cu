@@ -79,11 +79,12 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const float * residual) {
+        const float * residual, float * partial_ms, int partial_block) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
     GGML_ASSERT(!ids || !residual); // CODA residual epilogue only supported for the non-MoE path.
+    GGML_ASSERT(!partial_ms || residual);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -135,6 +136,17 @@ void ggml_cuda_mul_mat_q(
     if (use_stream_k && ne11 <= luce_mmq_dp_max_ne1) {
         use_stream_k = false;
     }
+    if (partial_ms) {
+        // First CODA RMS side-output prototype: statistics must be accumulated from
+        // the final h value. Stream-k split tiles write a suffix first and add prefix
+        // partials in a later fixup pass, so keep the stats path on data-parallel
+        // tiles until a stream-k-aware final-value stats path is added.
+        use_stream_k = false;
+        GGML_ASSERT(!ids);
+        GGML_ASSERT(ne02 == 1 && ne03 == 1);
+        GGML_ASSERT(partial_block > 0 && ne01 % partial_block == 0);
+        CUDA_CHECK(cudaMemsetAsync(partial_ms, 0, (ne01 / partial_block) * ne1 * sizeof(float), stream));
+    }
 
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
@@ -173,7 +185,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1, residual};
+            use_stream_k, ne1, residual, partial_ms, partial_block, partial_block > 0 ? (int)(ne01 / partial_block) : 0};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }

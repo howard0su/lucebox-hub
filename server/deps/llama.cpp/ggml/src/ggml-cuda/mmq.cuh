@@ -21,7 +21,8 @@ typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict
 // output tile, fusing the transformer residual add into the mmq epilogue. AI-assisted change
 // (private fork). residual is null on the default (unfused) path.
 typedef void (*mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
-    float * __restrict__ dst, const float * __restrict__ residual, const int stride, const int i_max, const int j_max);
+    float * __restrict__ dst, const float * __restrict__ residual, float * __restrict__ partial_ms,
+    const int partial_block, const int n_partial_blocks, const int stride, const int i_max, const int j_max);
 
 enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
@@ -3277,7 +3278,8 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 template<int mmq_x, int mmq_y, bool need_check>
 static __device__ __forceinline__ void mmq_write_back_dp4a(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
-        const float * __restrict__ residual, const int stride, const int i_max, const int j_max) {
+        const float * __restrict__ residual, float * __restrict__ partial_ms,
+        const int partial_block, const int n_partial_blocks, const int stride, const int i_max, const int j_max) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -3303,6 +3305,9 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
                 val += residual[idx];
             }
             dst[idx] = val;
+            if (partial_ms) {
+                atomicAdd(&partial_ms[ids_dst[j]*n_partial_blocks + i/partial_block], val*val / (float) partial_block);
+            }
         }
     }
 }
@@ -3310,7 +3315,8 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
 template<ggml_type type, int mmq_x, int mmq_y, bool need_check>
 static __device__ __forceinline__ void mmq_write_back_mma(
         const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
-        const float * __restrict__ residual, const int stride, const int i_max, const int j_max) {
+        const float * __restrict__ residual, float * __restrict__ partial_ms,
+        const int partial_block, const int n_partial_blocks, const int stride, const int i_max, const int j_max) {
 
     constexpr int granularity = mmq_get_granularity_device(mmq_x);
     constexpr int nwarps = mmq_get_nwarps_device();
@@ -3356,6 +3362,9 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     val += residual[idx];
                 }
                 dst[idx] = val;
+                if (partial_ms) {
+                    atomicAdd(&partial_ms[ids_dst[j]*n_partial_blocks + i/partial_block], val*val / (float) partial_block);
+                }
             }
         }
     }
@@ -3536,6 +3545,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ residual,
+        float * __restrict__ partial_ms, const int partial_block, const int n_partial_blocks,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
 
@@ -3625,9 +3635,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 
     if (fixup) {
-        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), nullptr, mmq_y, mmq_y, mmq_x);
+        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), nullptr, nullptr, 0, 0, mmq_y, mmq_y, mmq_x);
     } else {
-        write_back(sum, ids_dst, dst, residual, stride_col_dst, tile_x_max_i, tile_y_max_j);
+        write_back(sum, ids_dst, dst, residual, partial_ms, partial_block, n_partial_blocks,
+                   stride_col_dst, tile_x_max_i, tile_y_max_j);
     }
 }
 
@@ -3656,7 +3667,8 @@ static __global__ void mul_mat_q(
         const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int channel_ratio, const int nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ncols_max, const float * __restrict__ residual) {
+        const int ncols_max, const float * __restrict__ residual,
+        float * __restrict__ partial_ms, const int partial_block, const int n_partial_blocks) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3688,6 +3700,33 @@ static __global__ void mul_mat_q(
         ids_dst_shared[j] = j;
     }
     __syncthreads();
+
+    if (partial_ms) {
+        const int wt = blockIdx.z / nchannels_y;
+        const int zt = blockIdx.z - wt*nchannels_y;
+        const int jt = blockIdx.y;
+        const int it = blockIdx.x;
+
+        const int offset_y = wt*stride_sample_y + zt*stride_channel_y
+            + jt*mmq_x*(sizeof(block_q8_1_mmq)/sizeof(int));
+        const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst
+            + jt*mmq_x*stride_col_dst + it*mmq_y;
+        const int offset_x = (wt/sample_ratio)*stride_sample_x
+            + (zt/channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+
+        const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
+        const int tile_y_max_j = ncols_dst - jt*mmq_x - 1;
+        float * partial_ms_tile = partial_ms + (jt*mmq_x)*n_partial_blocks + (it*mmq_y)/partial_block;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
+             residual ? residual + offset_dst : nullptr,
+             partial_ms_tile, partial_block, n_partial_blocks,
+             stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk);
+        return;
+    }
 
     // On non-CDNA AMD or old CUDA the performance with stream-k was worse, use conventional tiling instead:
 #if (defined(GGML_USE_HIP) && !defined(CDNA)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3737,11 +3776,17 @@ static __global__ void mul_mat_q(
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
         const int offset_x = (wt/sample_ratio)*stride_sample_x + (zt/channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        float * partial_ms_tile = nullptr;
+        if (partial_ms) {
+            partial_ms_tile = partial_ms + (jt*mmq_x)*n_partial_blocks + (it*mmq_y)/partial_block;
+        }
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
-             residual ? residual + offset_dst : nullptr, stride_row_x, ncols_y, stride_col_dst,
+             residual ? residual + offset_dst : nullptr,
+             partial_ms_tile, partial_block, n_partial_blocks,
+             stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, ncols_x/qk);
         return;
     }
@@ -3818,11 +3863,17 @@ static __global__ void mul_mat_q(
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
         const int offset_x = (wt/sample_ratio)*stride_sample_x + (zt/channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        float * partial_ms_tile = nullptr;
+        if (partial_ms) {
+            partial_ms_tile = partial_ms + (jt*mmq_x)*n_partial_blocks + (it*mmq_y)/partial_block;
+        }
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
-             residual ? residual + offset_dst : nullptr, stride_row_x, ncols_y, stride_col_dst,
+             residual ? residual + offset_dst : nullptr,
+             partial_ms_tile, partial_block, n_partial_blocks,
+             stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 
         kbc += blocks_per_ne00;
@@ -3890,7 +3941,7 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
-         nullptr, stride_row_x, ncols_y, stride_col_dst,
+         nullptr, nullptr, 0, 0, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
@@ -4065,6 +4116,9 @@ struct mmq_args {
     // CODA §3.2.1 residual-add epilogue: dst-shaped/dst-strided residual added in the mmq
     // epilogue (null = default unfused path). Only used for the non-MoE (ids_dst==null) path.
     const float * residual = nullptr;
+    // Optional CODA RMS side output. Layout is [nrows_x / partial_block, ncols_dst]
+    // in contiguous F32, indexed as token*n_partial_blocks + row/partial_block.
+    float * partial_ms = nullptr; int partial_block = 0; int n_partial_blocks = 0;
 };
 
 template<ggml_type type>
@@ -4085,6 +4139,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps = mmq_get_nwarps_host(cc, warp_size);
     const int mmq_y = get_mmq_y_host(cc);
+    if (args.partial_ms) {
+        GGML_ASSERT(args.partial_block % mmq_y == 0);
+    }
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
@@ -4111,7 +4168,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max, args.residual);
+                 args.ncols_max, args.residual, args.partial_ms, args.partial_block, args.n_partial_blocks);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -4119,7 +4176,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max, args.residual);
+                 args.ncols_max, args.residual, args.partial_ms, args.partial_block, args.n_partial_blocks);
         }
         return;
     }
@@ -4140,7 +4197,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max, args.residual);
+             args.ncols_max, args.residual, args.partial_ms, args.partial_block, args.n_partial_blocks);
 
         if (!fixup_needed) {
             return;
@@ -4157,7 +4214,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max, args.residual);
+             args.ncols_max, args.residual, args.partial_ms, args.partial_block, args.n_partial_blocks);
 
         if (!fixup_needed) {
             return;
@@ -4283,7 +4340,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const float * residual = nullptr);
+        const float * residual = nullptr, float * partial_ms = nullptr, int partial_block = 0);
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
