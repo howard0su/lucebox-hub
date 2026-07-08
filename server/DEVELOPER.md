@@ -209,6 +209,7 @@ What engages:
 | **GEMM-Residual** (§3.2.1) | `DFLASH_CODA_RESIDUAL`, `DFLASH_CODA_RMS`, or umbrella | prefill / verify (M>1) | Forked `mmq` kernel adds a dst-shaped residual in its write-back epilogue. Detected automatically from any `{MUL_MAT, ADD}` with a contiguous, dst-shaped residual (non-MoE); **no graph rewrite needed** for pre-norm qwen/laguna/deepseek dense projections. Gemma4's sandwich/post-norm breaks this adjacency. |
 | **GEMM-Residual + RMS partial stats** (§3.2.1 prototype) | `DFLASH_CODA_RMS` or umbrella | prefill / verify (quantized mmq, M>8) | A named graph side-output tensor `coda_partial_ms:<tag>` lets the mmq residual epilogue also write per-token partial mean-square blocks over `h = mul_mat(W,x)+residual`. This validates ggml multi-output graph lifetime and the CODA RMSNorm stats path. |
 | **RMS partial-stats consumer** (§3.2.1) | `DFLASH_CODA_RMS` or umbrella | prefill / verify (qwen/qwen35 eligible residual→norm sites) | A CUDA RMSNorm helper consumes tagged `coda_partial_ms:<tag>` side outputs by reducing block means instead of recomputing `sum(h^2)` over all features. qwen35 and qwen3 graph builders emit tagged side-output/consumer pairs only when the residual input is a direct `{MUL_MAT, ADD}` with M>8 and 256-feature block alignment. |
+| **Deferred RMS row-scale** (§3.2.1 prototype) | `DFLASH_CODA_RMS` or umbrella | model-free test graph | A named `coda_apply_rstd:<tag>` scale node applies the per-token `rstd` from `coda_partial_ms:<tag>` after the following GEMM, proving the algebraic CODA path `W2 * (rstd * h * gamma) = rstd * (W2 * (h * gamma))`. This is test-only scaffolding; model graphs are not wired to it yet. |
 
 Set `DFLASH_CODA_DEBUG=1` to trace when the forked mmq residual epilogue engages.
 Set `DFLASH_CODA_RMS_POST_STATS=1` with `DFLASH_CODA_RMS=1` to test the experimental
@@ -242,7 +243,8 @@ GGML_CUDA_DISABLE_FUSION=1 ./test_coda_residual # unfused baseline (bench compar
 
 # CODA RMS side-output/consumer: validates two observable graph outputs, quantized
 # mmq residual+partial-mean-square side-output, tagged graph association, and
-# RMSNorm consumption of those partial stats.
+# RMSNorm consumption of those partial stats. Also covers the test-only deferred
+# row-scale graph via coda_apply_rstd:<tag>.
 DFLASH_CODA_RMS=1 ./test_coda_rms_side_output
 ```
 

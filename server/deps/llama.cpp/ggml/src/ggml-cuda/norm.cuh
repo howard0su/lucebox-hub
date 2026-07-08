@@ -22,6 +22,12 @@ void ggml_cuda_op_coda_partial_ms(ggml_backend_cuda_context & ctx,
                                   ggml_tensor * partial_ms,
                                   int partial_block);
 
+void ggml_cuda_op_coda_apply_rstd(ggml_backend_cuda_context & ctx,
+                                  ggml_tensor * dst,
+                                  const ggml_tensor * partial_ms,
+                                  int partial_block,
+                                  float eps);
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

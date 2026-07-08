@@ -235,6 +235,34 @@ static __global__ void coda_partial_ms_f32(const float * x,
 }
 
 template <int block_size>
+static __global__ void coda_apply_rstd_f32(const float * x,
+                                           const float * partial_ms,
+                                           float * dst,
+                                           const int ncols,
+                                           const int n_partial_blocks,
+                                           const int64_t stride_row,
+                                           const float eps) {
+    const int token = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    float sum = 0.0f;
+    const float * partial_ms_row = partial_ms + token*n_partial_blocks;
+    for (int block = tid; block < n_partial_blocks; block += block_size) {
+        sum += partial_ms_row[block];
+    }
+
+    extern __shared__ float s_sum[];
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, s_sum);
+    const float scale = rsqrtf(sum / (float) n_partial_blocks + eps);
+
+    const float * src_row = x + token*stride_row;
+    float * dst_row = dst + token*ncols;
+    for (int col = tid; col < ncols; col += block_size) {
+        dst_row[col] = src_row[col] * scale;
+    }
+}
+
+template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
@@ -444,6 +472,21 @@ static void coda_partial_ms_f32_cuda(const float * x, float * partial_ms,
         const dim3 block_dims(1024, 1, 1);
         coda_partial_ms_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
             x, partial_ms, ncols, n_partial_blocks, partial_block, stride_row);
+    }
+}
+
+static void coda_apply_rstd_f32_cuda(const float * x, const float * partial_ms, float * dst,
+                                     const int ncols, const int nrows, const int n_partial_blocks,
+                                     const int64_t stride_row, const float eps,
+                                     cudaStream_t stream) {
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        coda_apply_rstd_f32<256><<<nrows, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+            x, partial_ms, dst, ncols, n_partial_blocks, stride_row, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        coda_apply_rstd_f32<1024><<<nrows, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+            x, partial_ms, dst, ncols, n_partial_blocks, stride_row, eps);
     }
 }
 
@@ -741,6 +784,36 @@ void ggml_cuda_op_coda_partial_ms(ggml_backend_cuda_context & ctx,
     coda_partial_ms_f32_cuda(src_d, partial_ms_d,
                              (int) src->ne[0], (int) src->ne[1], (int) partial_ms->ne[0],
                              partial_block, stride_row, stream);
+}
+
+void ggml_cuda_op_coda_apply_rstd(ggml_backend_cuda_context & ctx,
+                                  ggml_tensor * dst,
+                                  const ggml_tensor * partial_ms,
+                                  int partial_block,
+                                  float eps) {
+    const ggml_tensor * src = dst->src[0];
+    const float * src_d = (const float *) src->data;
+    const float * partial_ms_d = (const float *) partial_ms->data;
+    float * dst_d = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(partial_ms->type == GGML_TYPE_F32);
+    GGML_ASSERT(partial_block > 0 && partial_ms->ne[0] > 0);
+    GGML_ASSERT(partial_ms->ne[1] == src->ne[1]);
+    GGML_ASSERT(src->ne[2] == 1 && src->ne[3] == 1);
+    GGML_ASSERT(partial_ms->ne[2] == 1 && partial_ms->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(src, dst));
+    GGML_ASSERT(ggml_is_contiguous(partial_ms));
+
+    const size_t ts0 = ggml_type_size(src->type);
+    GGML_ASSERT(src->nb[0] == ts0);
+    const int64_t stride_row = src->nb[1] / ts0;
+
+    coda_apply_rstd_f32_cuda(src_d, partial_ms_d, dst_d,
+                             (int) src->ne[0], (int) src->ne[1], (int) partial_ms->ne[0],
+                             stride_row, eps, stream);
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {

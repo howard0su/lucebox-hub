@@ -258,6 +258,22 @@ with draft steps increasing from 14 to 15 and output differing. This suggests st
 RMS materialization tweaks are exhausted; the next CODA opportunity is deferred row-scale
 into the following GEMM.
 
+**Deferred row-scale prototype**: `test_coda_rms_side_output` now also covers the CODA
+identity `W2 * (rstd * h * gamma) = rstd * (W2 * (h * gamma))` by naming the final scale
+node `coda_apply_rstd:<tag>`. The CUDA dispatch derives `rstd` from `coda_partial_ms:<tag>`
+and applies it after the following GEMM. Q4_K correctness passes with expected quantized
+accumulation-order drift (`rel ~6-7e-4`, tolerance 1e-3). Debug confirms the new dispatch
+fires. Model-free timings on RTX 2080 Ti for K=N=N2=1024:
+
+| M | normal RMS+weight before GEMM | deferred rstd after GEMM | ratio |
+|--:|:--:|:--:|:--:|
+| 32  | 0.2283 ms | 0.1950 ms | 0.85× |
+| 128 | 0.2501 ms | 0.2074 ms | 0.83× |
+| 512 | 0.3246 ms | 0.2957 ms | 0.91× |
+
+This is the first CODA RMS variant with a consistent model-free win; it is not wired into
+qwen/qwen35 model graphs yet.
+
 ## Reproducibility
 
 - Deterministic: greedy decode + greedy verify. Same prompts + same weights + same binary = same numbers ±1 tok/s.

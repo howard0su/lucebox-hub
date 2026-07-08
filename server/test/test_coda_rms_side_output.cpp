@@ -166,6 +166,84 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
     ggml_free(ctx);
 }
 
+static void run_deferred_scale_graph(ggml_backend_t backend, ggml_type wtype, int K, int N, int N2, int M, int block,
+                                     const std::vector<uint8_t> & w1bytes,
+                                     const std::vector<uint8_t> & w2bytes,
+                                     const std::vector<float> & xdata,
+                                     const std::vector<float> & zdata,
+                                     const std::vector<float> & rms_weight,
+                                     std::vector<float> & out,
+                                     bool deferred,
+                                     double * ms_per_iter = nullptr,
+                                     int iters = 0) {
+    const size_t ctx_size = 128 * 1024 * 1024;
+    ggml_init_params params = { ctx_size, nullptr, /*no_alloc=*/true };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * W1 = ggml_new_tensor_2d(ctx, wtype, K, N);
+    ggml_tensor * W2 = ggml_new_tensor_2d(ctx, wtype, N, N2);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
+    ggml_tensor * rw = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N);
+    ggml_set_input(W1);
+    ggml_set_input(W2);
+    ggml_set_input(x);
+    ggml_set_input(z);
+    ggml_set_input(rw);
+
+    const char * tag = "deferred_l0";
+    ggml_tensor * h = ggml_add(ctx, ggml_mul_mat(ctx, W1, x), z);
+    ggml_set_name(h, tag);
+
+    ggml_tensor * stats = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N / block, M);
+    ggml_format_name(stats, "coda_partial_ms:%s", tag);
+    ggml_set_output(stats);
+
+    ggml_tensor * result = nullptr;
+    if (deferred) {
+        ggml_tensor * postact = ggml_mul(ctx, h, rw);
+        ggml_tensor * next = ggml_mul_mat(ctx, W2, postact);
+        result = ggml_scale(ctx, next, 1.0f);
+        ggml_format_name(result, "coda_apply_rstd:%s", tag);
+    } else {
+        ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, h, 1e-5f), rw);
+        result = ggml_mul_mat(ctx, W2, norm);
+    }
+    ggml_set_output(result);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, stats);
+    ggml_build_forward_expand(gf, result);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_alloc_graph(alloc, gf);
+
+    ggml_backend_tensor_set(W1, w1bytes.data(), 0, ggml_nbytes(W1));
+    ggml_backend_tensor_set(W2, w2bytes.data(), 0, ggml_nbytes(W2));
+    ggml_backend_tensor_set(x, xdata.data(), 0, ggml_nbytes(x));
+    ggml_backend_tensor_set(z, zdata.data(), 0, ggml_nbytes(z));
+    ggml_backend_tensor_set(rw, rms_weight.data(), 0, ggml_nbytes(rw));
+
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_synchronize(backend);
+
+    out.resize(ggml_nelements(result));
+    ggml_backend_tensor_get(result, out.data(), 0, out.size() * sizeof(float));
+
+    if (ms_per_iter && iters > 0) {
+        for (int it = 0; it < 5; ++it) ggml_backend_graph_compute(backend, gf);
+        ggml_backend_synchronize(backend);
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < iters; ++it) ggml_backend_graph_compute(backend, gf);
+        ggml_backend_synchronize(backend);
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        *ms_per_iter = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+}
+
 static double bench_residual_only(ggml_backend_t backend, ggml_type wtype, int K, int N, int M,
                                   const std::vector<uint8_t> & wbytes,
                                   const std::vector<float> & xdata,
@@ -383,6 +461,37 @@ static bool test_tagged_rms_consumer(ggml_backend_t backend) {
     return pass;
 }
 
+static bool test_deferred_scale(ggml_backend_t backend, ggml_type wtype, int K, int N, int N2, int M, int block) {
+    if (!ggml_is_quantized(wtype) || M <= 8) {
+        printf("[coda_deferred_scale] %-8s N=%4d N2=%4d M=%4d block=%3d SKIP (mmq quantized M>8 only)\n",
+               ggml_type_name(wtype), N, N2, M, block);
+        return true;
+    }
+
+    srand(2027);
+    std::vector<uint8_t> w1bytes;
+    std::vector<uint8_t> w2bytes;
+    make_weight(wtype, K, N, w1bytes);
+    make_weight(wtype, N, N2, w2bytes);
+
+    std::vector<float> xdata(K * M), zdata(N * M), rms_weight(N);
+    for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    for (auto & v : rms_weight) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+
+    std::vector<float> ref, got;
+    run_deferred_scale_graph(backend, wtype, K, N, N2, M, block, w1bytes, w2bytes,
+                             xdata, zdata, rms_weight, ref, /*deferred=*/false);
+    run_deferred_scale_graph(backend, wtype, K, N, N2, M, block, w1bytes, w2bytes,
+                             xdata, zdata, rms_weight, got, /*deferred=*/true);
+
+    const float rel = relative_diff(ref, got);
+    const bool pass = rel < 1e-3f;
+    printf("[coda_deferred_scale] %-8s K=%4d N=%4d N2=%4d M=%4d block=%3d rel=%.2e %s\n",
+           ggml_type_name(wtype), K, N, N2, M, block, rel, pass ? "PASS" : "FAIL");
+    return pass;
+}
+
 static void bench_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, int N, int M, int block) {
     srand(2026);
     std::vector<uint8_t> wbytes;
@@ -436,6 +545,30 @@ static void bench_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, in
            fused_weight_norm_ms > 0.0 ? consume_weight_ms / fused_weight_norm_ms : 0.0);
 }
 
+static void bench_deferred_scale(ggml_backend_t backend, ggml_type wtype, int K, int N, int N2, int M, int block) {
+    srand(2027);
+    std::vector<uint8_t> w1bytes;
+    std::vector<uint8_t> w2bytes;
+    make_weight(wtype, K, N, w1bytes);
+    make_weight(wtype, N, N2, w2bytes);
+
+    std::vector<float> xdata(K * M), zdata(N * M), rms_weight(N), out;
+    for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    for (auto & v : rms_weight) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+
+    double normal_ms = 0.0;
+    run_deferred_scale_graph(backend, wtype, K, N, N2, M, block, w1bytes, w2bytes,
+                             xdata, zdata, rms_weight, out, /*deferred=*/false, &normal_ms, 200);
+    double deferred_ms = 0.0;
+    run_deferred_scale_graph(backend, wtype, K, N, N2, M, block, w1bytes, w2bytes,
+                             xdata, zdata, rms_weight, out, /*deferred=*/true, &deferred_ms, 200);
+
+    printf("[bench_deferred_scale] wtype=%-6s K=%4d N=%4d N2=%4d M=%4d block=%3d normal=%.4f ms deferred=%.4f ms deferred/normal=%.2fx\n",
+           ggml_type_name(wtype), K, N, N2, M, block, normal_ms, deferred_ms,
+           normal_ms > 0.0 ? deferred_ms / normal_ms : 0.0);
+}
+
 int main() {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
@@ -452,10 +585,16 @@ int main() {
     // F16 keeps the same graph contract on a dense GEMM path.
     ok &= test_two_outputs(backend, GGML_TYPE_F16, 512, 1024, 32, 256);
     ok &= test_tagged_rms_consumer(backend);
+    for (int M : {32, 128}) {
+        ok &= test_deferred_scale(backend, GGML_TYPE_Q4_K, 512, 1024, 1024, M, 256);
+    }
 
     printf("\n");
     for (int M : {32, 128, 512}) {
         bench_two_outputs(backend, GGML_TYPE_Q4_K, 512, 1024, M, 256);
+    }
+    for (int M : {32, 128, 512}) {
+        bench_deferred_scale(backend, GGML_TYPE_Q4_K, 512, 1024, 1024, M, 256);
     }
 
     ggml_backend_free(backend);
