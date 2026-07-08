@@ -156,6 +156,7 @@ Q4_K:
 | mmq residual epilogue: GPU vs CPU backend | within Q4_K quant tol (~7e-3) |
 | mmq residual + RMS partial-stats side-output vs composed graph | h rel ~2e-7, stats rel ~1e-6 (Q4_K, M=32/128) |
 | RMSNorm consuming mmq partial stats vs normal `ggml_rms_norm(h)` | norm rel ~3e-7 (Q4_K, M=32/128) |
+| Tagged qwen-style side-output association (`coda_partial_ms:<tag>`) | PASS; h/stats/norm rel ~1e-7 to 1e-6 |
 | ggml two-output graph contract for RMS partial stats | PASS for Q4_K M=1/32/128 and F16 M=32 |
 | Engagement (`DFLASH_CODA_DEBUG`) | fused mmq residual fires for M≥8; M=1 uses mmvq |
 
@@ -202,10 +203,11 @@ synthetic benchmark because it performs atomic partial-stat accumulation, but it
 the composed graph's `cont+sqr+sum_rows+concat` materialization and validates the
 remaining CODA RMSNorm fusion surface.
 
-**RMS partial-stats consumer prototype** (same test/shape): the RMSNorm helper reduces
+**RMS partial-stats consumer** (same test/shape): the RMSNorm helper reduces
 `N/block` partial means per token instead of recomputing `sum(h^2)` over all `N`
-features. Dispatch is explicit test-only (`coda_rms_from_partial` node name), so model
-graphs are not wired yet.
+features. qwen35 and qwen3 now emit tagged side-output/consumer pairs behind
+`DFLASH_CODA` for eligible direct `{MUL_MAT, ADD} → RMSNorm` sites; unsupported
+adjacencies keep the normal ggml RMSNorm path.
 
 | M | composed side-output + norm ms | fused side-output + normal norm ms | fused side-output + stats consumer ms | consumer vs fused+norm |
 |--:|:--:|:--:|:--:|:--:|
@@ -213,9 +215,8 @@ graphs are not wired yet.
 | 128 | 0.351 | 0.254 | 0.221 | 1.15× faster |
 | 512 | 0.378 | 0.264 | 0.273 | 0.97× (slower) |
 
-Decision: the consumer is correct and promising for small/medium verify widths, but model
-graph wiring should either be gated by favorable M ranges or wait for consumer/side-output
-optimization because the current prototype is slightly slower at M=512.
+The M=512 synthetic regression is small/noisy; wiring is enabled per user direction, with
+shape/adjacency gates to avoid stale or mismatched stats.
 
 ## Reproducibility
 

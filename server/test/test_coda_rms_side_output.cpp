@@ -67,7 +67,8 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
                                  double * ms_per_iter = nullptr,
                                  int iters = 0,
                                  std::vector<float> * norm_out = nullptr,
-                                 bool consume_partial_stats = false) {
+                                 bool consume_partial_stats = false,
+                                 const char * coda_tag = nullptr) {
     const size_t ctx_size = 128 * 1024 * 1024;
     ggml_init_params params = { ctx_size, nullptr, /*no_alloc=*/true };
     ggml_context * ctx = ggml_init(params);
@@ -80,10 +81,17 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
     ggml_set_input(z);
 
     ggml_tensor * h = ggml_add(ctx, ggml_mul_mat(ctx, W, x), z);
+    if (coda_tag) {
+        ggml_set_name(h, coda_tag);
+    }
     ggml_tensor * stats = nullptr;
     if (fused_side_output) {
         stats = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N / block, M);
-        ggml_set_name(stats, "coda_partial_ms");
+        if (coda_tag) {
+            ggml_format_name(stats, "coda_partial_ms:%s", coda_tag);
+        } else {
+            ggml_set_name(stats, "coda_partial_ms");
+        }
     } else {
         stats = build_partial_ms(ctx, h, block);
     }
@@ -92,7 +100,11 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
     if (norm_out) {
         norm = ggml_rms_norm(ctx, h, 1e-5f);
         if (consume_partial_stats) {
-            ggml_set_name(norm, "coda_rms_from_partial");
+            if (coda_tag) {
+                ggml_format_name(norm, "coda_rms_from_partial:%s", coda_tag);
+            } else {
+                ggml_set_name(norm, "coda_rms_from_partial");
+            }
         }
     }
 
@@ -306,6 +318,40 @@ static bool test_rms_consumer(ggml_backend_t backend, ggml_type wtype, int K, in
     return pass;
 }
 
+static bool test_tagged_rms_consumer(ggml_backend_t backend) {
+    constexpr ggml_type wtype = GGML_TYPE_Q4_K;
+    constexpr int K = 512;
+    constexpr int N = 1024;
+    constexpr int M = 32;
+    constexpr int block = 256;
+    const char * tag = "q35_l0_post_attn";
+
+    srand(2026);
+    std::vector<uint8_t> wbytes;
+    make_weight(wtype, K, N, wbytes);
+
+    std::vector<float> xdata(K * M), zdata(N * M);
+    for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+
+    std::vector<float> h_ref, stats_ref, norm_ref;
+    std::vector<float> h, stats, norm;
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h_ref, stats_ref,
+                         /*fused_side_output=*/false, nullptr, 0, &norm_ref,
+                         /*consume_partial_stats=*/false, tag);
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
+                         /*fused_side_output=*/true, nullptr, 0, &norm,
+                         /*consume_partial_stats=*/true, tag);
+
+    const float h_rel = relative_diff(h_ref, h);
+    const float s_rel = relative_diff(stats_ref, stats);
+    const float norm_rel = relative_diff(norm_ref, norm);
+    const bool pass = h_rel < 1e-5f && s_rel < 1e-5f && norm_rel < 2e-5f;
+    printf("[coda_rms_tagged] tag=%s h_rel=%.2e stats_rel=%.2e norm_rel=%.2e %s\n",
+           tag, h_rel, s_rel, norm_rel, pass ? "PASS" : "FAIL");
+    return pass;
+}
+
 static void bench_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, int N, int M, int block) {
     srand(2026);
     std::vector<uint8_t> wbytes;
@@ -361,6 +407,7 @@ int main() {
     }
     // F16 keeps the same graph contract on a dense GEMM path.
     ok &= test_two_outputs(backend, GGML_TYPE_F16, 512, 1024, 32, 256);
+    ok &= test_tagged_rms_consumer(backend);
 
     printf("\n");
     for (int M : {32, 128, 512}) {

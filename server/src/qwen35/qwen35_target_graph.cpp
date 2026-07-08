@@ -1069,7 +1069,11 @@ static ggml_tensor * build_single_layer(
 
     ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
     ggml_tensor * inpSA = inp_f32;
-    ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
+    char coda_tag[64];
+    snprintf(coda_tag, sizeof(coda_tag), "q35_l%d_pre_attn", layer_idx);
+    ggml_tensor * cur = layer_idx > 0
+        ? coda_rms_norm_mul_after_residual(ctx, gf, inp_f32, L.attn_norm, eps, coda_tag)
+        : rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
     if (is_attn) {
         int fa_idx = 0;
@@ -1098,7 +1102,8 @@ static ggml_tensor * build_single_layer(
     cur = ggml_add(ctx, cur, inpSA);
 
     ggml_tensor * ffn_residual = cur;
-    ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
+    snprintf(coda_tag, sizeof(coda_tag), "q35_l%d_post_attn", layer_idx);
+    ggml_tensor * post = coda_rms_norm_mul_after_residual(ctx, gf, cur, L.attn_post_norm, eps, coda_tag);
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * ffn  = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L, &moe_selected)
                                   : build_swiglu_ffn(ctx, post, L);
@@ -1190,7 +1195,11 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * inpSA = inp_f32;
 
         // Pre-attention norm
-        ggml_tensor * cur = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
+        char coda_tag[64];
+        snprintf(coda_tag, sizeof(coda_tag), "q35_l%d_pre_attn", il);
+        ggml_tensor * cur = il > 0
+            ? coda_rms_norm_mul_after_residual(ctx, gf, inp_f32, L.attn_norm, eps, coda_tag)
+            : rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
         if (is_attn) {
             const bool want_q_cap = in.q_capture && cache.q_cap;
@@ -1245,7 +1254,8 @@ QwenGraphOutputs build_qwen35_graph(
 
         // Post-attention norm (before FFN)
         ggml_tensor * ffn_residual = cur;
-        ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
+        snprintf(coda_tag, sizeof(coda_tag), "q35_l%d_post_attn", il);
+        ggml_tensor * post = coda_rms_norm_mul_after_residual(ctx, gf, cur, L.attn_post_norm, eps, coda_tag);
 
         // FFN (dense SwiGLU for qwen35, MoE for qwen35moe)
         ggml_tensor * moe_selected = nullptr;
@@ -1308,7 +1318,14 @@ QwenGraphOutputs build_qwen35_graph(
     }
 
     // 2. Final norm
-    ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+    ggml_tensor * out = nullptr;
+    if (w.n_layer > 0) {
+        char coda_tag[64];
+        snprintf(coda_tag, sizeof(coda_tag), "q35_l%d_final", w.n_layer - 1);
+        out = coda_rms_norm_mul_after_residual(ctx, gf, inpL, w.out_norm, w.rms_eps, coda_tag);
+    } else {
+        out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+    }
 
     // 3. LM head — optionally only for the last token (prefill optimization:
     //    reduces logits from [vocab, n_tokens] to [vocab, 1], saving ~233MB

@@ -3715,6 +3715,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static ggml_tensor * ggml_cuda_coda_partial_ms_for_tag(const ggml_cgraph * cgraph, const char * tag) {
+    if (tag && tag[0] != '\0') {
+        char name[GGML_MAX_NAME];
+        snprintf(name, sizeof(name), "coda_partial_ms:%s", tag);
+        if (ggml_tensor * partial_ms = ggml_graph_get_tensor(cgraph, name)) {
+            return partial_ms;
+        }
+    }
+    return ggml_graph_get_tensor(cgraph, "coda_partial_ms");
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4212,7 +4223,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             // GPU. Correctness is identical either way (see test_coda_residual).
                             if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0)) {
                                 static const bool coda_debug = (getenv("DFLASH_CODA_DEBUG") != nullptr);
-                                ggml_tensor * partial_ms = ggml_graph_get_tensor(cgraph, "coda_partial_ms");
+                                ggml_tensor * partial_ms = ggml_cuda_coda_partial_ms_for_tag(cgraph, bias_node->name);
                                 int partial_block = 0;
                                 if (partial_ms) {
                                     const bool ok_partial =
@@ -4250,8 +4261,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     static const bool dflash_coda_rms = (getenv("DFLASH_CODA") != nullptr);
                     if (dflash_coda_rms && node->op == GGML_OP_RMS_NORM &&
-                        strcmp(node->name, "coda_rms_from_partial") == 0) {
-                        ggml_tensor * partial_ms = ggml_graph_get_tensor(cgraph, "coda_partial_ms");
+                        strncmp(node->name, "coda_rms_from_partial", strlen("coda_rms_from_partial")) == 0) {
+                        const char * tag = nullptr;
+                        if (node->name[strlen("coda_rms_from_partial")] == ':') {
+                            tag = node->name + strlen("coda_rms_from_partial") + 1;
+                        }
+                        ggml_tensor * partial_ms = ggml_cuda_coda_partial_ms_for_tag(cgraph, tag);
                         int partial_block = 0;
                         if (partial_ms && node->src[0] && partial_ms->type == GGML_TYPE_F32 &&
                             node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
