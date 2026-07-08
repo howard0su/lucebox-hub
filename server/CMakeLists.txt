@@ -1060,6 +1060,20 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_SRC_INCLUDE_DIRS})
         add_test(NAME coda_residual COMMAND test_coda_residual)
     endif()
+
+    # CODA residual-RMSNorm two-output prototype (arXiv:2605.19269 §3.2.1).
+    # Models h = GEMM+residual plus a side output of partial mean-square stats,
+    # using current ggml multi-output graph semantics before adding a fused op.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_coda_rms_side_output.cpp")
+        add_executable(test_coda_rms_side_output test/test_coda_rms_side_output.cpp)
+        target_link_libraries(test_coda_rms_side_output PRIVATE dflash_common ggml ggml-cuda ggml-base)
+        target_include_directories(test_coda_rms_side_output PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        add_test(NAME coda_rms_side_output COMMAND test_coda_rms_side_output)
+    endif()
     endif()
 endif()
 
