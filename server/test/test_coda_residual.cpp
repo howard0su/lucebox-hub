@@ -134,6 +134,79 @@ static bool test_correctness(ggml_backend_t cuda, ggml_backend_t cpu,
     return pass;
 }
 
+// Build h0 = mul_mat(W, x) ALONE on `backend` (no add, so no residual fusion is
+// possible), returning h0 in `out`. Used to construct the "unfused" GPU reference.
+static void run_matmul_only(ggml_backend_t backend, ggml_type wtype, int K, int N, int M,
+                            const std::vector<uint8_t> & wbytes,
+                            const std::vector<float> & xdata,
+                            std::vector<float> & out) {
+    const size_t ctx_size = 64 * 1024 * 1024;
+    ggml_init_params params = { ctx_size, nullptr, /*no_alloc=*/true };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * W = ggml_new_tensor_2d(ctx, wtype, K, N);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+    ggml_set_input(W);
+    ggml_set_input(x);
+
+    ggml_tensor * h0 = ggml_mul_mat(ctx, W, x);
+    ggml_set_output(h0);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, h0);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_alloc_graph(alloc, gf);
+
+    ggml_backend_tensor_set(W, wbytes.data(), 0, ggml_nbytes(W));
+    ggml_backend_tensor_set(x, xdata.data(), 0, ggml_nbytes(x));
+
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_synchronize(backend);
+
+    out.resize(ggml_nelements(h0));
+    ggml_backend_tensor_get(h0, out.data(), 0, out.size() * sizeof(float));
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+}
+
+// Direct GPU fused-vs-unfused check: the fused single-graph {mul_mat, add} result
+// (which uses the CODA epilogue when DFLASH_CODA is set) must equal a standalone
+// GPU GEMM followed by the residual add done separately. This isolates the mmq
+// residual-epilogue fork from cross-backend quantization noise: both sides run the
+// identical GPU GEMM, so the fp32 residual add should agree essentially exactly.
+static bool test_fused_vs_split(ggml_backend_t cuda, ggml_type wtype, int K, int N, int M) {
+    srand(7);
+    std::vector<uint8_t> wbytes;
+    make_weight(wtype, K, N, wbytes);
+    std::vector<float> xdata(K * M), zdata(N * M);
+    for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+
+    std::vector<float> fused, h0;
+    run_residual(cuda, wtype, K, N, M, wbytes, xdata, zdata, fused);
+    run_matmul_only(cuda, wtype, K, N, M, wbytes, xdata, h0);
+
+    float max_abs = 0.0f, max_diff = 0.0f;
+    bool nonfinite = false;
+    for (size_t i = 0; i < fused.size(); i++) {
+        const float ref = h0[i] + zdata[i];   // unfused residual add
+        if (!std::isfinite(fused[i]) || !std::isfinite(ref)) { nonfinite = true; break; }
+        max_abs  = std::fmax(max_abs, std::fabs(ref));
+        max_diff = std::fmax(max_diff, std::fabs(fused[i] - ref));
+    }
+    const float rel = max_abs > 0.0f ? max_diff / max_abs : max_diff;
+    // Same GPU GEMM on both sides -> fp32 add must match to rounding (~1e-6 rel).
+    const float tol = 1e-5f;
+    const char * path = (M <= kMmvqMaxBatch) ? "mmvq" : "mmq ";
+    const bool pass = !nonfinite && rel < tol;
+    printf("[fused==split] %s wtype=%-6s K=%4d N=%4d M=%4d  rel=%.2e (tol=%.0e) %s\n",
+           path, ggml_type_name(wtype), K, N, M, rel, tol,
+           nonfinite ? "NONFINITE" : (pass ? "PASS" : "FAIL"));
+    return pass;
+}
+
 static void bench(ggml_backend_t cuda, ggml_type wtype, int K, int N, int M) {
     srand(7);
     std::vector<uint8_t> wbytes;
@@ -162,6 +235,13 @@ int main() {
     // Q4_K (production). M=1 -> mmvq (already fuses residual); M>8 -> mmq.
     for (int M : {1, 8, 32, 128, 512}) {
         ok &= test_correctness(cuda, cpu, GGML_TYPE_Q4_K, 512, 1024, M);
+    }
+
+    // Direct GPU fused-vs-unfused parity (validates the mmq residual-epilogue fork
+    // itself; set DFLASH_CODA=1 to exercise the fused mmq path for M>8).
+    printf("\n");
+    for (int M : {1, 8, 32, 128, 512}) {
+        ok &= test_fused_vs_split(cuda, GGML_TYPE_Q4_K, 512, 1024, M);
     }
 
     printf("\n");

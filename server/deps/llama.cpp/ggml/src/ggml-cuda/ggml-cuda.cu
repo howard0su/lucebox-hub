@@ -4191,6 +4191,38 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             fused_node_count = 2;
                             break;
                         }
+
+                        // CODA (arXiv:2605.19269 §3.2.1): fuse the residual add into the mmq GEMM
+                        // epilogue for the prefill/verify (M>1) path, which the mat-vec fusions above
+                        // (decode, M==1) do not cover. Gated behind DFLASH_CODA to keep the default
+                        // path unchanged. Restricted to the non-MoE GGML_OP_MUL_MAT + GGML_OP_ADD
+                        // case with a contiguous, dst-shaped residual. AI-assisted change (private fork).
+                        static const bool dflash_coda = (getenv("DFLASH_CODA") != nullptr);
+                        if (dflash_coda && bias_op == GGML_OP_ADD && ids == nullptr &&
+                            ggml_is_quantized(src0->type) &&
+                            src1->type == GGML_TYPE_F32 && bias_node->type == GGML_TYPE_F32 &&
+                            ggml_are_same_shape(bias_node, mm_node) &&
+                            ggml_is_contiguous(bias_node) && ggml_is_contiguous(bias_tensor) &&
+                            ggml_are_same_shape(bias_tensor, bias_node)) {
+                            const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+                            // NOTE: forcing the mmq path also captures small M (e.g. the M~2..8
+                            // spec-decode verify widths) that the normal path would run via mmvq.
+                            // That trades an mmvq GEMM for an mmq GEMM to save the separate add;
+                            // the net win is size-dependent and should be measured on the target
+                            // GPU. Correctness is identical either way (see test_coda_residual).
+                            if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0)) {
+                                static const bool coda_debug = (getenv("DFLASH_CODA_DEBUG") != nullptr);
+                                if (coda_debug) {
+                                    fprintf(stderr, "[CODA] fused mmq residual epilogue: M=%d N=%d\n",
+                                            (int) bias_node->ne[1], (int) bias_node->ne[0]);
+                                }
+                                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, /*ids=*/nullptr, bias_node,
+                                                    (const float *) bias_tensor->data);
+                                fused_mul_mat_vec = true;
+                                fused_node_count = 2;
+                                break;
+                            }
+                        }
                     }
 
                     if (fused_mul_mat_vec) {
