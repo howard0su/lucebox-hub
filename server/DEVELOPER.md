@@ -207,13 +207,15 @@ What engages when `DFLASH_CODA` is set:
 | **GEMM-Residual** (§3.2.1): `mul_mat(W,x) + residual` | decode (M=1) | Already fused upstream via the mmvq (`{MUL_MAT, ADD}`) mat-vec epilogue. |
 | **GEMM-Residual** (§3.2.1) | prefill / verify (M>1) | Forked `mmq` kernel adds a dst-shaped residual in its write-back epilogue. Detected automatically from any `{MUL_MAT, ADD}` with a contiguous, dst-shaped residual (non-MoE); **no graph rewrite needed** for pre-norm qwen/laguna/deepseek dense projections. Gemma4's sandwich/post-norm breaks this adjacency. |
 | **GEMM-Residual + RMS partial stats** (§3.2.1 prototype) | prefill / verify (quantized mmq, M>8) | A named graph side-output tensor `coda_partial_ms` lets the mmq residual epilogue also write per-token partial mean-square blocks over `h = mul_mat(W,x)+residual`. This validates ggml multi-output graph lifetime and the CODA RMSNorm stats path before adding a model graph rewrite. |
+| **RMS partial-stats consumer** (§3.2.1 prototype) | prefill / verify (explicit test marker only) | A CUDA RMSNorm helper can consume `coda_partial_ms` by reducing block means instead of recomputing `sum(h^2)` over all features. Dispatch is opt-in via a `coda_rms_from_partial` RMSNorm node name, so model graphs are unchanged until benchmarks justify wiring. |
 
 Set `DFLASH_CODA_DEBUG=1` to trace when the forked mmq residual epilogue engages.
 Set `GGML_CUDA_DISABLE_FUSION=1` to disable all ggml-cuda fusion (baseline).
 
 Core changes: `deps/llama.cpp/ggml/src/ggml-cuda/{mmq.cuh,mmq.cu,ggml-cuda.cu}`
 (residual and optional RMS partial-stats side-output threaded through `mmq_args` →
-`mul_mat_q` → `mmq_write_back_*`) plus GLU rewrites in
+`mul_mat_q` → `mmq_write_back_*`) plus `ggml-cuda/norm.cu` for the RMS stats
+consumer and GLU rewrites in
 `src/qwen35/qwen35_target_graph.cpp`, `src/qwen3/`, `src/gemma4/`, and
 `src/deepseek4/deepseek4_graph.cpp`.
 
@@ -233,8 +235,9 @@ DFLASH_CODA=1 ./test_coda_residual              # exercise the fused mmq path (M
 DFLASH_CODA_DEBUG=1 DFLASH_CODA=1 ./test_coda_residual   # + trace engagement
 GGML_CUDA_DISABLE_FUSION=1 ./test_coda_residual # unfused baseline (bench compare)
 
-# CODA RMS side-output prototype: validates two observable graph outputs and the
-# quantized mmq residual+partial-mean-square side-output epilogue.
+# CODA RMS side-output/consumer prototype: validates two observable graph outputs,
+# quantized mmq residual+partial-mean-square side-output, and opt-in RMSNorm
+# consumption of those partial stats.
 DFLASH_CODA=1 ./test_coda_rms_side_output
 ```
 

@@ -4248,6 +4248,35 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
+                    static const bool dflash_coda_rms = (getenv("DFLASH_CODA") != nullptr);
+                    if (dflash_coda_rms && node->op == GGML_OP_RMS_NORM &&
+                        strcmp(node->name, "coda_rms_from_partial") == 0) {
+                        ggml_tensor * partial_ms = ggml_graph_get_tensor(cgraph, "coda_partial_ms");
+                        int partial_block = 0;
+                        if (partial_ms && node->src[0] && partial_ms->type == GGML_TYPE_F32 &&
+                            node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                            node->src[0]->ne[1] == partial_ms->ne[1] &&
+                            partial_ms->ne[2] == 1 && partial_ms->ne[3] == 1 &&
+                            node->src[0]->ne[0] % partial_ms->ne[0] == 0 &&
+                            node->src[0]->ne[2] == 1 && node->src[0]->ne[3] == 1 &&
+                            ggml_are_same_shape(node, node->src[0]) &&
+                            ggml_is_contiguous(partial_ms) &&
+                            ggml_is_contiguous_rows(node->src[0])) {
+                            partial_block = (int) (node->src[0]->ne[0] / partial_ms->ne[0]);
+                        }
+
+                        if (partial_block > 0) {
+                            static const bool coda_debug = (getenv("DFLASH_CODA_DEBUG") != nullptr);
+                            if (coda_debug) {
+                                fprintf(stderr, "[CODA] RMSNorm from partial stats: M=%d N=%d stats=%d block=%d\n",
+                                        (int) node->src[0]->ne[1], (int) node->src[0]->ne[0],
+                                        (int) partial_ms->ne[0], partial_block);
+                            }
+                            ggml_cuda_op_rms_norm_from_partial_ms(*cuda_ctx, node, partial_ms, partial_block);
+                            continue;
+                        }
+                    }
+
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
                         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
                         i += 2;
