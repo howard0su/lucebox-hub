@@ -150,7 +150,7 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
-template <int block_size>
+template <int block_size, bool do_multiply = false>
 static __global__ void rms_norm_from_partial_ms_f32(const float * x,
                                                     const float * partial_ms,
                                                     float * dst,
@@ -159,7 +159,15 @@ static __global__ void rms_norm_from_partial_ms_f32(const float * x,
                                                     const int64_t stride_row,
                                                     const int64_t stride_channel,
                                                     const int64_t stride_sample,
-                                                    const float eps) {
+                                                    const float eps,
+                                                    const float * mul                  = nullptr,
+                                                    const int64_t mul_stride_row       = 0,
+                                                    const int64_t mul_stride_channel   = 0,
+                                                    const int64_t mul_stride_sample    = 0,
+                                                    const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
+                                                    const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
+                                                    const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
+                                                    const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0)) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -171,6 +179,13 @@ static __global__ void rms_norm_from_partial_ms_f32(const float * x,
     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
     partial_ms += row*n_partial_blocks;
+
+    if constexpr (do_multiply) {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
 
     float tmp = 0.0f;
     for (int block = tid; block < n_partial_blocks; block += block_size) {
@@ -184,7 +199,12 @@ static __global__ void rms_norm_from_partial_ms_f32(const float * x,
     const float scale = rsqrtf(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale * x[col];
+        if constexpr (do_multiply) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            dst[col] = scale * x[col] * mul[mul_col];
+        } else {
+            dst[col] = scale * x[col];
+        }
     }
 }
 
@@ -346,20 +366,42 @@ static void rms_norm_f32_cuda(
 }
 
 static void rms_norm_from_partial_ms_f32_cuda(
-        const float * x, const float * partial_ms, float * dst,
+        const float * x, const float * partial_ms, const float * mul, float * dst,
         const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int n_partial_blocks,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const uint32_t mul_ncols, const uint32_t mul_nrows, const uint32_t mul_nchannels, const uint32_t mul_nsamples,
         const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
-    if (ncols < 1024) {
-        const dim3 block_dims(256, 1, 1);
-        rms_norm_from_partial_ms_f32<256><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
-            x, partial_ms, dst, ncols, n_partial_blocks, stride_row, stride_channel, stride_sample, eps);
+    if (mul == nullptr) {
+        if (ncols < 1024) {
+            const dim3 block_dims(256, 1, 1);
+            rms_norm_from_partial_ms_f32<256, false><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                x, partial_ms, dst, ncols, n_partial_blocks, stride_row, stride_channel, stride_sample, eps);
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            rms_norm_from_partial_ms_f32<1024, false><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                x, partial_ms, dst, ncols, n_partial_blocks, stride_row, stride_channel, stride_sample, eps);
+        }
     } else {
-        const dim3 block_dims(1024, 1, 1);
-        rms_norm_from_partial_ms_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
-            x, partial_ms, dst, ncols, n_partial_blocks, stride_row, stride_channel, stride_sample, eps);
+        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+        if (ncols < 1024) {
+            const dim3 block_dims(256, 1, 1);
+            rms_norm_from_partial_ms_f32<256, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                x, partial_ms, dst, ncols, n_partial_blocks, stride_row, stride_channel, stride_sample, eps,
+                mul, mul_stride_row, mul_stride_channel, mul_stride_sample,
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            rms_norm_from_partial_ms_f32<1024, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                x, partial_ms, dst, ncols, n_partial_blocks, stride_row, stride_channel, stride_sample, eps,
+                mul, mul_stride_row, mul_stride_channel, mul_stride_sample,
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+        }
     }
 }
 
@@ -561,10 +603,76 @@ void ggml_cuda_op_rms_norm_from_partial_ms(ggml_backend_cuda_context & ctx,
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    rms_norm_from_partial_ms_f32_cuda(src0_d, partial_ms_d, dst_d,
+    rms_norm_from_partial_ms_f32_cuda(src0_d, partial_ms_d, nullptr, dst_d,
                                       ne00, ne01, ne02, ne03,
                                       (int) partial_ms->ne[0],
-                                      s01, s02, s03, eps, stream);
+                                      s01, s02, s03,
+                                      0, 0, 0, 0, 0, 0, 0,
+                                      eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_from_partial_ms_fused(ggml_backend_cuda_context & ctx,
+                                                 ggml_tensor * dst,
+                                                 ggml_tensor * mul_tensor,
+                                                 const ggml_tensor * partial_ms,
+                                                 int partial_block) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *) src0->data;
+    const float * partial_ms_d = (const float *) partial_ms->data;
+    const float * mul_d = nullptr;
+    const ggml_tensor * mul_src = nullptr;
+
+    if (mul_tensor->src[0] == dst) {
+        mul_d = (const float *) mul_tensor->src[1]->data;
+        mul_src = mul_tensor->src[1];
+    } else if (mul_tensor->src[1] == dst) {
+        mul_d = (const float *) mul_tensor->src[0]->data;
+        mul_src = mul_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    float * dst_d = (float *) mul_tensor->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(partial_ms->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+    GGML_ASSERT(partial_block > 0 && ne00 % partial_block == 0);
+    GGML_ASSERT(partial_ms->ne[0] == ne00 / partial_block);
+    GGML_ASSERT(partial_ms->ne[1] == ne01);
+    GGML_ASSERT(partial_ms->ne[2] == 1 && partial_ms->ne[3] == 1);
+    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+    GGML_ASSERT(ggml_is_contiguous(partial_ms));
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
+
+    const size_t ts_mul = ggml_type_size(mul_src->type);
+    GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
+    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
+    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
+
+    rms_norm_from_partial_ms_f32_cuda(src0_d, partial_ms_d, mul_d, dst_d,
+                                      ne00, ne01, ne02, ne03,
+                                      (int) partial_ms->ne[0],
+                                      s01, s02, s03,
+                                      mul_s01, mul_s02, mul_s03,
+                                      (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1],
+                                      (uint32_t) mul_src->ne[2], (uint32_t) mul_src->ne[3],
+                                      eps, stream);
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {

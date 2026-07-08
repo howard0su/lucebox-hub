@@ -4293,6 +4293,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                         (int) node->src[0]->ne[1], (int) node->src[0]->ne[0],
                                         (int) partial_ms->ne[0], partial_block);
                             }
+                            if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL}, {})) {
+                                if (coda_debug) {
+                                    fprintf(stderr, "[CODA] RMSNorm from partial stats fused with MUL\n");
+                                }
+                                ggml_cuda_op_rms_norm_from_partial_ms_fused(*cuda_ctx, node, cgraph->nodes[i+1], partial_ms, partial_block);
+                                i++;
+                                continue;
+                            }
                             ggml_cuda_op_rms_norm_from_partial_ms(*cuda_ctx, node, partial_ms, partial_block);
                             continue;
                         }

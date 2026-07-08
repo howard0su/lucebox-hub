@@ -68,7 +68,8 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
                                  int iters = 0,
                                  std::vector<float> * norm_out = nullptr,
                                  bool consume_partial_stats = false,
-                                 const char * coda_tag = nullptr) {
+                                 const char * coda_tag = nullptr,
+                                 const std::vector<float> * rms_weight = nullptr) {
     const size_t ctx_size = 128 * 1024 * 1024;
     ggml_init_params params = { ctx_size, nullptr, /*no_alloc=*/true };
     ggml_context * ctx = ggml_init(params);
@@ -76,9 +77,13 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
     ggml_tensor * W = ggml_new_tensor_2d(ctx, wtype, K, N);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
     ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
+    ggml_tensor * rw = rms_weight ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N) : nullptr;
     ggml_set_input(W);
     ggml_set_input(x);
     ggml_set_input(z);
+    if (rw) {
+        ggml_set_input(rw);
+    }
 
     ggml_tensor * h = ggml_add(ctx, ggml_mul_mat(ctx, W, x), z);
     if (coda_tag) {
@@ -98,14 +103,15 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
 
     ggml_tensor * norm = nullptr;
     if (norm_out) {
-        norm = ggml_rms_norm(ctx, h, 1e-5f);
+        ggml_tensor * norm_node = ggml_rms_norm(ctx, h, 1e-5f);
         if (consume_partial_stats) {
             if (coda_tag) {
-                ggml_format_name(norm, "coda_rms_from_partial:%s", coda_tag);
+                ggml_format_name(norm_node, "coda_rms_from_partial:%s", coda_tag);
             } else {
-                ggml_set_name(norm, "coda_rms_from_partial");
+                ggml_set_name(norm_node, "coda_rms_from_partial");
             }
         }
+        norm = rw ? ggml_mul(ctx, norm_node, rw) : norm_node;
     }
 
     ggml_set_output(h);
@@ -130,6 +136,9 @@ static void run_two_output_graph(ggml_backend_t backend, ggml_type wtype, int K,
     ggml_backend_tensor_set(W, wbytes.data(), 0, ggml_nbytes(W));
     ggml_backend_tensor_set(x, xdata.data(), 0, ggml_nbytes(x));
     ggml_backend_tensor_set(z, zdata.data(), 0, ggml_nbytes(z));
+    if (rw) {
+        ggml_backend_tensor_set(rw, rms_weight->data(), 0, ggml_nbytes(rw));
+    }
 
     ggml_backend_graph_compute(backend, gf);
     ggml_backend_synchronize(backend);
@@ -248,6 +257,8 @@ static bool test_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, int
     std::vector<float> xdata(K * M), zdata(N * M);
     for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
     for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    std::vector<float> rms_weight(N);
+    for (auto & v : rms_weight) v = (float)(rand() % 2000 - 1000) / 1000.0f;
 
     std::vector<float> h, stats;
     std::vector<float> h_ref, stats_ref;
@@ -299,22 +310,32 @@ static bool test_rms_consumer(ggml_backend_t backend, ggml_type wtype, int K, in
     std::vector<float> xdata(K * M), zdata(N * M);
     for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
     for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    std::vector<float> rms_weight(N);
+    for (auto & v : rms_weight) v = (float)(rand() % 2000 - 1000) / 1000.0f;
 
     std::vector<float> h_ref, stats_ref, norm_ref;
     std::vector<float> h, stats, norm;
+    std::vector<float> weighted_ref, weighted;
     run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h_ref, stats_ref,
                          /*fused_side_output=*/false, nullptr, 0, &norm_ref,
                          /*consume_partial_stats=*/false);
     run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
                          /*fused_side_output=*/true, nullptr, 0, &norm,
                          /*consume_partial_stats=*/true);
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h_ref, stats_ref,
+                         /*fused_side_output=*/false, nullptr, 0, &weighted_ref,
+                         /*consume_partial_stats=*/false, nullptr, &rms_weight);
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
+                         /*fused_side_output=*/true, nullptr, 0, &weighted,
+                         /*consume_partial_stats=*/true, nullptr, &rms_weight);
 
     const float h_rel = relative_diff(h_ref, h);
     const float s_rel = relative_diff(stats_ref, stats);
     const float norm_rel = relative_diff(norm_ref, norm);
-    const bool pass = h_rel < 1e-5f && s_rel < 1e-5f && norm_rel < 2e-5f;
-    printf("[coda_rms_consume] %-8s N=%4d M=%4d block=%3d h_rel=%.2e stats_rel=%.2e norm_rel=%.2e %s\n",
-           ggml_type_name(wtype), N, M, block, h_rel, s_rel, norm_rel, pass ? "PASS" : "FAIL");
+    const float weighted_rel = relative_diff(weighted_ref, weighted);
+    const bool pass = h_rel < 1e-5f && s_rel < 1e-5f && norm_rel < 2e-5f && weighted_rel < 2e-5f;
+    printf("[coda_rms_consume] %-8s N=%4d M=%4d block=%3d h_rel=%.2e stats_rel=%.2e norm_rel=%.2e weighted_rel=%.2e %s\n",
+           ggml_type_name(wtype), N, M, block, h_rel, s_rel, norm_rel, weighted_rel, pass ? "PASS" : "FAIL");
     return pass;
 }
 
@@ -333,22 +354,32 @@ static bool test_tagged_rms_consumer(ggml_backend_t backend) {
     std::vector<float> xdata(K * M), zdata(N * M);
     for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
     for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    std::vector<float> rms_weight(N);
+    for (auto & v : rms_weight) v = (float)(rand() % 2000 - 1000) / 1000.0f;
 
     std::vector<float> h_ref, stats_ref, norm_ref;
     std::vector<float> h, stats, norm;
+    std::vector<float> weighted_ref, weighted;
     run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h_ref, stats_ref,
                          /*fused_side_output=*/false, nullptr, 0, &norm_ref,
                          /*consume_partial_stats=*/false, tag);
     run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
                          /*fused_side_output=*/true, nullptr, 0, &norm,
                          /*consume_partial_stats=*/true, tag);
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h_ref, stats_ref,
+                         /*fused_side_output=*/false, nullptr, 0, &weighted_ref,
+                         /*consume_partial_stats=*/false, tag, &rms_weight);
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
+                         /*fused_side_output=*/true, nullptr, 0, &weighted,
+                         /*consume_partial_stats=*/true, tag, &rms_weight);
 
     const float h_rel = relative_diff(h_ref, h);
     const float s_rel = relative_diff(stats_ref, stats);
     const float norm_rel = relative_diff(norm_ref, norm);
-    const bool pass = h_rel < 1e-5f && s_rel < 1e-5f && norm_rel < 2e-5f;
-    printf("[coda_rms_tagged] tag=%s h_rel=%.2e stats_rel=%.2e norm_rel=%.2e %s\n",
-           tag, h_rel, s_rel, norm_rel, pass ? "PASS" : "FAIL");
+    const float weighted_rel = relative_diff(weighted_ref, weighted);
+    const bool pass = h_rel < 1e-5f && s_rel < 1e-5f && norm_rel < 2e-5f && weighted_rel < 2e-5f;
+    printf("[coda_rms_tagged] tag=%s h_rel=%.2e stats_rel=%.2e norm_rel=%.2e weighted_rel=%.2e %s\n",
+           tag, h_rel, s_rel, norm_rel, weighted_rel, pass ? "PASS" : "FAIL");
     return pass;
 }
 
@@ -360,6 +391,8 @@ static void bench_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, in
     std::vector<float> xdata(K * M), zdata(N * M);
     for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
     for (auto & v : zdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
+    std::vector<float> rms_weight(N);
+    for (auto & v : rms_weight) v = (float)(rand() % 2000 - 1000) / 1000.0f;
 
     std::vector<float> h, stats;
     double ms = 0.0;
@@ -381,6 +414,14 @@ static void bench_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, in
     run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
                          /*fused_side_output=*/true, &consume_ms, 200, &norm,
                          /*consume_partial_stats=*/true);
+    double consume_weight_ms = 0.0;
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
+                         /*fused_side_output=*/true, &consume_weight_ms, 200, &norm,
+                         /*consume_partial_stats=*/true, nullptr, &rms_weight);
+    double fused_weight_norm_ms = 0.0;
+    run_two_output_graph(backend, wtype, K, N, M, block, wbytes, xdata, zdata, h, stats,
+                         /*fused_side_output=*/true, &fused_weight_norm_ms, 200, &norm,
+                         /*consume_partial_stats=*/false, nullptr, &rms_weight);
     const double residual_ms = bench_residual_only(backend, wtype, K, N, M, wbytes, xdata, zdata, 200);
     printf("[bench_rms_side] wtype=%-6s K=%4d N=%4d M=%4d block=%3d  residual=%.4f ms composed=%.4f ms fused=%.4f ms fused/residual=%.2fx fused/composed=%.2fx\n",
            ggml_type_name(wtype), K, N, M, block, residual_ms, ms, fused_ms,
@@ -390,6 +431,9 @@ static void bench_two_outputs(ggml_backend_t backend, ggml_type wtype, int K, in
            ggml_type_name(wtype), K, N, M, block, composed_norm_ms, fused_norm_ms, consume_ms,
            fused_norm_ms > 0.0 ? consume_ms / fused_norm_ms : 0.0,
            composed_norm_ms > 0.0 ? consume_ms / composed_norm_ms : 0.0);
+    printf("[bench_rms_consume_weight] wtype=%-6s K=%4d N=%4d M=%4d block=%3d  fused+norm_mul=%.4f ms fused+consume_mul=%.4f ms consume_mul/fused_norm_mul=%.2fx\n",
+           ggml_type_name(wtype), K, N, M, block, fused_weight_norm_ms, consume_weight_ms,
+           fused_weight_norm_ms > 0.0 ? consume_weight_ms / fused_weight_norm_ms : 0.0);
 }
 
 int main() {

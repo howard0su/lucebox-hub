@@ -240,6 +240,15 @@ than a proven material gain. The actionable result is that residual/RMS are curr
 the e2e regressors; RMS in particular raises verify compute by ~4-5 ms, so the next
 CODA step is to fuse the RMS partial-stats consumer with RMS weight multiplication.
 
+**RMS partial-stats consumer + weight multiply**: a follow-up CUDA path fuses
+`RMSNorm(from partial stats) * weight` for the tagged qwen/qwen35 graph pattern. Correctness
+passes with weighted rel ~3e-7, and debug confirms the fused RMS+MUL dispatch is engaged.
+Synthetic timing is mixed: M=32 ratio 0.98x vs normal fused RMSNorm+MUL, M=128 1.17x
+(worse), M=512 0.92x. Fresh e2e still regresses: baseline 75.01 tok/s vs
+`DFLASH_CODA_RMS=1` 72.47 tok/s, verify compute 84.46 ms vs 90.40 ms. This means the
+remaining RMS bottleneck is not the separate weight multiply alone; optimize partial-stat
+writing/scheduling before treating RMS CODA as an e2e performance win.
+
 ## Reproducibility
 
 - Deterministic: greedy decode + greedy verify. Same prompts + same weights + same binary = same numbers ±1 tok/s.
