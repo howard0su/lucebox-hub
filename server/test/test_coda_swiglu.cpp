@@ -5,6 +5,7 @@
 //   qwen3    : SWIGLU       silu(gate(x)) * up(x)        -> ggml_glu_split(..., SWIGLU)
 //   gemma4   : GEGLU        gelu(gate(x)) * up(x)        -> ggml_glu_split(..., GEGLU)
 //   deepseek4: clamped SWIGLU silu(clamp(gate)) * clamp(up) -> clamp + ggml_glu_split(..., SWIGLU)
+//   laguna/qwen35moe: packed SWIGLU on one [gate|up] matmul -> ggml_swiglu(...)
 //
 // qwen3/gemma4 produce the backend-fusible {MUL_MAT, MUL_MAT, GLU} pattern; the
 // deepseek4 clamps intentionally remain explicit, so only the activation itself
@@ -26,6 +27,7 @@ enum class GluCase {
     SWIGLU,
     GEGLU,
     CLAMPED_SWIGLU,
+    PACKED_SWIGLU,
 };
 
 static const char * case_name(GluCase c) {
@@ -33,6 +35,7 @@ static const char * case_name(GluCase c) {
         case GluCase::SWIGLU:         return "swiglu";
         case GluCase::GEGLU:          return "geglu";
         case GluCase::CLAMPED_SWIGLU: return "clamped_swiglu";
+        case GluCase::PACKED_SWIGLU:  return "packed_swiglu";
     }
     return "unknown";
 }
@@ -67,15 +70,59 @@ static void run_glu_graph(ggml_backend_t backend, GluCase which, bool fused,
     ggml_init_params params = { ctx_size, nullptr, /*no_alloc=*/true };
     ggml_context * ctx = ggml_init(params);
 
-    ggml_tensor * Wg = ggml_new_tensor_2d(ctx, wtype, K, N);
-    ggml_tensor * Wu = ggml_new_tensor_2d(ctx, wtype, K, N);
+    const int n_out_wg = which == GluCase::PACKED_SWIGLU ? 2 * N : N;
+    ggml_tensor * Wg = ggml_new_tensor_2d(ctx, wtype, K, n_out_wg);
+    ggml_tensor * Wu = which == GluCase::PACKED_SWIGLU ? nullptr : ggml_new_tensor_2d(ctx, wtype, K, N);
     ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
     ggml_set_input(Wg);
-    ggml_set_input(Wu);
+    if (Wu) ggml_set_input(Wu);
     ggml_set_input(x);
 
     ggml_tensor * gate = ggml_mul_mat(ctx, Wg, x);
-    ggml_tensor * up   = ggml_mul_mat(ctx, Wu, x);
+    ggml_tensor * up   = nullptr;
+
+    if (which == GluCase::PACKED_SWIGLU) {
+        if (fused) {
+            ggml_tensor * result = ggml_swiglu(ctx, gate);
+            ggml_set_output(result);
+
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, result);
+
+            ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            ggml_gallocr_alloc_graph(alloc, gf);
+
+            ggml_backend_tensor_set(Wg, Wg_data.data(), 0, ggml_nbytes(Wg));
+            ggml_backend_tensor_set(x,  xdata.data(),  0, ggml_nbytes(x));
+
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+
+            out.resize(ggml_nelements(result));
+            ggml_backend_tensor_get(result, out.data(), 0, out.size() * sizeof(float));
+
+            if (ms_per_iter && iters > 0) {
+                for (int it = 0; it < 5; ++it) ggml_backend_graph_compute(backend, gf);
+                ggml_backend_synchronize(backend);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                for (int it = 0; it < iters; ++it) ggml_backend_graph_compute(backend, gf);
+                ggml_backend_synchronize(backend);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                *ms_per_iter = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+            }
+
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+            return;
+        }
+
+        gate = ggml_view_2d(ctx, gate, N, M, gate->nb[1], 0);
+        up   = ggml_view_2d(ctx, gate->view_src, N, M, gate->nb[1], (size_t) N * ggml_element_size(gate));
+        gate = ggml_cont(ctx, gate);
+        up   = ggml_cont(ctx, up);
+    } else {
+        up = ggml_mul_mat(ctx, Wu, x);
+    }
 
     if (which == GluCase::CLAMPED_SWIGLU) {
         constexpr float limit = 10.0f;
@@ -99,7 +146,7 @@ static void run_glu_graph(ggml_backend_t backend, GluCase which, bool fused,
     ggml_gallocr_alloc_graph(alloc, gf);
 
     ggml_backend_tensor_set(Wg, Wg_data.data(), 0, ggml_nbytes(Wg));
-    ggml_backend_tensor_set(Wu, Wu_data.data(), 0, ggml_nbytes(Wu));
+    if (Wu) ggml_backend_tensor_set(Wu, Wu_data.data(), 0, ggml_nbytes(Wu));
     ggml_backend_tensor_set(x,  xdata.data(),  0, ggml_nbytes(x));
 
     ggml_backend_graph_compute(backend, gf);
@@ -126,8 +173,8 @@ static bool test_glu_fusion(ggml_backend_t backend, GluCase which,
                             ggml_type wtype, int K, int N, int M) {
     srand(1234);
     std::vector<uint8_t> Wg_data, Wu_data;
-    make_weight(wtype, K, N, Wg_data);
-    make_weight(wtype, K, N, Wu_data);
+    make_weight(wtype, K, which == GluCase::PACKED_SWIGLU ? 2 * N : N, Wg_data);
+    if (which != GluCase::PACKED_SWIGLU) make_weight(wtype, K, N, Wu_data);
     std::vector<float> xdata(K * M);
     for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
 
@@ -159,8 +206,8 @@ static void bench_glu_fusion(ggml_backend_t backend, GluCase which,
                              ggml_type wtype, int K, int N, int M) {
     srand(1234);
     std::vector<uint8_t> Wg_data, Wu_data;
-    make_weight(wtype, K, N, Wg_data);
-    make_weight(wtype, K, N, Wu_data);
+    make_weight(wtype, K, which == GluCase::PACKED_SWIGLU ? 2 * N : N, Wg_data);
+    if (which != GluCase::PACKED_SWIGLU) make_weight(wtype, K, N, Wu_data);
     std::vector<float> xdata(K * M);
     for (auto & v : xdata) v = (float)(rand() % 2000 - 1000) / 1000.0f;
 
@@ -182,7 +229,7 @@ int main() {
     }
 
     bool ok = true;
-    for (GluCase which : { GluCase::SWIGLU, GluCase::GEGLU, GluCase::CLAMPED_SWIGLU }) {
+    for (GluCase which : { GluCase::SWIGLU, GluCase::GEGLU, GluCase::CLAMPED_SWIGLU, GluCase::PACKED_SWIGLU }) {
         for (int M : {1, 8, 32}) {
             ok &= test_glu_fusion(backend, which, GGML_TYPE_Q4_K, 512, 256, M);
         }
@@ -192,7 +239,7 @@ int main() {
     }
 
     printf("\n");
-    for (GluCase which : { GluCase::SWIGLU, GluCase::GEGLU, GluCase::CLAMPED_SWIGLU }) {
+    for (GluCase which : { GluCase::SWIGLU, GluCase::GEGLU, GluCase::CLAMPED_SWIGLU, GluCase::PACKED_SWIGLU }) {
         for (int M : {1, 32}) {
             bench_glu_fusion(backend, which, GGML_TYPE_Q4_K, 512, 256, M);
         }

@@ -201,6 +201,7 @@ What engages when `DFLASH_CODA` is set:
 | Pattern | Path | How |
 | --- | --- | --- |
 | **SwiGLU** (§3.2.2): `silu(gate) * up` | prefill + decode | qwen35 and qwen3 emit `ggml_glu_split(..., SWIGLU)`, triggering ggml's fused `{MUL_MAT, MUL_MAT, GLU}` kernel. qwen35 only does this when gate/up weight scales are 1.0 (non-NVFP4). Laguna and qwen35moe already used `ggml_swiglu_split`. |
+| **Packed SwiGLU**: `silu(gate) * up` from one `[gate\|up]` projection | decode / MoE hot paths | Laguna shared-expert and qwen35moe combined gate-up paths use `ggml_swiglu(...)` on the packed projection output, eliminating split views / cont copies while preserving exact `silu(gate) * up` semantics. |
 | **GEGLU**: `gelu(gate) * up` | prefill + decode | gemma4 emits `ggml_glu_split(..., GEGLU)` for dense/shared FFN and per-layer injection. Dense/shared FFN uses `{MUL_MAT, MUL_MAT, GLU}`; per-layer injection and routed combined-gate-up paths get activation-level GLU fusion. |
 | **Clamped SwiGLU**: `silu(clamp(gate)) * clamp(up)` | prefill + decode | deepseek4 keeps the asymmetric clamps explicit and uses `ggml_glu_split(..., SWIGLU)` after them. This is exact; it is **not** `SWIGLU_OAI`. Clamp nodes prevent GEMM-epilogue fusion, but collapse the activation from `{SILU, MUL}` into one GLU op. |
 | **GEMM-Residual** (§3.2.1): `mul_mat(W,x) + residual` | decode (M=1) | Already fused upstream via the mmvq (`{MUL_MAT, ADD}`) mat-vec epilogue. |
@@ -222,7 +223,7 @@ synthetic tensors, so they run without the 27B model:
 ```bash
 cd server/build
 
-# GLU-family fusion: SWIGLU, GEGLU, clamped SWIGLU correctness + microbenchmarks
+# GLU-family fusion: SWIGLU, GEGLU, clamped SWIGLU, packed SWIGLU correctness + microbenchmarks
 ./test_coda_swiglu
 
 # GEMM-Residual mmq epilogue: GPU fused-vs-unfused parity (rel ~1e-7) + GPU-vs-CPU

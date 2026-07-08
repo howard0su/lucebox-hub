@@ -149,6 +149,7 @@ Q4_K:
 | Check | Result |
 |-------|--------|
 | SWIGLU fused vs unfused graph (qwen3/qwen35 shape, Q4_K) | bit-exact (M=1/8/32) |
+| packed SWIGLU fused vs split-view baseline (Laguna/qwen35moe shape, Q4_K) | bit-exact (M=1/8/32) |
 | GEGLU fused vs unfused graph (gemma4 shape, Q4_K) | bit-exact (M=1/8/32) |
 | clamped SWIGLU fused vs unfused graph (deepseek4 shape, Q4_K) | bit-exact (M=1/8/32) |
 | mmq residual epilogue: GPU fused vs unfused GEMM+add | rel ~1e-7 (M=1..512), essentially exact |
@@ -166,6 +167,8 @@ Q4_K K=512 N=256, 200 iters):
 | GEGLU | 32 | 0.214 | 0.129 | 1.66× |
 | clamped SWIGLU | 1  | 0.188 | 0.124 | 1.51× |
 | clamped SWIGLU | 32 | 0.226 | 0.152 | 1.49× |
+| packed SWIGLU | 1  | 0.186 | 0.071 | 2.61× |
+| packed SWIGLU | 32 | 0.189 | 0.118 | 1.60× |
 
 **Residual microbenchmark** (full-graph wall-clock, RTX 2080 Ti, 200 iters, noisy at
 these small sizes — the residual add is cheap vs Q4_K weight traffic and host launch

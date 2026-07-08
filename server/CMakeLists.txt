@@ -1033,7 +1033,8 @@ if(DFLASH27B_TESTS)
     endif()
 
     # CODA GLU-family fusion correctness + microbenchmark (arXiv:2605.19269 §3.2.2).
-    # Covers SWIGLU (qwen3/qwen35), GEGLU (gemma4), and clamped SWIGLU (deepseek4).
+    # Covers SWIGLU (qwen3/qwen35), GEGLU (gemma4), clamped SWIGLU (deepseek4),
+    # and packed SWIGLU (laguna/qwen35moe).
     # Uses only stock ggml GLU paths, so it runs on any CUDA arch (including sm_75)
     # and needs no model weights.
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda"
