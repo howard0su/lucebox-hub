@@ -220,6 +220,26 @@ adjacencies keep the normal ggml RMSNorm path.
 The M=512 synthetic regression is small/noisy; wiring is enabled per user direction, with
 shape/adjacency gates to avoid stale or mismatched stats.
 
+**Local `/opt/models` isolated e2e A/B** (`Qwen3.6-27B-Q4_K_M.gguf` target,
+`draft-Qwen3.6-27B.gguf` draft, 26-token prompt, `n_gen=128`, DDTree budget 22,
+max ctx 512, RTX 2080 Ti):
+
+| Case | Env | tok/s | verify compute ms | draft steps | avg commit/step | output vs baseline |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| baseline | unset | 76.24 | 82.67 | 14 | 9.14 | baseline |
+| GLU-only | `DFLASH_CODA_GLU=1` | 76.46 | 82.81 | 14 | 9.14 | matches |
+| residual-only | `DFLASH_CODA_RESIDUAL=1` | 72.36 | 83.08 | 15 | 8.53 | matches |
+| RMS-only | `DFLASH_CODA_RMS=1` | 72.66 | 88.03 | 14 | 9.14 | differs |
+| umbrella | `DFLASH_CODA=1` | 72.87 | 86.92 | 14 | 9.14 | differs |
+| GLU+residual | `DFLASH_CODA_GLU=1 DFLASH_CODA_RESIDUAL=1` | 73.02 | 82.16 | 15 | 8.53 | matches |
+| GLU+RMS | `DFLASH_CODA_GLU=1 DFLASH_CODA_RMS=1` | 73.65 | 87.45 | 14 | 9.14 | differs |
+
+Baseline-vs-GLU repeats were 76.61 tok/s mean baseline vs 76.97 tok/s GLU-only
+(+0.36 tok/s, +0.5%), with matching output tokens. Treat this as noise-range rather
+than a proven material gain. The actionable result is that residual/RMS are currently
+the e2e regressors; RMS in particular raises verify compute by ~4-5 ms, so the next
+CODA step is to fuse the RMS partial-stats consumer with RMS weight multiplication.
+
 ## Reproducibility
 
 - Deterministic: greedy decode + greedy verify. Same prompts + same weights + same binary = same numbers ±1 tok/s.
