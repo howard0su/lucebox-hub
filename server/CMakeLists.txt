@@ -1045,6 +1045,19 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_SRC_INCLUDE_DIRS})
         add_test(NAME coda_swiglu COMMAND test_coda_swiglu)
     endif()
+
+    # CODA GEMM-Residual epilogue unit test + microbenchmark (arXiv:2605.19269 §3.2.1).
+    # Runs on any CUDA arch (incl. sm_75); no model weights needed.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_coda_residual.cpp")
+        add_executable(test_coda_residual test/test_coda_residual.cpp)
+        target_link_libraries(test_coda_residual PRIVATE dflash_common ggml ggml-cuda ggml-base)
+        target_include_directories(test_coda_residual PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        add_test(NAME coda_residual COMMAND test_coda_residual)
+    endif()
     endif()
 endif()
 
