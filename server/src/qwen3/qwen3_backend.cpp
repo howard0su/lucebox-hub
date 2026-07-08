@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 
 namespace dflash::common {
@@ -68,6 +69,47 @@ static ggml_tensor * coda_rms_norm_mul_after_residual(
     }
 
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), weight);
+}
+
+static ggml_tensor * coda_deferred_rms_weight_after_residual(
+    ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * x,
+    ggml_tensor * weight, float eps, const char * tag, bool * deferred) {
+    static const bool coda = coda_feature_enabled("DFLASH_CODA_RMS");
+    if (deferred) {
+        *deferred = false;
+    }
+    constexpr int partial_block = 256;
+    const bool has_mul_mat_residual =
+        x->op == GGML_OP_ADD && x->type == GGML_TYPE_F32 &&
+        x->ne[2] == 1 && x->ne[3] == 1 &&
+        x->ne[1] > 8 && x->ne[0] % partial_block == 0 &&
+        x->src[0] && x->src[1] &&
+        (x->src[0]->op == GGML_OP_MUL_MAT || x->src[1]->op == GGML_OP_MUL_MAT);
+
+    if (coda && gf && tag && has_mul_mat_residual) {
+        ggml_set_name(x, tag);
+        ggml_tensor * partial_ms = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0] / partial_block, x->ne[1]);
+        ggml_format_name(partial_ms, "coda_partial_ms:%s", tag);
+        ggml_set_output(partial_ms);
+        ggml_build_forward_expand(gf, partial_ms);
+        if (deferred) {
+            *deferred = true;
+        }
+        return ggml_mul(ctx, x, weight);
+    }
+
+    return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), weight);
+}
+
+static ggml_tensor * coda_apply_deferred_rstd(
+    ggml_context * ctx, ggml_tensor * x, float eps, const char * tag, bool deferred) {
+    if (!deferred || !tag) {
+        return x;
+    }
+    ggml_tensor * y = ggml_scale(ctx, x, 1.0f);
+    ggml_format_name(y, "coda_apply_rstd:%s", tag);
+    std::memcpy(y->op_params + 1, &eps, sizeof(float));
+    return y;
 }
 
 // ── Cache management ───────────────────────────────────────────────────
@@ -260,14 +302,18 @@ bool Qwen3Backend::do_step(const float * embed, int n_tokens, int kv_start,
         // Pre-attention norm
         char coda_tag[64];
         snprintf(coda_tag, sizeof(coda_tag), "qwen3_l%d_pre_attn", il);
+        bool pre_attn_deferred = false;
         ggml_tensor * normed = il > 0
-            ? coda_rms_norm_mul_after_residual(ctx, gf, cur, L.attn_norm, eps, coda_tag)
+            ? coda_deferred_rms_weight_after_residual(ctx, gf, cur, L.attn_norm, eps, coda_tag, &pre_attn_deferred)
             : ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), L.attn_norm);
 
         // Q/K/V projections
         ggml_tensor * Q = ggml_mul_mat(ctx, L.wq, normed);  // [H*D, n_tokens]
         ggml_tensor * K = ggml_mul_mat(ctx, L.wk, normed);  // [Hk*D, n_tokens]
         ggml_tensor * V = ggml_mul_mat(ctx, L.wv, normed);  // [Hk*D, n_tokens]
+        Q = coda_apply_deferred_rstd(ctx, Q, eps, coda_tag, pre_attn_deferred);
+        K = coda_apply_deferred_rstd(ctx, K, eps, coda_tag, pre_attn_deferred);
+        V = coda_apply_deferred_rstd(ctx, V, eps, coda_tag, pre_attn_deferred);
 
         // Reshape to [D, heads, n_tokens]
         Q = ggml_reshape_3d(ctx, Q, D, H, n_tokens);

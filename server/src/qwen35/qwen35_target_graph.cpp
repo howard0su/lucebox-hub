@@ -1320,10 +1320,14 @@ QwenGraphOutputs build_qwen35_graph(
 
     // 2. Final norm
     ggml_tensor * out = nullptr;
+    bool final_deferred = false;
+    char final_coda_tag[64] = {};
     if (w.n_layer > 0) {
-        char coda_tag[64];
-        snprintf(coda_tag, sizeof(coda_tag), "q35_l%d_final", w.n_layer - 1);
-        out = coda_rms_norm_mul_after_residual(ctx, gf, inpL, w.out_norm, w.rms_eps, coda_tag);
+        snprintf(final_coda_tag, sizeof(final_coda_tag), "q35_l%d_final", w.n_layer - 1);
+        const bool can_defer_final = w.output && !(in.last_token_logits_only && n_tokens > 1);
+        out = can_defer_final
+            ? coda_deferred_rms_weight_after_residual(ctx, gf, inpL, w.out_norm, w.rms_eps, final_coda_tag, &final_deferred)
+            : coda_rms_norm_mul_after_residual(ctx, gf, inpL, w.out_norm, w.rms_eps, final_coda_tag);
     } else {
         out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
     }
@@ -1338,6 +1342,7 @@ QwenGraphOutputs build_qwen35_graph(
                                (size_t)(n_tokens - 1) * out->nb[1]);
         }
         logits = ggml_mul_mat(ctx, w.output, out);
+        logits = coda_apply_deferred_rstd(ctx, logits, w.rms_eps, final_coda_tag, final_deferred);
         ggml_set_name(logits, "logits");
         ggml_build_forward_expand(gf, logits);
     } else {

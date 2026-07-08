@@ -272,7 +272,14 @@ fires. Model-free timings on RTX 2080 Ti for K=N=N2=1024:
 | 512 | 0.3246 ms | 0.2957 ms | 0.91× |
 
 This is the first CODA RMS variant with a consistent model-free win; it is not wired into
-qwen/qwen35 model graphs yet.
+all qwen/qwen35 model graphs. Safe wiring now exists for qwen3 pre-attention Q/K/V
+projections and qwen35 final LM-head when logits are computed for the same token span.
+qwen35 packed Q+gate attention and all FFN pre-norm sites remain on the materialized RMS
+path because deferring `rstd` through nonlinear gate/SwiGLU branches changes semantics.
+The default DFlash `/opt/models` decode path still shows no deferred-rstd engagement in
+qwen35 because it computes last-token-only logits; `DFLASH_CODA_RMS=1` remains an e2e
+regressor there (64-token local check: 63.73 tok/s baseline vs 54.43 tok/s RMS, output
+tokens match).
 
 ## Reproducibility
 

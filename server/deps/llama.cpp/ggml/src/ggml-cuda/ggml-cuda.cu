@@ -4347,12 +4347,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         }
                         if (partial_block > 0) {
                             static const bool coda_debug = (getenv("DFLASH_CODA_DEBUG") != nullptr);
+                            float eps = 1e-5f;
+                            memcpy(&eps, node->op_params + 1, sizeof(float));
                             if (coda_debug) {
-                                fprintf(stderr, "[CODA] deferred RMS rstd after GEMM: M=%d N=%d stats=%d\n",
+                                fprintf(stderr, "[CODA] deferred RMS rstd after GEMM: M=%d N=%d stats=%d eps=%.2e\n",
                                         (int) node->src[0]->ne[1], (int) node->src[0]->ne[0],
-                                        (int) partial_ms->ne[0]);
+                                        (int) partial_ms->ne[0], eps);
                             }
-                            ggml_cuda_op_coda_apply_rstd(*cuda_ctx, node, partial_ms, partial_block, 1e-5f);
+                            ggml_cuda_op_coda_apply_rstd(*cuda_ctx, node, partial_ms, partial_block, eps);
                             continue;
                         }
                     }
