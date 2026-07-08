@@ -1031,6 +1031,20 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
+
+    # CODA SwiGLU-GEMM fusion correctness (arXiv:2605.19269 §3.2.2). Uses only the
+    # stock ggml {MUL_MAT, MUL_MAT, GLU} fusion, so it runs on any CUDA arch
+    # (including sm_75) and needs no model weights.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_coda_swiglu.cpp")
+        add_executable(test_coda_swiglu test/test_coda_swiglu.cpp)
+        target_link_libraries(test_coda_swiglu PRIVATE dflash_common ggml ggml-cuda ggml-base)
+        target_include_directories(test_coda_swiglu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        add_test(NAME coda_swiglu COMMAND test_coda_swiglu)
+    endif()
     endif()
 endif()
 
