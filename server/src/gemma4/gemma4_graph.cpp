@@ -37,6 +37,10 @@ namespace dflash::common {
 
 static constexpr float GEMMA4_EPS = 1e-6f;
 
+static bool coda_feature_enabled(const char * feature_env) {
+    return std::getenv("DFLASH_CODA") != nullptr || std::getenv(feature_env) != nullptr;
+}
+
 static ggml_tensor * gemma4_rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
                                           ggml_tensor * weight, float eps = GEMMA4_EPS) {
     x = rms_norm_input_f32(ctx, x);
@@ -46,7 +50,7 @@ static ggml_tensor * gemma4_rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
 }
 
 static ggml_tensor * coda_geglu(ggml_context * ctx, ggml_tensor * gate, ggml_tensor * up) {
-    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    static const bool coda = coda_feature_enabled("DFLASH_CODA_GLU");
     if (coda) {
         return ggml_glu_split(ctx, gate, up, GGML_GLU_OP_GEGLU);
     }

@@ -33,6 +33,10 @@
 
 namespace dflash::common {
 
+static bool coda_feature_enabled(const char * feature_env) {
+    return std::getenv("DFLASH_CODA") != nullptr || std::getenv(feature_env) != nullptr;
+}
+
 namespace {
 using Ds4TimingClock = std::chrono::steady_clock;
 
@@ -433,10 +437,10 @@ static ggml_tensor * build_clamped_swiglu(ggml_context * ctx,
     up   = ggml_clamp(ctx, up,   -clamp, clamp);
     // This is not ggml_swiglu_oai: DS4 uses silu(gate) * up after asymmetric
     // clamps, while SWIGLU_OAI uses silu_alpha(x) * (1 + g). Keep the clamps
-    // explicit and fuse only the exact silu*mul activation when DFLASH_CODA is
-    // enabled. The clamp nodes prevent a GEMM-epilogue fusion, but this still
+    // explicit and fuse only the exact silu*mul activation when DFLASH_CODA_GLU
+    // (or umbrella DFLASH_CODA) is enabled. The clamp nodes prevent a GEMM-epilogue fusion, but this still
     // collapses the activation from {SILU, MUL} into a single GLU op.
-    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    static const bool coda = coda_feature_enabled("DFLASH_CODA_GLU");
     if (coda) {
         return ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
     }

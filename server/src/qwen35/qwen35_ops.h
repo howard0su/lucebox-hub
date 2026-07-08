@@ -9,6 +9,10 @@
 
 namespace dflash::common {
 
+inline bool coda_feature_enabled(const char * feature_env) {
+    return std::getenv("DFLASH_CODA") != nullptr || std::getenv(feature_env) != nullptr;
+}
+
 inline ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
                                   ggml_tensor * weight, float eps) {
     x = rms_norm_input_f32(ctx, x);
@@ -23,7 +27,7 @@ inline ggml_tensor * coda_rms_norm_mul_after_residual(
     x = rms_norm_input_f32(ctx, x);
     weight = graph_tensor_f32(ctx, weight);
 
-    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    static const bool coda = coda_feature_enabled("DFLASH_CODA_RMS");
     constexpr int partial_block = 256;
     const bool has_mul_mat_residual =
         x->op == GGML_OP_ADD && x->type == GGML_TYPE_F32 &&

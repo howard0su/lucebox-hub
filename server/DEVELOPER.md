@@ -193,21 +193,22 @@ CODA ([arXiv:2605.19269](https://arxiv.org/abs/2605.19269) §3) rewrites transfo
 blocks as GEMM-epilogue programs, fusing the memory-bound residual / norm / activation
 work into the surrounding GEMMs so the epilogue is hidden behind the matmul. This repo
 implements the ggml-native subset for the qwen-family, Laguna, Gemma4, and DeepSeek4
-graphs, gated behind the `DFLASH_CODA` environment variable (unset = default, unchanged
-behavior).
+graphs. `DFLASH_CODA` enables the full CODA set; `DFLASH_CODA_GLU`,
+`DFLASH_CODA_RESIDUAL`, and `DFLASH_CODA_RMS` enable the activation, residual-epilogue,
+and RMS partial-stats paths independently. All unset = default, unchanged behavior.
 
-What engages when `DFLASH_CODA` is set:
+What engages:
 
-| Pattern | Path | How |
-| --- | --- | --- |
-| **SwiGLU** (§3.2.2): `silu(gate) * up` | prefill + decode | qwen35 and qwen3 emit `ggml_glu_split(..., SWIGLU)`, triggering ggml's fused `{MUL_MAT, MUL_MAT, GLU}` kernel. qwen35 only does this when gate/up weight scales are 1.0 (non-NVFP4). Laguna and qwen35moe already used `ggml_swiglu_split`. |
-| **Packed SwiGLU**: `silu(gate) * up` from one `[gate\|up]` projection | decode / MoE hot paths | Laguna shared-expert and qwen35moe combined gate-up paths use `ggml_swiglu(...)` on the packed projection output, eliminating split views / cont copies while preserving exact `silu(gate) * up` semantics. |
-| **GEGLU**: `gelu(gate) * up` | prefill + decode | gemma4 emits `ggml_glu_split(..., GEGLU)` for dense/shared FFN and per-layer injection. Dense/shared FFN uses `{MUL_MAT, MUL_MAT, GLU}`; per-layer injection and routed combined-gate-up paths get activation-level GLU fusion. |
-| **Clamped SwiGLU**: `silu(clamp(gate)) * clamp(up)` | prefill + decode | deepseek4 keeps the asymmetric clamps explicit and uses `ggml_glu_split(..., SWIGLU)` after them. This is exact; it is **not** `SWIGLU_OAI`. Clamp nodes prevent GEMM-epilogue fusion, but collapse the activation from `{SILU, MUL}` into one GLU op. |
-| **GEMM-Residual** (§3.2.1): `mul_mat(W,x) + residual` | decode (M=1) | Already fused upstream via the mmvq (`{MUL_MAT, ADD}`) mat-vec epilogue. |
-| **GEMM-Residual** (§3.2.1) | prefill / verify (M>1) | Forked `mmq` kernel adds a dst-shaped residual in its write-back epilogue. Detected automatically from any `{MUL_MAT, ADD}` with a contiguous, dst-shaped residual (non-MoE); **no graph rewrite needed** for pre-norm qwen/laguna/deepseek dense projections. Gemma4's sandwich/post-norm breaks this adjacency. |
-| **GEMM-Residual + RMS partial stats** (§3.2.1 prototype) | prefill / verify (quantized mmq, M>8) | A named graph side-output tensor `coda_partial_ms` lets the mmq residual epilogue also write per-token partial mean-square blocks over `h = mul_mat(W,x)+residual`. This validates ggml multi-output graph lifetime and the CODA RMSNorm stats path before adding a model graph rewrite. |
-| **RMS partial-stats consumer** (§3.2.1) | prefill / verify (qwen/qwen35 eligible residual→norm sites) | A CUDA RMSNorm helper consumes tagged `coda_partial_ms:<tag>` side outputs by reducing block means instead of recomputing `sum(h^2)` over all features. qwen35 and qwen3 graph builders emit tagged side-output/consumer pairs behind `DFLASH_CODA` only when the residual input is a direct `{MUL_MAT, ADD}` with M>8 and 256-feature block alignment. |
+| Pattern | Gate | Path | How |
+| --- | --- | --- | --- |
+| **SwiGLU** (§3.2.2): `silu(gate) * up` | `DFLASH_CODA_GLU` or umbrella | prefill + decode | qwen35 and qwen3 emit `ggml_glu_split(..., SWIGLU)`, triggering ggml's fused `{MUL_MAT, MUL_MAT, GLU}` kernel. qwen35 only does this when gate/up weight scales are 1.0 (non-NVFP4). Laguna and qwen35moe already used `ggml_swiglu_split`. |
+| **Packed SwiGLU**: `silu(gate) * up` from one `[gate\|up]` projection | `DFLASH_CODA_GLU` or umbrella | decode / MoE hot paths | Laguna shared-expert and qwen35moe combined gate-up paths use `ggml_swiglu(...)` on the packed projection output, eliminating split views / cont copies while preserving exact `silu(gate) * up` semantics. |
+| **GEGLU**: `gelu(gate) * up` | `DFLASH_CODA_GLU` or umbrella | prefill + decode | gemma4 emits `ggml_glu_split(..., GEGLU)` for dense/shared FFN and per-layer injection. Dense/shared FFN uses `{MUL_MAT, MUL_MAT, GLU}`; per-layer injection and routed combined-gate-up paths get activation-level GLU fusion. |
+| **Clamped SwiGLU**: `silu(clamp(gate)) * clamp(up)` | `DFLASH_CODA_GLU` or umbrella | prefill + decode | deepseek4 keeps the asymmetric clamps explicit and uses `ggml_glu_split(..., SWIGLU)` after them. This is exact; it is **not** `SWIGLU_OAI`. Clamp nodes prevent GEMM-epilogue fusion, but collapse the activation from `{SILU, MUL}` into one GLU op. |
+| **GEMM-Residual** (§3.2.1): `mul_mat(W,x) + residual` | existing upstream path | decode (M=1) | Already fused upstream via the mmvq (`{MUL_MAT, ADD}`) mat-vec epilogue. |
+| **GEMM-Residual** (§3.2.1) | `DFLASH_CODA_RESIDUAL`, `DFLASH_CODA_RMS`, or umbrella | prefill / verify (M>1) | Forked `mmq` kernel adds a dst-shaped residual in its write-back epilogue. Detected automatically from any `{MUL_MAT, ADD}` with a contiguous, dst-shaped residual (non-MoE); **no graph rewrite needed** for pre-norm qwen/laguna/deepseek dense projections. Gemma4's sandwich/post-norm breaks this adjacency. |
+| **GEMM-Residual + RMS partial stats** (§3.2.1 prototype) | `DFLASH_CODA_RMS` or umbrella | prefill / verify (quantized mmq, M>8) | A named graph side-output tensor `coda_partial_ms:<tag>` lets the mmq residual epilogue also write per-token partial mean-square blocks over `h = mul_mat(W,x)+residual`. This validates ggml multi-output graph lifetime and the CODA RMSNorm stats path. |
+| **RMS partial-stats consumer** (§3.2.1) | `DFLASH_CODA_RMS` or umbrella | prefill / verify (qwen/qwen35 eligible residual→norm sites) | A CUDA RMSNorm helper consumes tagged `coda_partial_ms:<tag>` side outputs by reducing block means instead of recomputing `sum(h^2)` over all features. qwen35 and qwen3 graph builders emit tagged side-output/consumer pairs only when the residual input is a direct `{MUL_MAT, ADD}` with M>8 and 256-feature block alignment. |
 
 Set `DFLASH_CODA_DEBUG=1` to trace when the forked mmq residual epilogue engages.
 Set `GGML_CUDA_DISABLE_FUSION=1` to disable all ggml-cuda fusion (baseline).
@@ -228,17 +229,17 @@ synthetic tensors, so they run without the 27B model:
 cd server/build
 
 # GLU-family fusion: SWIGLU, GEGLU, clamped SWIGLU, packed SWIGLU correctness + microbenchmarks
-./test_coda_swiglu
+DFLASH_CODA_GLU=1 ./test_coda_swiglu
 
 # GEMM-Residual mmq epilogue: GPU fused-vs-unfused parity (rel ~1e-7) + GPU-vs-CPU
-DFLASH_CODA=1 ./test_coda_residual              # exercise the fused mmq path (M>1)
-DFLASH_CODA_DEBUG=1 DFLASH_CODA=1 ./test_coda_residual   # + trace engagement
+DFLASH_CODA_RESIDUAL=1 ./test_coda_residual              # exercise the fused mmq path (M>1)
+DFLASH_CODA_DEBUG=1 DFLASH_CODA_RESIDUAL=1 ./test_coda_residual   # + trace engagement
 GGML_CUDA_DISABLE_FUSION=1 ./test_coda_residual # unfused baseline (bench compare)
 
 # CODA RMS side-output/consumer: validates two observable graph outputs, quantized
 # mmq residual+partial-mean-square side-output, tagged graph association, and
 # RMSNorm consumption of those partial stats.
-DFLASH_CODA=1 ./test_coda_rms_side_output
+DFLASH_CODA_RMS=1 ./test_coda_rms_side_output
 ```
 
 End-to-end logit/token parity and paper-aligned block / prefill-decode perf require the

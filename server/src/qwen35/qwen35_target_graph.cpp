@@ -514,11 +514,12 @@ static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
     // CODA §3.2.2: express gate/up + SwiGLU as {MUL_MAT, MUL_MAT, GLU} so the
     // ggml-cuda backend fuses the pairwise silu*mul activation into the gate/up
-    // GEMM epilogue (ggml_cuda_should_fuse_mul_mat). Enabled via DFLASH_CODA.
+    // GEMM epilogue (ggml_cuda_should_fuse_mul_mat). Enabled via DFLASH_CODA_GLU
+    // or umbrella DFLASH_CODA.
     // Only valid when the per-tensor dequant scales are trivial (non-NVFP4); for
     // NVFP4 (scale != 1) the ggml_scale node breaks the fusible pattern, so we
     // keep the original silu/mul path.
-    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    static const bool coda = coda_feature_enabled("DFLASH_CODA_GLU");
     if (coda && L.w_gate_s == 1.0f && L.w_up_s == 1.0f) {
         ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
         ggml_tensor * up   = ggml_mul_mat(ctx, L.w_up, cur);

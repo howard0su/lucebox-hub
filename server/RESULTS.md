@@ -136,11 +136,12 @@ Starting point: Chain DFlash at 112.8 tok/s mean on HumanEval, AL 7.67.
 | Budget 20 → 22, f16 intermediate                | +5.5    | +0.24| f16 cuts intermediate bandwidth in half |
 | **Total**                                       | **+16.7** | **+0.64** | **129.5 tok/s, AL 8.31 (HumanEval mean, fresh run)** |
 
-## CODA fused kernels (`DFLASH_CODA`) — local model-free validation
+## CODA fused kernels (`DFLASH_CODA*`) — local model-free validation
 
 CODA ([arXiv:2605.19269](https://arxiv.org/abs/2605.19269) §3) block-as-GEMM-epilogue
-fusions for qwen-family / Laguna / Gemma4 / DeepSeek4 graphs, gated behind
-`DFLASH_CODA`. See `DEVELOPER.md` → "CODA fused kernels". The following were
+fusions for qwen-family / Laguna / Gemma4 / DeepSeek4 graphs. `DFLASH_CODA` enables
+the full set; `DFLASH_CODA_GLU`, `DFLASH_CODA_RESIDUAL`, and `DFLASH_CODA_RMS` enable
+the feature families independently. See `DEVELOPER.md` → "CODA fused kernels". The following were
 validated locally on the RTX 2080 Ti (sm_75) with synthetic tensors (no full model),
 Q4_K:
 
@@ -159,6 +160,7 @@ Q4_K:
 | Tagged qwen-style side-output association (`coda_partial_ms:<tag>`) | PASS; h/stats/norm rel ~1e-7 to 1e-6 |
 | ggml two-output graph contract for RMS partial stats | PASS for Q4_K M=1/32/128 and F16 M=32 |
 | Engagement (`DFLASH_CODA_DEBUG`) | fused mmq residual fires for M≥8; M=1 uses mmvq |
+| Split feature flags | PASS: `DFLASH_CODA_GLU=1`, `DFLASH_CODA_RESIDUAL=1`, `DFLASH_CODA_RMS=1`, and umbrella `DFLASH_CODA=1` targeted tests |
 
 **GLU microbenchmark** (`test_coda_swiglu`, full-graph wall-clock, RTX 2080 Ti,
 Q4_K K=512 N=256, 200 iters):
@@ -206,7 +208,7 @@ remaining CODA RMSNorm fusion surface.
 **RMS partial-stats consumer** (same test/shape): the RMSNorm helper reduces
 `N/block` partial means per token instead of recomputing `sum(h^2)` over all `N`
 features. qwen35 and qwen3 now emit tagged side-output/consumer pairs behind
-`DFLASH_CODA` for eligible direct `{MUL_MAT, ADD} → RMSNorm` sites; unsupported
+`DFLASH_CODA_RMS` or umbrella `DFLASH_CODA` for eligible direct `{MUL_MAT, ADD} → RMSNorm` sites; unsupported
 adjacencies keep the normal ggml RMSNorm path.
 
 | M | composed side-output + norm ms | fused side-output + normal norm ms | fused side-output + stats consumer ms | consumer vs fused+norm |

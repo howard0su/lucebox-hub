@@ -3726,6 +3726,10 @@ static ggml_tensor * ggml_cuda_coda_partial_ms_for_tag(const ggml_cgraph * cgrap
     return ggml_graph_get_tensor(cgraph, "coda_partial_ms");
 }
 
+static bool ggml_cuda_coda_feature_enabled(const char * feature_env) {
+    return getenv("DFLASH_CODA") != nullptr || getenv(feature_env) != nullptr;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4205,10 +4209,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                         // CODA (arXiv:2605.19269 §3.2.1): fuse the residual add into the mmq GEMM
                         // epilogue for the prefill/verify (M>1) path, which the mat-vec fusions above
-                        // (decode, M==1) do not cover. Gated behind DFLASH_CODA to keep the default
-                        // path unchanged. Restricted to the non-MoE GGML_OP_MUL_MAT + GGML_OP_ADD
-                        // case with a contiguous, dst-shaped residual. AI-assisted change (private fork).
-                        static const bool dflash_coda = (getenv("DFLASH_CODA") != nullptr);
+                        // (decode, M==1) do not cover. Gated behind DFLASH_CODA_RESIDUAL
+                        // (or umbrella DFLASH_CODA) to keep the default path unchanged. Restricted
+                        // to the non-MoE GGML_OP_MUL_MAT + GGML_OP_ADD case with a contiguous,
+                        // dst-shaped residual. AI-assisted change (private fork).
+                        static const bool dflash_coda = ggml_cuda_coda_feature_enabled("DFLASH_CODA_RESIDUAL") ||
+                                                        ggml_cuda_coda_feature_enabled("DFLASH_CODA_RMS");
                         if (dflash_coda && bias_op == GGML_OP_ADD && ids == nullptr &&
                             ggml_is_quantized(src0->type) &&
                             src1->type == GGML_TYPE_F32 && bias_node->type == GGML_TYPE_F32 &&
@@ -4259,7 +4265,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
-                    static const bool dflash_coda_rms = (getenv("DFLASH_CODA") != nullptr);
+                    static const bool dflash_coda_rms = ggml_cuda_coda_feature_enabled("DFLASH_CODA_RMS");
                     if (dflash_coda_rms && node->op == GGML_OP_RMS_NORM &&
                         strncmp(node->name, "coda_rms_from_partial", strlen("coda_rms_from_partial")) == 0) {
                         const char * tag = nullptr;

@@ -59,10 +59,14 @@ namespace {
 
 constexpr int FA_WINDOW  = 512;
 
+static bool coda_feature_enabled(const char * feature_env) {
+    return std::getenv("DFLASH_CODA") != nullptr || std::getenv(feature_env) != nullptr;
+}
+
 static ggml_tensor * coda_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       ggml_tensor * w_gate, ggml_tensor * w_up,
                                       ggml_tensor * w_down) {
-    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    static const bool coda = coda_feature_enabled("DFLASH_CODA_GLU");
     if (coda) {
         ggml_tensor * gate = ggml_mul_mat(ctx, w_gate, cur);
         ggml_tensor * up   = ggml_mul_mat(ctx, w_up,   cur);
@@ -78,7 +82,7 @@ static ggml_tensor * coda_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
 static ggml_tensor * coda_rms_norm_mul_after_residual(
     ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * x,
     ggml_tensor * weight, float eps, const char * tag) {
-    static const bool coda = (std::getenv("DFLASH_CODA") != nullptr);
+    static const bool coda = coda_feature_enabled("DFLASH_CODA_RMS");
     constexpr int partial_block = 256;
     const bool has_mul_mat_residual =
         x->op == GGML_OP_ADD && x->type == GGML_TYPE_F32 &&
