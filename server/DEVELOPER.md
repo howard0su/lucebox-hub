@@ -187,6 +187,51 @@ python test_multi_turn_prefix_cache.py --url http://localhost:8000
 
 ---
 
+## CODA fused kernels (`DFLASH_CODA`)
+
+CODA ([arXiv:2605.19269](https://arxiv.org/abs/2605.19269) §3) rewrites transformer
+blocks as GEMM-epilogue programs, fusing the memory-bound residual / norm / activation
+work into the surrounding GEMMs so the epilogue is hidden behind the matmul. This repo
+implements the ggml-native subset for the **qwen35** target graph, gated behind the
+`DFLASH_CODA` environment variable (unset = default, unchanged behavior).
+
+What engages when `DFLASH_CODA` is set:
+
+| Pattern | Path | How |
+| --- | --- | --- |
+| **SwiGLU** (§3.2.2): `silu(gate) * up` | prefill + decode | `build_swiglu_ffn` emits `ggml_glu_split(..., SWIGLU)`, triggering ggml's fused `{MUL_MAT, MUL_MAT, GLU}` kernel. Only when the gate/up weight scales are 1.0 (non-NVFP4). |
+| **GEMM-Residual** (§3.2.1): `mul_mat(W,x) + residual` | decode (M=1) | Already fused upstream via the mmvq (`{MUL_MAT, ADD}`) mat-vec epilogue. |
+| **GEMM-Residual** (§3.2.1) | prefill / verify (M>1) | Forked `mmq` kernel adds a dst-shaped residual in its write-back epilogue. Detected automatically from any `{MUL_MAT, ADD}` with a contiguous, dst-shaped residual (non-MoE); **no graph rewrite needed** — the qwen35 FFN already emits down-proj `mul_mat` directly followed by the residual `add`. |
+
+Set `DFLASH_CODA_DEBUG=1` to trace when the forked mmq residual epilogue engages.
+Set `GGML_CUDA_DISABLE_FUSION=1` to disable all ggml-cuda fusion (baseline).
+
+Core changes: `deps/llama.cpp/ggml/src/ggml-cuda/{mmq.cuh,mmq.cu,ggml-cuda.cu}`
+(residual threaded through `mmq_args` → `mul_mat_q` → `mmq_write_back_*`) and
+`src/qwen35/qwen35_target_graph.cpp` (`build_swiglu_ffn`).
+
+### Local model-free tests (no weights, any CUDA arch incl. sm_75)
+
+These validate the fused kernels against the unfused ggml op sequence with small
+synthetic tensors, so they run without the 27B model:
+
+```bash
+cd server/build
+
+# SwiGLU fusion: fused CODA graph vs unfused baseline (Q4_K bit-exact)
+./test_coda_swiglu
+
+# GEMM-Residual mmq epilogue: GPU fused-vs-unfused parity (rel ~1e-7) + GPU-vs-CPU
+DFLASH_CODA=1 ./test_coda_residual              # exercise the fused mmq path (M>1)
+DFLASH_CODA_DEBUG=1 DFLASH_CODA=1 ./test_coda_residual   # + trace engagement
+GGML_CUDA_DISABLE_FUSION=1 ./test_coda_residual # unfused baseline (bench compare)
+```
+
+End-to-end logit/token parity and paper-aligned block / prefill-decode perf require the
+27B model on a GPU with enough memory and are run on the remote validation host.
+
+---
+
 ## Project structure
 
 ```

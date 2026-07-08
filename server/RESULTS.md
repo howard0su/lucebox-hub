@@ -136,6 +136,37 @@ Starting point: Chain DFlash at 112.8 tok/s mean on HumanEval, AL 7.67.
 | Budget 20 → 22, f16 intermediate                | +5.5    | +0.24| f16 cuts intermediate bandwidth in half |
 | **Total**                                       | **+16.7** | **+0.64** | **129.5 tok/s, AL 8.31 (HumanEval mean, fresh run)** |
 
+## CODA fused kernels (`DFLASH_CODA`) — local model-free validation
+
+CODA ([arXiv:2605.19269](https://arxiv.org/abs/2605.19269) §3) block-as-GEMM-epilogue
+fusions for the qwen35 target graph, gated behind `DFLASH_CODA`. See
+`DEVELOPER.md` → "CODA fused kernels". The following were validated locally on the
+RTX 2080 Ti (sm_75) with synthetic tensors (no 27B model), Q4_K, K=512 N=1024:
+
+**Correctness** (`test_coda_residual`, `test_coda_swiglu`):
+
+| Check | Result |
+|-------|--------|
+| SwiGLU fused vs unfused graph (Q4_K) | bit-exact (M=1/8/32) |
+| mmq residual epilogue: GPU fused vs unfused GEMM+add | rel ~1e-7 (M=1..512), essentially exact |
+| mmq residual epilogue: GPU vs CPU backend | within Q4_K quant tol (~7e-3) |
+| Engagement (`DFLASH_CODA_DEBUG`) | fused mmq residual fires for M≥8; M=1 uses mmvq |
+
+**Microbenchmark** (full-graph wall-clock, RTX 2080 Ti, 200 iters, noisy at these small
+sizes — the residual add is cheap vs Q4_K weight traffic and host launch overhead
+dominates; reported for reference only, not a headline speedup):
+
+| M | unfused (mmq+add) ms | fused (mmq epilogue) ms |
+|--:|:--:|:--:|
+| 32   | 0.140 | 0.120 |
+| 128  | 0.136 | 0.138 |
+| 512  | 0.151 | 0.170 |
+| 2048 | 0.258 | 0.261 |
+
+The structural win is removing a separate elementwise ADD pass (a full N×M read+write)
+per residual; its impact at model scale / chained blocks and end-to-end prefill/decode
+tok/s vs the paper is pending measurement on the remote GPU with the 27B model.
+
 ## Reproducibility
 
 - Deterministic: greedy decode + greedy verify. Same prompts + same weights + same binary = same numbers ±1 tok/s.
