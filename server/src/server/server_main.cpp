@@ -98,10 +98,11 @@ static bool validate_server_placement(const BackendArgs & bargs,
             "to load the draft backend in this process\n");
         return false;
     }
-    if (!bargs.remote_target_shard.enabled() &&
+    if (bargs.remote_target_shard.enabled() ||
         bargs.remote_target_shard.has_aux_options()) {
         std::fprintf(stderr,
-            "[server] --target-shard-ipc-work-dir requires --target-shard-ipc-bin\n");
+            "[server] target-shard IPC options were removed; use "
+            "--target-devices cuda:N,hip:M to load shards in this process\n");
         return false;
     }
     if (draft_placement_used && target != draft) {
@@ -143,38 +144,7 @@ static bool validate_server_placement(const BackendArgs & bargs,
     const bool mixed_target_split =
         bargs.device.is_layer_split() && bargs.device.is_mixed_layer_split();
     if (mixed_target_split) {
-        if (!bargs.remote_target_shard.enabled()) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split requires "
-                "--target-shard-ipc-bin\n");
-            return false;
-        }
-        size_t remote_begin = 0;
-        while (remote_begin < bargs.device.layer_split_gpus.size() &&
-               bargs.device.layer_split_backend(remote_begin) == compiled) {
-            ++remote_begin;
-        }
-        if (remote_begin == 0 || remote_begin >= bargs.device.layer_split_gpus.size()) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split currently supports "
-                "one local backend group followed by one remote backend group\n");
-            return false;
-        }
-        const PlacementBackend remote_backend =
-            bargs.device.layer_split_backend(remote_begin);
-        bool one_boundary = true;
-        for (size_t i = remote_begin; i < bargs.device.layer_split_gpus.size(); ++i) {
-            if (bargs.device.layer_split_backend(i) != remote_backend) {
-                one_boundary = false;
-                break;
-            }
-        }
-        if (!one_boundary) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split currently supports "
-                "only one backend boundary\n");
-            return false;
-        }
+        (void)mixed_target_split;
     } else if (bargs.device.is_layer_split() && target != compiled) {
         std::fprintf(stderr,
             "[server] target layer split must use this binary's compiled "
@@ -205,8 +175,8 @@ static void print_usage(const char * prog) {
         "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
         "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
         "                                 Env: DFLASH27B_DRAFT_SWA)\n"
-        "  --target-shard-ipc-bin <path>  Remote target shard IPC daemon for mixed target split\n"
-        "  --target-shard-ipc-work-dir <path>  Remote target shard IPC scratch directory\n"
+        "  --target-shard-ipc-bin <path>  Removed; use --target-devices cuda:N,hip:M\n"
+        "  --target-shard-ipc-work-dir <path>  Removed\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
@@ -1011,14 +981,6 @@ int main(int argc, char ** argv) {
                          bargs.device.layer_split_gpus[i]);
         }
         std::fprintf(stderr, "\n");
-        if (bargs.remote_target_shard.enabled()) {
-            std::fprintf(stderr, "[server] │  target_shard_ipc= %s\n",
-                         bargs.remote_target_shard.ipc_bin.c_str());
-            if (!bargs.remote_target_shard.work_dir.empty()) {
-                std::fprintf(stderr, "[server] │  target_shard_dir= %s\n",
-                             bargs.remote_target_shard.work_dir.c_str());
-            }
-        }
     }
     std::fprintf(stderr, "[server] │  draft_device    = %s\n",
                  placement_device_name(bargs.draft_device).c_str());

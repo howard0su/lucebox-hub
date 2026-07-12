@@ -88,6 +88,13 @@ bool compute_target_shard_layer_split_plan(
 bool init_layer_split_shard_metas(
     std::vector<LayerSplitShardMeta *> shards,
     const std::vector<int> & gpus,
+    const std::vector<PlacementBackend> & backends,
+    const std::vector<LayerSplitRange> & ranges,
+    const char * log_prefix);
+
+bool init_layer_split_shard_metas(
+    std::vector<LayerSplitShardMeta *> shards,
+    const std::vector<int> & gpus,
     const std::vector<LayerSplitRange> & ranges,
     const char * log_prefix);
 

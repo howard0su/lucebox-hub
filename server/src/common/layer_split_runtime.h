@@ -58,12 +58,10 @@ bool init_layer_split_runtime(const LayerSplitRuntimeInit & cfg,
     shards.resize(cfg.device->layer_split_gpus.size());
     auto shard_metas = layer_split_shard_metas(shards);
     if (!init_layer_split_shard_metas(
-            shard_metas, cfg.device->layer_split_gpus, ranges,
+            shard_metas, cfg.device->layer_split_gpus,
+            cfg.device->layer_split_backends, ranges,
             log_prefix)) {
         return false;
-    }
-    for (size_t i = 0; i < shard_metas.size(); ++i) {
-        shard_metas[i]->placement_backend = cfg.device->layer_split_backend(i);
     }
 
     (void)enable_layer_split_peer_access(

@@ -8,6 +8,7 @@
 #include "deepseek4_internal.h"
 #include "common/layer_split_runtime.h"
 #include "common/gguf_inspect.h"
+#include "placement/placement_backend_runtime.h"
 
 #include "ggml-cuda.h"
 #if defined(GGML_USE_CUDA)
@@ -200,15 +201,10 @@ bool DeepSeek4LayerSplitAdapter::init() {
         }
     }
 
-    // When remote_target_shard is configured, use mixed (IPC) path only if
-    // there are actually remote layers to offload.
-    if (cfg_.remote_target_shard.enabled() && device.layer_split_gpus.size() > 1) {
-        return init_mixed_target_split_full(device);
-    }
     if (cfg_.remote_target_shard.enabled()) {
         std::fprintf(stderr,
-                     "[deepseek4-split] remote target shard configured but no remote layers selected; "
-                     "using single-shard target path\n");
+                     "[deepseek4-split] target-shard IPC options are ignored; "
+                     "using same-process layer-split backends\n");
     }
 
     // Single-shard path: all layers on one GPU (monolithic)
@@ -216,11 +212,14 @@ bool DeepSeek4LayerSplitAdapter::init() {
         shards_.resize(1);
         auto & shard = shards_[0];
         shard.gpu = device.layer_split_gpus.empty() ? 0 : device.layer_split_gpus[0];
+        shard.placement_backend = device.layer_split_backends.empty()
+            ? device.backend
+            : device.layer_split_backend(0);
         shard.layer_begin = 0;
         shard.layer_end = 43;
-        shard.backend = ggml_backend_cuda_init(shard.gpu);
+        shard.backend = init_placement_backend(
+            shard.placement_backend, shard.gpu, "deepseek4-split");
         if (!shard.backend) {
-            std::fprintf(stderr, "[deepseek4-split] CUDA backend init failed gpu=%d\n", shard.gpu);
             return false;
         }
 

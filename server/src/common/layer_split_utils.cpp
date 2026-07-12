@@ -2,11 +2,13 @@
 
 #include "common/peer_access.h"
 #include "common/snapshot_backend.h"
+#include "placement/placement_backend_runtime.h"
 #include "ggml-cuda.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <utility>
 
 namespace dflash::common {
 
@@ -117,25 +119,37 @@ bool compute_target_shard_layer_split_plan(
 bool init_layer_split_shard_metas(
         std::vector<LayerSplitShardMeta *> shards,
         const std::vector<int> & gpus,
+        const std::vector<PlacementBackend> & backends,
         const std::vector<LayerSplitRange> & ranges,
         const char * log_prefix) {
     if (shards.size() != gpus.size() || shards.size() != ranges.size()) return false;
+    if (!backends.empty() && backends.size() != shards.size()) return false;
     const char * prefix = log_prefix ? log_prefix : "target-split";
     for (size_t i = 0; i < shards.size(); ++i) {
         auto * shard = shards[i];
         if (!shard) return false;
-        shard->placement_backend = PlacementBackend::Auto;
+        shard->placement_backend =
+            i < backends.size() ? backends[i] : PlacementBackend::Auto;
         shard->gpu = gpus[i];
         shard->layer_begin = ranges[i].begin;
         shard->layer_end = ranges[i].end;
-        shard->backend = ggml_backend_cuda_init(shard->gpu);
+        shard->backend = init_placement_backend(
+            shard->placement_backend, shard->gpu, prefix);
         if (!shard->backend) {
-            std::fprintf(stderr, "[%s] backend init failed gpu=%d\n",
-                         prefix, shard->gpu);
             return false;
         }
     }
     return true;
+}
+
+bool init_layer_split_shard_metas(
+        std::vector<LayerSplitShardMeta *> shards,
+        const std::vector<int> & gpus,
+        const std::vector<LayerSplitRange> & ranges,
+        const char * log_prefix) {
+    return init_layer_split_shard_metas(
+        std::move(shards), gpus, std::vector<PlacementBackend>{}, ranges,
+        log_prefix);
 }
 
 bool enable_layer_split_peer_access(
