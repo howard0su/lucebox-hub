@@ -48,7 +48,8 @@ inline PlacementBackend compiled_placement_backend() {
 
 inline bool placement_backend_supported(PlacementBackend backend) {
     return backend == PlacementBackend::Auto ||
-           backend == compiled_placement_backend();
+           backend == PlacementBackend::Cuda ||
+           backend == PlacementBackend::Hip;
 }
 
 }  // namespace dflash::common

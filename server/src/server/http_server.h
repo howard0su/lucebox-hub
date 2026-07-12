@@ -152,8 +152,8 @@ struct ServerConfig {
     float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
     std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3-0.6B)
     int         pflash_drafter_gpu = 0;     // backend-local GPU for PFlash drafter
-    bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
-    RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
+    bool        pflash_remote_drafter = false; // legacy field; draft IPC is disabled
+    RemoteDraftConfig pflash_remote;        // legacy field; draft IPC is disabled
     bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
     // Passthrough proxy — forward to upstream OpenAI-compatible server
     std::string pflash_upstream_base;      // e.g. "http://localhost:8080/v1"

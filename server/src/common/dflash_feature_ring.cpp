@@ -266,6 +266,7 @@ void draft_feature_mirror_free(DraftFeatureMirror & mirror) {
     mirror.target_device = 0;
     mirror.cap = 0;
     mirror.storage_type = GGML_TYPE_F32;
+    mirror.host_transfer = false;
 }
 
 bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
@@ -306,15 +307,12 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
         return false;
     }
     const size_t bytes = ggml_nbytes(mirror.target_feat);
-    cudaError_t err = cudaSetDevice(device);
-    if (feature_cuda_failed("cudaSetDevice", err)) {
-        draft_feature_mirror_free(mirror);
-        return false;
-    }
-    err = cudaMemset(mirror.target_feat->data, 0, bytes);
-    if (feature_cuda_failed("cudaMemset", err)) {
-        draft_feature_mirror_free(mirror);
-        return false;
+    std::vector<uint8_t> zeros(std::min<size_t>(bytes, 4u * 1024u * 1024u), 0);
+    size_t done = 0;
+    while (done < bytes) {
+        const size_t chunk = std::min(bytes - done, zeros.size());
+        ggml_backend_tensor_set(mirror.target_feat, zeros.data(), done, chunk);
+        done += chunk;
     }
     mirror.cap = cap;
     std::fprintf(stderr, "[dflash-feature] mirror dtype=%s cap=%d fc_in=%d\n",
@@ -433,14 +431,19 @@ bool copy_host_capture_slice_to_draft_ring(
     const size_t expected = (size_t)n_tokens * (size_t)hidden;
     if (host_elems != expected) return false;
     const size_t dst_stride = feature_ring.target_feat->nb[1];
-    const size_t row_bytes = (size_t)hidden * sizeof(float);
+    const size_t row_bytes = ggml_row_size(feature_ring.storage_type, hidden);
+    std::vector<uint8_t> row(row_bytes);
     for (int i = 0; i < n_tokens; ++i) {
         const int slot = (start_pos + i) % feature_ring.cap;
         const float * src = host + (size_t)i * (size_t)hidden;
         const size_t dst_offset =
             (size_t)slot * dst_stride +
-            (size_t)capture_idx * (size_t)hidden * sizeof(float);
-        ggml_backend_tensor_set(feature_ring.target_feat, src, dst_offset, row_bytes);
+            (size_t)capture_idx * row_bytes;
+        if (!host_f32_to_feature_row(feature_ring.storage_type, src,
+                                     row.data(), hidden)) {
+            return false;
+        }
+        ggml_backend_tensor_set(feature_ring.target_feat, row.data(), dst_offset, row_bytes);
     }
     return true;
 }
@@ -455,8 +458,25 @@ bool copy_feature_ring_range_to_tensor(
 
     const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
     const size_t row_bytes = (size_t)fc_in * sizeof(float);
+    const size_t storage_row_bytes = ggml_row_size(feature_ring.storage_type, fc_in);
     const size_t src_stride = feature_ring.target_feat->nb[1];
     const size_t dst_stride = dst->nb[1];
+    if (feature_ring.host_transfer) {
+        std::vector<uint8_t> row(storage_row_bytes);
+        std::vector<float> host((size_t)fc_in);
+        for (int i = 0; i < n_tokens; ++i) {
+            const int slot = (start_pos + i) % feature_ring.cap;
+            ggml_backend_tensor_get(feature_ring.target_feat, row.data(),
+                                    (size_t)slot * src_stride, storage_row_bytes);
+            if (!feature_row_to_host_f32(feature_ring.storage_type, row.data(),
+                                         host.data(), fc_in)) {
+                return false;
+            }
+            ggml_backend_tensor_set(dst, host.data(), (size_t)i * dst_stride,
+                                    row_bytes);
+        }
+        return true;
+    }
     int done = 0;
     while (done < n_tokens) {
         const int slot = (start_pos + done) % feature_ring.cap;

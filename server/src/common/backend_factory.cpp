@@ -20,6 +20,20 @@
 
 namespace dflash::common {
 
+namespace {
+
+DevicePlacement effective_draft_device(const BackendArgs & args) {
+    DevicePlacement draft = args.draft_device;
+    if (draft.backend == PlacementBackend::Auto && draft.gpu == 0) {
+        draft.backend = args.device.backend;
+        draft.gpu = args.device.primary_gpu();
+        draft.max_ctx = args.device.max_ctx;
+    }
+    return draft;
+}
+
+}  // namespace
+
 std::string detect_arch(const char * model_path) {
     auto info = inspect_gguf_model_info(model_path);
     return info.arch;
@@ -77,10 +91,12 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         }
 
         Qwen35Config cfg;
+        const DevicePlacement draft_device = effective_draft_device(args);
         cfg.target_path        = args.model_path;
         cfg.draft_path         = args.draft_path;
         cfg.device             = args.device;
-        cfg.draft_gpu          = args.draft_device.gpu;
+        cfg.draft_device       = draft_device;
+        cfg.draft_gpu          = draft_device.gpu;
         cfg.remote_draft       = args.remote_draft;
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
@@ -104,10 +120,12 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
 
     } else if (arch == "qwen35moe") {
         Qwen35Config cfg;
+        const DevicePlacement draft_device = effective_draft_device(args);
         cfg.target_path        = args.model_path;
         cfg.draft_path         = args.draft_path;
         cfg.device             = args.device;
-        cfg.draft_gpu          = args.draft_device.gpu;
+        cfg.draft_device       = draft_device;
+        cfg.draft_gpu          = draft_device.gpu;
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
         cfg.kq_stride_pad      = args.kq_stride_pad;

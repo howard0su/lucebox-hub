@@ -32,11 +32,8 @@ inline PFlashDrafterPlacement resolve_pflash_drafter_placement(
     out.drafter_backend = drafter_device.backend == PlacementBackend::Auto
         ? out.target_backend : drafter_device.backend;
     out.drafter_gpu = drafter_device.gpu;
-    out.remote_drafter = pflash_enabled &&
-                         out.target_backend != out.drafter_backend;
-    if (out.remote_drafter) {
-        out.remote = remote;
-    }
+    (void)pflash_enabled;
+    (void)remote;
     return out;
 }
 

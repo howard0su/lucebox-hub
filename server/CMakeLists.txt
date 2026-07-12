@@ -317,6 +317,7 @@ add_library(dflash_common STATIC
     src/common/gguf_inspect.cpp
     src/common/backend_factory.cpp
     src/placement/placement_config.cpp
+    src/placement/placement_backend_runtime.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
     src/common/peer_access.cpp

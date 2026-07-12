@@ -42,6 +42,7 @@ struct Qwen35Config {
     const char * target_path = nullptr;
     const char * draft_path  = nullptr;
     DevicePlacement device;                // target GPU placement
+    DevicePlacement draft_device;          // draft GPU/backend placement
     int          draft_gpu   = 0;
     RemoteDraftConfig remote_draft;
     int          stream_fd   = -1;
@@ -221,6 +222,7 @@ private:
     ggml_backend_t draft_backend_  = nullptr;
     ggml_backend_t snap_backend_   = nullptr;  // snapshot storage (CPU or unified)
     bool           split_gpus_     = false;
+    bool           mixed_draft_backend_ = false;
 
     // ── Model weights + caches ───────────────────────────────────────
     TargetWeights  w_;
@@ -316,6 +318,7 @@ private:
                       bool * degenerate_close_out = nullptr);
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
+    bool sync_local_draft_features_via_host(int start_pos, int n_tokens);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);

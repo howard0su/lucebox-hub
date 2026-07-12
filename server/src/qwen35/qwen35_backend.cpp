@@ -6,6 +6,7 @@
 #include "dflash_capture.h"
 #include "common/dflash_draft_graph.h"
 #include "peer_access.h"
+#include "placement/placement_backend_runtime.h"
 #include "attn_masks.h"
 #include "common/sampler.h"
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
@@ -175,22 +176,29 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 
 bool Qwen35Backend::init() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
-    split_gpus_ = !use_remote_draft && (cfg_.device.gpu != cfg_.draft_gpu);
+    const PlacementBackend target_backend_kind =
+        resolve_placement_backend(cfg_.device.backend);
+    const PlacementBackend draft_backend_kind =
+        resolve_placement_backend(cfg_.draft_device.backend, target_backend_kind);
+    cfg_.draft_gpu = cfg_.draft_device.gpu;
+    split_gpus_ = !use_remote_draft &&
+                  (cfg_.device.gpu != cfg_.draft_gpu ||
+                   target_backend_kind != draft_backend_kind);
+    mixed_draft_backend_ = !use_remote_draft &&
+                           target_backend_kind != draft_backend_kind;
 
-    target_backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
+    target_backend_ = init_placement_backend(target_backend_kind, cfg_.device.gpu, "target");
     if (!target_backend_) {
-        std::fprintf(stderr, "target cuda init failed\n");
         return false;
     }
     draft_backend_ = use_remote_draft ? nullptr : target_backend_;
     if (split_gpus_) {
-        draft_backend_ = ggml_backend_cuda_init(cfg_.draft_gpu);
+        draft_backend_ = init_placement_backend(draft_backend_kind, cfg_.draft_gpu, "draft");
         if (!draft_backend_) {
-            std::fprintf(stderr, "draft cuda init failed\n");
             return false;
         }
     }
-    if (split_gpus_ && g_peer_access_opt_in) {
+    if (split_gpus_ && !mixed_draft_backend_ && g_peer_access_opt_in) {
         enable_peer_access_pair(cfg_.device.gpu, cfg_.draft_gpu);
     }
 
@@ -322,6 +330,8 @@ bool Qwen35Backend::init() {
                                        w_.n_capture_layers,
                                        w_.n_embd)) {
             std::fprintf(stderr, "warning: feature mirror init failed, spec decode will use AR fallback\n");
+        } else {
+            feature_mirror_.host_transfer = mixed_draft_backend_;
         }
     }
 
@@ -1236,8 +1246,12 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (remote_draft_.active() && !draft_parked_) {
             if (!sync_remote_draft_features(kv_pos, n_tokens)) return -1;
         } else if (feature_mirror_.target_feat && !draft_parked_) {
-            draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                            feature_mirror_, kv_pos, n_tokens);
+            const bool ok = mixed_draft_backend_
+                ? sync_local_draft_features_via_host(kv_pos, n_tokens)
+                : draft_feature_mirror_sync_range(cache_.target_feat,
+                                                  cache_.target_feat_cap,
+                                                  feature_mirror_, kv_pos, n_tokens);
+            if (!ok) return -1;
         }
 
         start += n_tokens;
@@ -1779,6 +1793,42 @@ bool Qwen35Backend::sync_remote_draft_features(int start_pos, int n_tokens) {
             return false;
         }
     }
+    return true;
+}
+
+bool Qwen35Backend::sync_local_draft_features_via_host(int start_pos, int n_tokens) {
+    if (!feature_mirror_.target_feat || !cache_.target_feat || n_tokens <= 0) return true;
+    if (cache_.target_feat_cap <= 0) return false;
+
+    const int n_capture = w_.n_capture_layers;
+    const int feat_hidden = w_.n_embd;
+    const size_t src_stride = cache_.target_feat->nb[1];
+    std::vector<float> slice((size_t)n_tokens * (size_t)feat_hidden);
+    std::vector<uint16_t> bf16(feat_hidden);
+    ggml_backend_synchronize(target_backend_);
+    for (int cap_idx = 0; cap_idx < n_capture; ++cap_idx) {
+        for (int t = 0; t < n_tokens; ++t) {
+            const int slot = (start_pos + t) % cache_.target_feat_cap;
+            const size_t src_offset = (size_t)slot * src_stride +
+                (size_t)cap_idx * (size_t)feat_hidden * sizeof(uint16_t);
+            ggml_backend_tensor_get(cache_.target_feat, bf16.data(),
+                                    src_offset,
+                                    sizeof(uint16_t) * (size_t)feat_hidden);
+            float * dst = slice.data() + (size_t)t * feat_hidden;
+            for (int h = 0; h < feat_hidden; ++h) {
+                dst[h] = bf16_bits_to_f32(bf16[h]);
+            }
+        }
+        if (!copy_host_capture_slice_to_draft_ring(feature_mirror_, cap_idx,
+                                                   start_pos, n_tokens,
+                                                   slice.data(), slice.size())) {
+            std::fprintf(stderr,
+                "spec-decode: local mixed-backend feature sync failed capture=%d\n",
+                cap_idx);
+            return false;
+        }
+    }
+    ggml_backend_synchronize(draft_backend_);
     return true;
 }
 
@@ -2549,8 +2599,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
         } else if (feature_mirror_.target_feat && cache_.target_feat) {
-            draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                            feature_mirror_, committed, commit_n);
+            const bool ok = mixed_draft_backend_
+                ? sync_local_draft_features_via_host(committed, commit_n)
+                : draft_feature_mirror_sync_range(cache_.target_feat,
+                                                  cache_.target_feat_cap,
+                                                  feature_mirror_, committed, commit_n);
+            if (!ok) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
         }
 
         // 8. Emit committed tokens (stop at EOS)

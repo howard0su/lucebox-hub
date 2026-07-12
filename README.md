@@ -366,16 +366,15 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--hard-limit-reply-budget N` | `4096` | Hard ceiling; injects `</think>` close near limit |
 | `--reasoning-effort-{low,medium,high,x-high,max} N` | model-card | OpenAI-style effort tiers |
 
-**Multi-GPU / IPC**
+**Multi-GPU / mixed backends**
 
 | Flag / env | Default | Effect |
 |---|---|---|
 | `--target-device <dev>` | `cuda:0` | Target backend (e.g. `cuda:0`, `hip:0`) |
-| `--draft-device <dev>` | same as target | Draft backend; mixed backend needs `--draft-ipc-bin` |
+| `--draft-device <dev>` | same as target | Draft backend (e.g. `cuda:0`, `hip:0`); CUDA/HIP draft backends load in the same process |
 | `--target-gpu N` | `0` | Target GPU index |
 | `--draft-gpu N` | same as target | Draft GPU index; offload draft to a second GPU |
 | `--target-devices <list>` / `--target-layer-split` | single GPU | Layer-split target across GPUs |
-| `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
 | `--peer-access` | off | Enable P2P between target GPUs |
 | `--chunk N` | backend default | Prefill ubatch size |
 | `--no-cors` | CORS on | Disable CORS headers |

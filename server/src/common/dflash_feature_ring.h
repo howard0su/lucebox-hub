@@ -35,6 +35,7 @@ struct DraftFeatureMirror {
     int n_target_layers = 0;
     int hidden_size = 0;
     ggml_type storage_type = GGML_TYPE_F32;
+    bool host_transfer = false; // use ggml get/set instead of backend runtime peer copies
 };
 
 void draft_feature_mirror_free(DraftFeatureMirror & mirror);
