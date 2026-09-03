@@ -287,7 +287,7 @@ jobs:
     env:
       HIP_VISIBLE_DEVICES: ${{ matrix.device_index }}
       EXPECTED_HIP_ARCH: ${{ matrix.arch }}
-      LUCE_TEST_MODEL_QWEN35: /opt/models/UD-Q4_K_M/Qwen3.5-122B-A10B-UD-Q4_K_M-00001-of-00003.gguf
+      LUCE_TEST_MODEL_QWEN35: /opt/models/Qwen3.6-27B-Q4_K_M.gguf
       LUCE_TEST_MODEL_QWEN3: /opt/models/Qwen3-0.6B-BF16.gguf
       LUCE_TEST_MODEL_DEEPSEEK4: /opt/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
       DS4_TEST_MODEL: /opt/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
